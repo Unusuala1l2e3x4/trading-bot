@@ -6,32 +6,53 @@ import toml
 import os
 from dotenv import load_dotenv
 
+import time
+
 load_dotenv(override=True)
 livepaper = os.getenv('LIVEPAPER')
 config = toml.load('../config.toml')
 
-# Initialize the Alpaca API
+# # Initialize the Alpaca API
 api = tradeapi.REST(config[livepaper]['key'], config[livepaper]['secret'], config[livepaper]['endpoint'], api_version='v2')
 
 
+from trading import is_market_open, get_historical_data
 
-# Fetch historical data
-def get_historical_data(symbol, start_date, end_date, timeframe='day'):
-    barset = api.get_barset(symbol, timeframe, start=start_date, end=end_date)
-    return barset[symbol].df
+
+# (method) def get_bars(
+#     symbol: str | List[str],
+#     timeframe: TimeFrame,
+#     start: str | None = None,
+#     end: str | None = None,
+#     adjustment: str = 'raw',
+#     limit: int = None,
+#     feed: str | None = None,
+#     asof: str | None = None,
+#     sort: Sort | None = None
+# ) -> BarsV2
+
 
 # Touch Detection
-def detect_support_resistance(df, min_touches=2, tolerance=0.02):
-    levels = {}
+def detect_support_resistance(df, min_touches=3, tolerance=0.02):
+    levels = []
+    touch_counts = {}
+
     for i in range(len(df)):
         for j in range(i+1, len(df)):
-            if abs(df['close'][i] - df['close'][j]) < tolerance:
-                level = round(df['close'][i], 2)
-                if level not in levels:
-                    levels[level] = 0
-                levels[level] += 1
+            level = (df['close'][i] + df['close'][j]) / 2
+            
+            if abs(df['close'][i] - df['close'][j]) < tolerance * df['close'][i]:
+                if level not in touch_counts:
+                    touch_counts[level] = 0
+                touch_counts[level] += 1
 
-    return {level: count for level, count in levels.items() if count >= min_touches}
+    for level, touches in touch_counts.items():
+        if touches >= min_touches:
+            levels.append(level)
+    
+    levels = sorted(levels)
+    return levels
+
 
 # Volatility Analysis
 def calculate_volatility(df, period=14):
@@ -47,7 +68,7 @@ def log_alert(message):
 # Placing Orders
 def place_order(symbol, buy_price, stop_loss_price):
     try:
-        api.submit_order(
+        buy_order = api.submit_order(
             symbol=symbol,
             qty=1,
             side='buy',
@@ -55,7 +76,7 @@ def place_order(symbol, buy_price, stop_loss_price):
             stop_price=buy_price,
             time_in_force='gtc',
         )
-        api.submit_order(
+        stop_order = api.submit_order(
             symbol=symbol,
             qty=1,
             side='sell',
@@ -63,34 +84,61 @@ def place_order(symbol, buy_price, stop_loss_price):
             stop_price=stop_loss_price,
             time_in_force='gtc',
         )
-        log_alert(f"Order placed: Buy {symbol} at {buy_price}, Stop Loss at {stop_loss_price}")
+        log_alert(f"Order placed: Buy at {buy_price}, Stop at {stop_loss_price}")
+        return buy_order.id, stop_order.id
     except Exception as e:
-        log_alert(f"Error placing order: {e}")
+        log_alert(f"Failed to place order: {e}")
+        return None, None
+
+
+def check_order_status(order_id):
+    try:
+        order = api.get_order(order_id)
+        return order.status
+    except Exception as e:
+        log_alert(f"Failed to check order status: {e}")
+        return None
+
+
+
 
 # Main function
-def run_trading_bot(symbol):
+def run_trading_bot(symbol, min_touches=3, tolerance=0.02):
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
     
     df = get_historical_data(symbol, start_date, end_date)
     
-    # Detect support and resistance levels
-    levels = detect_support_resistance(df)
+    levels = detect_support_resistance(df, min_touches, tolerance)
     log_alert(f"Detected levels: {levels}")
     
-    # Calculate volatility
     volatility = calculate_volatility(df)
     log_alert(f"Calculated volatility: {volatility}")
 
-    # Determine the trading action
-    for level, touches in levels.items():
+    for level in levels:
         high_price = level
-        low_price = level - (level * 0.02)  # Example stop loss 2% below level
+        low_price = level - (level * 0.02)
         
-        if touches >= 2:
-            buy_price = high_price + 0.0001
-            place_order(symbol, buy_price, low_price)
+        buy_price = high_price + 0.0001
+
+        while not is_market_open():
+            log_alert("Market is closed. Waiting for market to open...")
+            time.sleep(60)  # Sleep for a minute before checking again
+
+        buy_order_id, stop_order_id = place_order(symbol, buy_price, low_price)
+        
+        if buy_order_id and stop_order_id:
+            while True:
+                stop_order_status = check_order_status(stop_order_id)
+                
+                if stop_order_status == 'filled':
+                    log_alert("Stop order executed. Placing new buy order.")
+                    buy_order_id, stop_order_id = place_order(symbol, buy_price, low_price)
+                
+                time.sleep(60)  # Sleep for a minute before checking again
             break
+
+
 
 # # Example usage
 # run_trading_bot('AAPL')
