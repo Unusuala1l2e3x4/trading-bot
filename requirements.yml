@@ -1,0 +1,15 @@
+name: trading_bot_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - pandas
+  - numpy
+  - pip
+  - pip:
+    - python-dotenv
+    - ipykernel
+    - alpaca-trade-api
+    - toml
+
