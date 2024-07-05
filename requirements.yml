@@ -11,5 +11,7 @@ dependencies:
     - python-dotenv
     - ipykernel
     - alpaca-trade-api
+    - alpaca-py
     - toml
+    - matplotlib
 

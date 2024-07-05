@@ -6,6 +6,7 @@ import toml
 import os
 from dotenv import load_dotenv
 
+
 load_dotenv(override=True)
 livepaper = os.getenv('LIVEPAPER')
 config = toml.load('../config.toml')
@@ -16,8 +17,6 @@ api = tradeapi.REST(config[livepaper]['key'], config[livepaper]['secret'], confi
 def is_market_open():
     clock = api.get_clock()
     return clock.is_open
-
-
 
 # Fetch historical data
 def get_historical_data(symbol, start_date, end_date, timeframe='day'):

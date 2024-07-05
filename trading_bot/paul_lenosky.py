@@ -19,19 +19,6 @@ api = tradeapi.REST(config[livepaper]['key'], config[livepaper]['secret'], confi
 from trading import is_market_open, get_historical_data
 
 
-# (method) def get_bars(
-#     symbol: str | List[str],
-#     timeframe: TimeFrame,
-#     start: str | None = None,
-#     end: str | None = None,
-#     adjustment: str = 'raw',
-#     limit: int = None,
-#     feed: str | None = None,
-#     asof: str | None = None,
-#     sort: Sort | None = None
-# ) -> BarsV2
-
-
 # Touch Detection
 def detect_support_resistance(df, min_touches=3, tolerance=0.02):
     levels = []
