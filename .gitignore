@@ -3,3 +3,6 @@ __pycache__/
 .env
 *.toml
 *.url
+*.csv
+*.txt
+trading_bot/reject
