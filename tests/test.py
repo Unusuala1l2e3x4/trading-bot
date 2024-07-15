@@ -1,95 +1,148 @@
 @dataclass
 class TradePosition:
-    # ... (existing attributes)
-    current_shares: int  # Initialize this to total_shares
-    partial_exits: List[Tuple[datetime, float, int]] = field(default_factory=list)
-    partial_entries: List[Tuple[datetime, float, int]] = field(default_factory=list)
+    # ... other attributes ...
+    initial_shares: int
+    current_shares: int
+    sub_positions: List[SubPosition] = field(default_factory=list)
 
-    # ... (existing methods)
+    @property
+    def num_sub_positions(self) -> int:
+        if self.times_buying_power <= 2:
+            return 1
+        elif self.initial_shares % 2 == 0:
+            return 2
+        else:
+            return 3
+        
+    @property
+    def shares_per_sub(self) -> List[int]:
+        num_subs = self.num_sub_positions
+        if num_subs == 1:
+            return [self.initial_shares]
+        elif num_subs == 2:
+            return [self.initial_shares // 2] * 2
+        else:  # 3 sub-positions
+            base_shares = self.initial_shares // 3
+            extra_shares = self.initial_shares % 3
+            return [base_shares + (1 if i < extra_shares else 0) for i in range(3)]
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
-        if shares_to_sell > self.current_shares:
-            shares_to_sell = self.current_shares
-        self.partial_exits.append((exit_time, exit_price, shares_to_sell))
+    def add_sub_position(self, entry_time: datetime, entry_price: float, shares: int):
+        self.sub_positions.append(SubPosition(entry_time, entry_price, shares))
+        self.current_shares += shares
+
+    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int) -> float:
+        remaining_shares = shares_to_sell
+        realized_pnl = 0
+        for sp in self.sub_positions:
+            if sp.exit_time is None and remaining_shares > 0:
+                shares_sold = min(sp.shares, remaining_shares)
+                sp.shares -= shares_sold
+                remaining_shares -= shares_sold
+                if sp.shares == 0:
+                    sp.exit_time = exit_time
+                    sp.exit_price = exit_price
+                realized_pnl += (exit_price - sp.entry_price) * shares_sold if self.is_long else \
+                                (sp.entry_price - exit_price) * shares_sold
         self.current_shares -= shares_to_sell
+        return realized_pnl
 
+
+    @staticmethod
+    def calculate_shares_per_sub(total_shares: int, num_subs: int) -> List[int]:
+        if num_subs == 1:
+            return [total_shares]
+        elif num_subs == 2:
+            return [total_shares // 2] * 2
+        else:  # 3 sub-positions
+            base_shares = total_shares // 3
+            extra_shares = total_shares % 3
+            return [base_shares + (1 if i < extra_shares else 0) for i in range(3)]
+      
+      
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
-        if self.current_shares + shares_to_buy > self.total_shares:
-            shares_to_buy = self.total_shares - self.current_shares
-        self.partial_entries.append((entry_time, entry_price, shares_to_buy))
+        # Determine how to distribute new shares among sub-positions
+        current_num_subs = len([sp for sp in self.sub_positions if sp.shares > 0])
+        new_total_shares = self.current_shares + shares_to_buy
+        new_num_subs = 3 if new_total_shares % 2 != 0 and self.times_buying_power > 2 else \
+                       2 if self.times_buying_power > 2 else 1
+
+        if new_num_subs > current_num_subs:
+            # Create new sub-position(s)
+            for _ in range(new_num_subs - current_num_subs):
+                self.add_sub_position(entry_time, entry_price, 0)
+
+        # Distribute shares
+        shares_per_sub = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
+        remaining_shares = shares_to_buy
+        for i, sp in enumerate(self.sub_positions):
+            if sp.shares > 0 or i < new_num_subs:
+                target_shares = shares_per_sub[i]
+                shares_to_add = target_shares - sp.shares
+                if shares_to_add > 0:
+                    actual_shares_to_add = min(shares_to_add, remaining_shares)
+                    sp.shares += actual_shares_to_add
+                    remaining_shares -= actual_shares_to_add
+                    if remaining_shares == 0:
+                        break
+
         self.current_shares += shares_to_buy
 
-    def distance_to_stop(self, current_price: float) -> float:
-        return abs(current_price - self.current_stop_price)
-    
-    
+       
+       
+       
         
 def backtest_strategy(touch_detection_areas, initial_investment=10000, do_longs=True, do_shorts=True, use_margin=False, times_buying_power=4):
     # ...
-    def update_positions(timestamp, open_price, close_price, high_price, low_price):
-        nonlocal trades_executed
-        positions_to_remove = []
+    
+    
+    def place_stop_market_buy(area: TouchArea, timestamp: datetime, open_price: float, high_price: float, low_price: float, close_price: float, prev_close: float):
+        nonlocal balance, current_id, total_account_value, open_positions, trades_executed
 
-        def perform_exit(area_id, position, exit_price):
-            nonlocal trades_executed
-            position.close(timestamp, exit_price)
-            trades_executed += 1
-            position.area.record_entry_exit(position.entry_time, position.entry_price, 
-                                            timestamp, exit_price)
-            position.area.terminate(touch_area_collection)
-            positions_to_remove.append(area_id)
+        if open_positions or balance <= 0:
+            return NO_POSITION_OPENED
 
-        def handle_partial_trades(position, price):
-            total_gain = position.max_price - position.entry_price if position.is_long else position.entry_price - position.min_price
-            distance_to_stop = position.distance_to_stop(price)
+        # ... (existing checks for order execution)
 
-            if distance_to_stop < total_gain * 0.5:  # Start scaling out at 50% retracement
-                shares_to_sell = int(position.current_shares * 0.1)  # Sell 10% of current position
-                if shares_to_sell > 0:
-                    position.partial_exit(timestamp, price, shares_to_sell)
-            elif distance_to_stop > total_gain * 0.75 and position.current_shares < position.total_shares:
-                shares_to_buy = int((position.total_shares - position.current_shares) * 0.1)  # Buy back 10% of sold shares
-                if shares_to_buy > 0:
-                    position.partial_entry(timestamp, price, shares_to_buy)
+        execution_price = area.get_buy_price
 
-        for area_id, position in open_positions.items():
-            old_stop_price = position.current_stop_price
-            debug_print(f"{timestamp} - Updating position {position.id} (Old stop price: {old_stop_price:.4f})")
+        max_position_size, actual_margin_multiplier, overall_margin_multiplier, initial_margin_requirement = calculate_max_position_size()
 
-            # Check at open
-            position.update_stop_price(open_price)
-            handle_partial_trades(position, open_price)
-            if position.should_exit(open_price):
-                perform_exit(area_id, position, open_price)
-                continue
+        total_shares = math.floor((balance * overall_margin_multiplier) / execution_price)
+        invest_amount = total_shares * execution_price
+        actual_cash_used = invest_amount / overall_margin_multiplier
 
-            # Check at high/low for long/short positions
-            if position.is_long:
-                position.update_stop_price(high_price)
-                handle_partial_trades(position, high_price)
-                if position.should_exit(high_price):
-                    perform_exit(area_id, position, high_price)
-                    continue
-            else:
-                position.update_stop_price(low_price)
-                handle_partial_trades(position, low_price)
-                if position.should_exit(low_price):
-                    perform_exit(area_id, position, low_price)
-                    continue
+        if actual_cash_used > balance:
+            return NO_POSITION_OPENED
 
-            # Check at close
-            position.update_stop_price(close_price)
-            handle_partial_trades(position, close_price)
-            if position.should_exit(close_price):
-                perform_exit(area_id, position, close_price)
+        position = TradePosition(
+            id=current_id,
+            area=area,
+            is_long=area.is_long,
+            entry_time=timestamp,
+            initial_balance=actual_cash_used,
+            use_margin=use_margin,
+            is_marginable=is_marginable,
+            times_buying_power=times_buying_power,
+            actual_margin_multiplier=actual_margin_multiplier,
+            current_stop_price=high_price - area.get_range if area.is_long else low_price + area.get_range,
+            max_price=high_price if area.is_long else None,
+            min_price=low_price if not area.is_long else None,
+            initial_shares=total_shares,
+            current_shares=total_shares
+        )
 
-        # Remove closed positions and update account
-        temp = {}
-        for area_id in positions_to_remove:
-            temp[area_id] = open_positions[area_id]
-            del open_positions[area_id]
-        for area_id in positions_to_remove:
-            exit_action(area_id, temp[area_id])
+        shares_per_sub = position.shares_per_sub
+        for shares in shares_per_sub:
+            position.add_sub_position(timestamp, execution_price, shares)
 
-        if positions_to_remove:
-            debug_print(f"  Updated Total Account Value: {total_account_value:.2f}")
+        current_id += 1
+        open_positions[area.id] = position
+
+        print(f"{'res' if area.is_long else 'sup'} area {area.id}: {current_id} {timestamp} - Enter {'Long ' if area.is_long else 'Short'} at {execution_price:.4f}. "
+            f"Shares: {total_shares}, Amount: ${invest_amount:.2f} (Margin: {actual_margin_multiplier:.2f}x, Overall: {overall_margin_multiplier:.2f}x, Sub-positions: {position.num_sub_positions})")
+
+        rebalance(add=-actual_cash_used, current_price=close_price)
+        return POSITION_OPENED
+    
+    
+    
