@@ -1,114 +1,106 @@
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-
-@dataclass
-class Trade:
-    id: int
-    is_long: bool
+class SubPosition:
     entry_time: datetime
     entry_price: float
-    exit_time: datetime
-    exit_price: float
-    initial_balance: float
-    use_margin: bool
-    is_marginable: bool
-    times_buying_power: float
-    stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
-    # stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
+    shares: int
+    cash_committed: float
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float] = None
 
-    FINRA_TAF_RATE = 0.000119  # per share
-    SEC_FEE_RATE = 22.90 / 1_000_000  # per dollar
-    
-    """
-    stock_borrow_rate: Annual rate for borrowing the stock (for short positions)
-    - Expressed in decimal form (e.g., 0.003 for 30 bps, 0.03 for 300 bps)
-    - "bps" means basis points, where 1 bp = 0.01% = 0.0001 in decimal form
-    - For ETBs (easy to borrow stocks), this typically ranges from 30 to 300 bps annually
-    - 30 bps = 0.30% = 0.003 in decimal form
-    - 300 bps = 3.00% = 0.03 in decimal form
-    
-    Info from website:
-    - Borrow fees accrue daily and are billed at the end of each month. Borrow fees can vary significantly depending upon demand to short. 
-    - Generally, ETBs cost between 30 and 300bps annually.
-    
-    - Daily stock borrow fee = Daily ETB stock borrow fee + Daily HTB stock borrow fee
-    - Daily ETB stock borrow fee = (settlement date end of day total ETB short $ market value * that stock’s ETB rate) / 360
-    - Daily HTB stock borrow fee = Σ((each stock’s HTB short $ market value * that stock’s HTB rate) / 360)
-    
-    
-    See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#stock-borrow-rates
-    
-    If holding shorts overnight (unimplemented; not applicable to intraday trading):
-    - daily_margin_interest_charge = (settlement_date_debit_balance * 0.085) / 360
-    
-    See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#margin-interest-rate
-    """
-
-
-
-    @property
-    def margin_multiplier(self) -> float:
-        if self.use_margin and self.is_marginable:
-            return min(self.times_buying_power, 4)  # Cap at 4x as per regulations
-        return 1
-
-    @property
-    def shares(self) -> float:
-        return (self.initial_balance * self.margin_multiplier) / self.entry_price
-
-    @property
-    def entry_transaction_costs(self) -> float:
-        # FINRA TAF
-        finra_taf = max(0.01, self.FINRA_TAF_RATE * self.shares)
-        return finra_taf
-
-    @property
-    def exit_transaction_costs(self) -> float:
-        # FINRA TAF
-        finra_taf = max(0.01, self.FINRA_TAF_RATE * self.shares)
-
-        # SEC Fee (only for selling long positions or closing short positions)
-        sec_fee = 0
-        if self.is_long or (not self.is_long and self.exit_price > self.entry_price):
-            trade_value = self.exit_price * self.shares
-            sec_fee = self.SEC_FEE_RATE * trade_value
-
-        return finra_taf + sec_fee
-
-    @property
-    def stock_borrow_cost(self) -> float:
-        if self.is_long:
-            return 0
+class TradePosition:
+    #...
+    def calculate_num_sub_positions(self, total_shares: int) -> int:
+        if self.times_buying_power <= 2:
+            return 1
+        elif total_shares % 2 == 0:
+            return 2
+        else:
+            return 3
         
-        holding_days = self.holding_time.total_seconds() / (24 * 60 * 60)
-        daily_borrow_rate = self.stock_borrow_rate / 360
-        return self.initial_balance * self.margin_multiplier * daily_borrow_rate * holding_days
+    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
+        if self.is_long:
+            realized_pnl = (exit_price - self.entry_price) * shares_to_sell
+        else:
+            realized_pnl = (self.entry_price - exit_price) * shares_to_sell
+        cash_released = 0
+        remaining_shares_to_sell = shares_to_sell
 
-    @property
-    def total_transaction_costs(self) -> float:
-        return self.entry_transaction_costs + self.exit_transaction_costs + self.stock_borrow_cost
+        for sp in self.sub_positions:
+            if sp.shares > 0 and remaining_shares_to_sell > 0:
+                shares_sold = min(sp.shares, remaining_shares_to_sell)
+                assert sp.shares >= shares_sold
+                sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
+                sp.shares -= shares_sold
+                self.current_shares -= shares_sold
+                sp.cash_committed -= sub_cash_released
+                cash_released += sub_cash_released
+                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False)
+                remaining_shares_to_sell -= shares_sold
+                if sp.shares == 0:
+                    sp.exit_time = exit_time
+                    sp.exit_price = exit_price
+        self.current_market_value = self.current_shares * exit_price
+        self.cash_committed -= cash_released
+        return realized_pnl / self.actual_margin_multiplier, cash_released
 
-    @property
-    def holding_time(self) -> timedelta:
-        return self.exit_time - self.entry_time
+    def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
+        target_shares = [total_shares // num_subs] * num_subs
+        remaining_shares = total_shares % num_subs
+        
+        # Distribute remaining shares
+        for i in range(remaining_shares):
+            target_shares[i] += 1
+            
+        # Adjust target shares based on current sub-position shares
+        for i in range(min(num_subs, len(current_sub_shares))):
+            print(current_sub_shares[i], target_shares[i])
+            if target_shares[i] < current_sub_shares[i]:
+                excess = current_sub_shares[i] - target_shares[i]
+                target_shares[i] = current_sub_shares[i]
+                
+                # Redistribute excess to other sub-positions
+                for j in range(i + 1, num_subs):
+                    if target_shares[j] > excess:
+                        target_shares[j] -= excess
+                        break
+                    else:
+                        excess -= target_shares[j]
+                        target_shares[j] = 0
+        return target_shares
 
-    @property
-    def price_diff(self) -> float:
-        diff = self.exit_price - self.entry_price if self.is_long else self.entry_price - self.exit_price
-        return diff - (self.total_transaction_costs/self.shares)
-    
-    @property
-    def profit_loss(self) -> float:
-        price_difference = self.exit_price - self.entry_price if self.is_long else self.entry_price - self.exit_price
-        gross_profit = price_difference * self.shares
-        return gross_profit - self.total_transaction_costs
 
-    @property
-    def profit_loss_percentage(self) -> float:
-        return (self.profit_loss / self.initial_balance) * 100
+    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
+        new_total_shares = self.current_shares + shares_to_buy
+        new_num_subs = self.calculate_num_sub_positions(new_total_shares)
+        
+        additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
+        self.cash_committed += additional_cash_committed
 
-    @property
-    def return_on_equity(self) -> float:
-        """Calculate return on equity, considering margin if used"""
-        equity_used = self.initial_balance / self.margin_multiplier
-        return (self.profit_loss / equity_used) * 100
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        current_sub_shares = [sp.shares for sp in active_sub_positions]
+        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
+
+        remaining_shares = shares_to_buy
+        new_sub_positions = []
+        for i in range(new_num_subs):
+            if i < len(active_sub_positions):
+                shares_to_add = target_shares[i] - active_sub_positions[i].shares
+                if shares_to_add > 0:
+                    sub_cash_committed = (shares_to_add * entry_price) / self.actual_margin_multiplier
+                    active_sub_positions[i].shares += shares_to_add
+                    self.current_shares += shares_to_add
+                    active_sub_positions[i].cash_committed += sub_cash_committed
+                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True)
+                    remaining_shares -= shares_to_add
+            else:
+                new_shares = min(target_shares[i], remaining_shares)
+                self.current_shares += new_shares
+                sub_cash_committed = (new_shares * entry_price) / self.actual_margin_multiplier
+                new_sub_positions.append(SubPosition(entry_time, entry_price, new_shares, sub_cash_committed))
+                self.add_transaction(entry_time, new_shares, entry_price, is_entry=True)
+                remaining_shares -= new_shares
+            if remaining_shares == 0:
+                break
+        # Add new sub-positions at the end
+        self.sub_positions.extend(new_sub_positions)
+        self.current_market_value = self.current_shares * entry_price
+        return additional_cash_committed
