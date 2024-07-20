@@ -60,32 +60,6 @@ class TradePosition:
     # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
     stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
     
-    # Note: This class assumes intraday trading. No overnight interest is calculated.
-     
-    """
-    stock_borrow_rate: Annual rate for borrowing the stock (for short positions)
-    - Expressed in decimal form (e.g., 0.003 for 30 bps, 0.03 for 300 bps)
-    - "bps" means basis points, where 1 bp = 0.01% = 0.0001 in decimal form
-    - For ETBs (easy to borrow stocks), this typically ranges from 30 to 300 bps annually
-    - 30 bps = 0.30% = 0.003 in decimal form
-    - 300 bps = 3.00% = 0.03 in decimal form
-    
-    Info from website:
-    - Borrow fees accrue daily and are billed at the end of each month. Borrow fees can vary significantly depending upon demand to short. 
-    - Generally, ETBs cost between 30 and 300bps annually.
-    
-    - Daily stock borrow fee = Daily ETB stock borrow fee + Daily HTB stock borrow fee
-    - Daily ETB stock borrow fee = (settlement date end of day total ETB short $ market value * that stock’s ETB rate) / 360
-    - Daily HTB stock borrow fee = Σ((each stock’s HTB short $ market value * that stock’s HTB rate) / 360)
-    
-    
-    See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#stock-borrow-rates
-    
-    If holding shorts overnight (unimplemented; not applicable to intraday trading):
-    - daily_margin_interest_charge = (settlement_date_debit_balance * 0.085) / 360
-    
-    See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#margin-interest-rate
-    """
     FINRA_TAF_RATE = 0.000119  # per share
     SEC_FEE_RATE = 22.90 / 1_000_000  # per dollar
     
@@ -112,14 +86,6 @@ class TradePosition:
     def total_shares(self) -> int:
         return sum(sp.shares for sp in self.sub_positions if sp.exit_time is None)
 
-    # def update_last_price(self, price: float):
-    #     old_market_value = self.market_value
-    #     self.last_price = price
-    #     self.market_value = self.shares * price
-    #     self.unrealized_pnl = self.market_value - (self.shares * self.entry_price)
-    #     return self.market_value - old_market_value
-        
-        
     def update_market_value(self, current_price: float):
         self.market_value = self.shares * current_price
         self.last_price = current_price
@@ -127,37 +93,6 @@ class TradePosition:
             self.unrealized_pnl = (current_price - self.entry_price) * self.shares
         else:
             self.unrealized_pnl = (self.entry_price - current_price) * self.shares
-    
-    # @property
-    # def cash_value(self):
-    #     return self.initial_cash_used
-    
-    # @property
-    # def equity_value(self):
-    #     return (self.market_value - self.initial_cash_used * self.actual_margin_multiplier) / self.actual_margin_multiplier
-    
-    # @property
-    # def num_sub_positions(self) -> int:
-    #     if self.times_buying_power <= 2:
-    #         return 1
-    #     elif self.initial_shares % 2 == 0:
-    #         return 2
-    #     else:
-    #         return 3
-        
-
-        
-    # def add_sub_position(self, entry_time: datetime, entry_price: float, shares: int):
-    #     self.sub_positions.append(SubPosition(entry_time, entry_price, shares))
-    #     self.add_shares(shares)
-    #     print(f'buying {shares} shares at {entry_time}, {entry_price:.4f} ({shares*entry_price:.4f})')
-    #     self.add_transaction(entry_time, shares, entry_price, is_entry=True)
-    #     assert shares > 0
-    
-    # def remove_share(self, )
-
-    # def calculate_max_shares(self, available_cash: float, current_price: float) -> int:
-    #     return math.floor((available_cash * self.times_buying_power) / current_price)
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
         cash_released = 0
@@ -446,25 +381,7 @@ class TradePosition:
         start_time = min(sp.entry_time for sp in self.sub_positions)
         end_time = max(sp.exit_time or datetime.now() for sp in self.sub_positions)
         return end_time - start_time
-    
 
-    # @property
-    # def profit_loss(self) -> float:
-    #     print(f'  Debug - profit_loss\n    Calculating PnL from {sum(1 for sp in self.sub_positions if sp.exit_time is not None)} / {len(self.sub_positions)} (exited/all) sub-positions:')
-        
-    #     realized_pnl = sum((sp.exit_price - sp.entry_price) * sp.shares if self.is_long else
-    #                     (sp.entry_price - sp.exit_price) * sp.shares
-    #                     for sp in self.sub_positions if sp.exit_time is not None)
-        
-    #     total_pl = (realized_pnl + self.unrealized_pnl) / self.times_buying_power
-    #     ret = total_pl - self.total_transaction_costs
-        
-    #     print(f'    total_pl = (realized_pnl + unrealized_pnl) / times_buying_power')
-    #     print(f'    = ({realized_pnl:.2f} + {self.unrealized_pnl:.2f}) / {self.times_buying_power:.2f} = {total_pl:.2f}')
-    #     print(f'    - {self.total_transaction_costs:.2f} fees = {ret:.2f}')
-        
-    #     return ret
-    
     
     @property
     def get_unrealized_pnl(self) -> float:
@@ -501,14 +418,6 @@ class TradePosition:
         diff = avg_exit_price - avg_entry_price
         return diff if self.is_long else -diff
 
-    # def current_value(self, current_price: float) -> float:
-    #     # market_value = self.shares * current_price
-    #     if self.is_long:
-    #         profit_loss = (current_price - self.entry_price) * self.shares
-    #     else:
-    #         profit_loss = (self.entry_price - current_price) * self.shares
-    #     return self.initial_cash_used + (profit_loss / self.actual_margin_multiplier)
-                
     @property
     def total_investment(self) -> float:
         return sum(sp.entry_price * sp.shares for sp in self.sub_positions)
@@ -516,50 +425,3 @@ class TradePosition:
     @property
     def margin_used(self) -> float:
         return self.total_investment - self.initial_balance
-            
-            
-
-
-
-import csv
-from datetime import datetime
-
-import pandas as pd
-
-def export_trades_to_csv(trades: List[TradePosition], filename: str):
-    """
-    Export the trades data to a CSV file using pandas.
-    
-    Args:
-    trades (list): List of TradePosition objects
-    filename (str): Name of the CSV file to be created
-    """
-    data = []
-    for trade in trades:
-        row = {
-            'ID': trade.id,
-            'Type': 'Long' if trade.is_long else 'Short',
-            'Entry Time': trade.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'Exit Time': trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time else '',
-            'Holding Time': str(trade.holding_time),
-            'Entry Price': f"{trade.entry_price:.4f}",
-            'Exit Price': f"{trade.exit_price:.4f}" if trade.exit_price else '',
-            'Initial Shares': f"{trade.initial_shares:.4f}",
-            'Realized P/L': f"{trade.realized_pnl:.4f}",
-            'Unrealized P/L': f"{trade.get_unrealized_pnl:.4f}",
-            'Total P/L': f"{trade.profit_loss:.4f}",
-            'P/L %': f"{trade.profit_loss_percentage:.2f}",
-            'ROE %': f"{trade.return_on_equity:.2f}",
-            'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
-            'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
-        }
-        data.append(row)
-        # print(row)  # Print each row for verification
-        # print(trade.transactions)
-
-    df = pd.DataFrame(data)
-    df.to_csv(filename, index=False)
-    print(f"Trade summary has been exported to {filename}")
-
-# # In your backtest_strategy function, replace or add after the print statements:
-# export_trades_to_csv(trades)
