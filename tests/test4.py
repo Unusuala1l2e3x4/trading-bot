@@ -1,87 +1,79 @@
-@dataclass
-class TradePosition:
-    # ... (existing attributes)
-    actual_margin_multiplier: float
-    times_buying_power: float
+    # You're right to point that out, and I apologize for the oversight. We should indeed keep using the `self.realized_pnl` attribute as it provides a running total of realized profits and losses, which can be useful for various calculations and tracking purposes. Let's modify our approach to incorporate this:
 
-    def calculate_num_sub_positions(self, total_shares: int) -> int:
-        if self.times_buying_power <= 2:
-            return 1
-        elif total_shares == self.initial_shares:
-            return 2 if total_shares % 2 == 0 else 3
-        else:
-            # For partial positions, calculate the minimum number of sub-positions needed
-            min_sub_positions = math.ceil(total_shares / (self.initial_shares / 2))
-            return min(min_sub_positions, 3)  # Cap at 3 sub-positions
+    # 1. Update the `add_transaction` method:
 
-    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
-        new_total_shares = self.current_shares + shares_to_buy
-        new_num_subs = self.calculate_num_sub_positions(new_total_shares)
+    # ```python
+    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool):
+        transaction_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
+        value = -shares * price if is_entry else shares * price  # Negative for buys, positive for sells
+        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, value)
+        self.transactions.append(transaction)
         
-        additional_cash_committed = (shares_to_buy * entry_price) / self.actual_margin_multiplier
-        self.remaining_cash_committed += additional_cash_committed
-
-        current_sub_shares = [sp.shares for sp in self.sub_positions if sp.shares > 0]
-        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
+        if not is_entry:
+            # Update realized_pnl only on exits
+            self.realized_pnl += value - transaction_cost
         
-        print(f"Debug - current_sub_shares: {current_sub_shares}, target_shares: {target_shares}, all_sub_shares: {[sp.shares for sp in self.sub_positions]}")
+        print(f'    add_transaction {timestamp}, {shares}, {price:.4f}, {is_entry}, {transaction_cost:.4f}, {value:.4f}')
+    # ```
 
-        remaining_shares = shares_to_buy
-        for i in range(new_num_subs):
-            if i < len(self.sub_positions) and self.sub_positions[i].shares > 0:
-                shares_to_add = target_shares[i] - self.sub_positions[i].shares
-                if shares_to_add > 0:
-                    self.sub_positions[i].shares += shares_to_add
-                    self.sub_positions[i].cash_committed += (shares_to_add * entry_price) / self.actual_margin_multiplier
-                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True)
-                    remaining_shares -= shares_to_add
-            else:
-                new_shares = min(target_shares[i], remaining_shares)
-                new_cash_committed = (new_shares * entry_price) / self.actual_margin_multiplier
-                new_sub_position = SubPosition(entry_time, entry_price, new_shares, new_cash_committed)
-                if i < len(self.sub_positions):
-                    self.sub_positions[i] = new_sub_position
-                else:
-                    self.sub_positions.append(new_sub_position)
-                self.add_transaction(entry_time, new_shares, entry_price, is_entry=True)
-                remaining_shares -= new_shares
+    # 2. Modify the `profit_loss` property:
 
-            if remaining_shares == 0:
-                break
-
-        # self.current_shares += shares_to_buy
-        self.current_market_value = self.current_shares * entry_price
+    # ```python
+    @property
+    def profit_loss(self) -> float:
+        unrealized_pnl = sum((self.last_price - sp.entry_price) * sp.shares if self.is_long else
+                            (sp.entry_price - self.last_price) * sp.shares
+                            for sp in self.sub_positions if sp.shares > 0)
         
-        print(f"Debug - After entry: all_sub_shares: {[sp.shares for sp in self.sub_positions]}")
+        total_pnl = self.realized_pnl + unrealized_pnl
+        adjusted_pnl = total_pnl / self.times_buying_power
+        
+        return adjusted_pnl
+    # ```
 
-        return additional_cash_committed
+    # 3. Keep the `partial_exit` function as it is in my previous response, but remove the `realized_pnl` calculation since it's now handled in `add_transaction`:
 
+    # ```python
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
-        if self.is_long:
-            realized_pnl = (exit_price - self.entry_price) * shares_to_sell
-        else:
-            realized_pnl = (self.entry_price - exit_price) * shares_to_sell
-        
         cash_released = 0
         remaining_shares_to_sell = shares_to_sell
 
-        for sp in reversed(self.sub_positions):
+        for sp in self.sub_positions:
             if sp.shares > 0 and remaining_shares_to_sell > 0:
                 shares_sold = min(sp.shares, remaining_shares_to_sell)
-                cash_released_from_sub = (shares_sold / sp.shares) * sp.cash_committed
+                
+                sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
+                
                 sp.shares -= shares_sold
-                sp.cash_committed -= cash_released_from_sub
-                cash_released += cash_released_from_sub
+                self.shares -= shares_sold
+                sp.cash_committed -= sub_cash_released
+                cash_released += sub_cash_released
+                
+                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False)
                 remaining_shares_to_sell -= shares_sold
 
                 if sp.shares == 0:
                     sp.exit_time = exit_time
                     sp.exit_price = exit_price
 
-        self.current_shares -= shares_to_sell
-        self.current_market_value = self.current_shares * exit_price
-        self.remaining_cash_committed -= cash_released
-        
-        self.add_transaction(exit_time, shares_to_sell, exit_price, is_entry=False)
-        
-        return realized_pnl / self.actual_margin_multiplier, cash_released
+        self.cash_committed -= cash_released
+        self.market_value = self.shares * exit_price
+        self.partial_exit_count += 1
+
+        print(f"Partial exit: {self.id} {exit_time.time()} - {'Long' if self.is_long else 'Short'} "
+            f"Sold {shares_to_sell} @ {exit_price:.4f} "
+            f"(From {self.shares + shares_to_sell} to {self.shares}). "
+            f"Cash released: {cash_released:.2f}, "
+            f"Realized PnL: {self.realized_pnl:.2f}")
+
+        return self.realized_pnl, self.realized_pnl / self.times_buying_power, cash_released
+    # ```
+
+    # These changes ensure that:
+
+    # 1. We're using the `self.realized_pnl` attribute to track realized profits and losses.
+    # 2. The `add_transaction` method updates `self.realized_pnl` for exit transactions.
+    # 3. The `profit_loss` property calculates total P&L using both realized and unrealized P&L, adjusting for leverage.
+    # 4. We're not double-counting realized P&L in the `partial_exit` function.
+
+    # This approach should provide more accurate P&L calculations while maintaining the use of the `self.realized_pnl` attribute. The `profit_loss` property now gives a complete picture of both realized and unrealized P&L, adjusted for leverage.

@@ -11,6 +11,8 @@ class Transaction:
     price: float
     is_entry: bool
     transaction_cost: float
+    value: float  # This will be the cost (negative) or revenue (positive)
+    realized_pnl: Optional[float] = None 
     
 @dataclass
 class SubPosition:
@@ -20,6 +22,7 @@ class SubPosition:
     cash_committed: float
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
+    transactions: List[Transaction] = field(default_factory=list)
 
 @dataclass
 class TradePosition:
@@ -39,6 +42,9 @@ class TradePosition:
     shares: int = 0
     partial_entry_count: int = 0
     partial_exit_count: int = 0
+    cumulative_realized_pnl = 0
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float] = None
     sub_positions: List[SubPosition] = field(default_factory=list)
     transactions: List[Transaction] = field(default_factory=list)
     current_stop_price: Optional[float] = None
@@ -47,6 +53,7 @@ class TradePosition:
     last_price: float = field(default=0.0)
     cash_committed: float = field(init=False)
     unrealized_pnl: float = field(default=0.0)
+    realized_pnl: float = 0
     # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
     stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
     
@@ -87,7 +94,11 @@ class TradePosition:
         self.cash_committed = 0
         assert self.times_buying_power <= 4
         
+        print(f'initial_shares {self.initial_shares}')
+        
         self.partial_entry(self.entry_time, self.entry_price, self.initial_shares)
+        
+        print(f'initial_shares {self.initial_shares}')
 
         
     @property
@@ -109,7 +120,10 @@ class TradePosition:
     def update_market_value(self, current_price: float):
         self.market_value = self.shares * current_price
         self.last_price = current_price
-        self.unrealized_pnl = self.market_value - (self.shares * self.entry_price)
+        if self.is_long:
+            self.unrealized_pnl = (current_price - self.entry_price) * self.shares
+        else:
+            self.unrealized_pnl = (self.entry_price - current_price) * self.shares
     
     # @property
     # def cash_value(self):
@@ -129,12 +143,6 @@ class TradePosition:
     #         return 3
         
 
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool):
-        transaction_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
-        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost)
-        self.transactions.append(transaction)
-        
-        print(f'    add_transaction {timestamp}, {shares}, {price:.4f}, {is_entry}, {transaction_cost:.4f}')
         
     # def add_sub_position(self, entry_time: datetime, entry_price: float, shares: int):
     #     self.sub_positions.append(SubPosition(entry_time, entry_price, shares))
@@ -149,69 +157,49 @@ class TradePosition:
     #     return math.floor((available_cash * self.times_buying_power) / current_price)
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
-        if self.is_long:
-            realized_pnl = (exit_price - self.entry_price) * shares_to_sell
-        else:
-            realized_pnl = (self.entry_price - exit_price) * shares_to_sell
-
-
-        print(f"  Debug - partial_exit:")
-        print(f"    Current shares: {self.shares}, Shares to sell: {shares_to_sell}")
-        # print(f"    Current sub-positions: {current_sub_shares}")
-        # print(f"    Target shares: {target_shares}")
-        print(f"    all_sub_shares: {[sp.shares for sp in self.sub_positions]}")
-
-
         cash_released = 0
+        realized_pnl = 0
         remaining_shares_to_sell = shares_to_sell
 
         for sp in self.sub_positions:
             if sp.shares > 0 and remaining_shares_to_sell > 0:
+                sp.entry_time
+                
+                
                 shares_sold = min(sp.shares, remaining_shares_to_sell)
                 
-                assert sp.shares >= shares_sold
-                
                 sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
+                sp_realized_pnl = (exit_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - exit_price) * shares_sold
+                
                 sp.shares -= shares_sold
                 self.shares -= shares_sold
                 sp.cash_committed -= sub_cash_released
                 cash_released += sub_cash_released
-                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False)
+                realized_pnl += sp_realized_pnl
+                
+                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sp_realized_pnl=sp_realized_pnl, start_time=sp.entry_time)
                 remaining_shares_to_sell -= shares_sold
 
                 if sp.shares == 0:
-                    assert sp.cash_committed == 0, sp.cash_committed
                     sp.exit_time = exit_time
                     sp.exit_price = exit_price
 
-        # self.shares -= shares_to_sell
-        self.market_value = self.shares * exit_price
         self.cash_committed -= cash_released
+        self.market_value = self.shares * exit_price
         self.partial_exit_count += 1
-        
-        assert round(self.cash_committed,10) == round(sum([sp.cash_committed for sp in self.sub_positions]),10), (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions]))
-        
-        # return realized_pnl / self.actual_margin_multiplier, cash_released
-        return realized_pnl / self.times_buying_power, cash_released
-    
-    
-    # @staticmethod
-    # def calculate_shares_per_sub(total_shares: int, num_subs: int) -> List[int]:
-    #     if num_subs == 1:
-    #         return [total_shares]
-    #     elif num_subs == 2:
-    #         return [total_shares // 2] * 2
-    #     else:  # 3 sub-positions
-    #         base_shares = total_shares // 3
-    #         extra_shares = total_shares % 3
-    #         return [base_shares + (1 if i < extra_shares else 0) for i in range(3)]
-            
-            
+
+        print(f"Partial exit: {self.id} {exit_time.time()} - {'Long' if self.is_long else 'Short'} "
+            f"Sold {shares_to_sell} @ {exit_price:.4f} "
+            f"(From {self.shares + shares_to_sell} to {self.shares}). "
+            f"Cash released: {cash_released:.2f}, "
+            f"Realized PnL for this exit: {realized_pnl:.2f} / {self.times_buying_power:.2f} = {realized_pnl / self.times_buying_power :.2f}")
+
+        return realized_pnl, realized_pnl / self.times_buying_power, cash_released
+                        
     # @staticmethod
     def calculate_num_sub_positions(self, total_shares: int) -> int:
         if self.times_buying_power <= 2:
             return 1
-        # elif total_shares % 2 == 0:
         elif self.initial_shares % 2 == 0:
             return 2
         else:
@@ -220,122 +208,95 @@ class TradePosition:
 
     # partial_entry issue: once there are 3 active sub-positions, its more expensive to decrease sub-positions than just distribute new shares to the existing ones.
     def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
-        target_shares = [total_shares // num_subs] * num_subs
-        remaining_shares = total_shares % num_subs
-
-        print(f"  Debug - calculate_shares_per_sub:")
-        print(f"    Current: {current_sub_shares}")
-        print(f"    Target:  {target_shares}")
+        target_shares = current_sub_shares.copy()
+        while len(target_shares) < num_subs:
+            target_shares.append(0)
         
-        
-        # Distribute remaining shares
-        for i in range(remaining_shares):
-            target_shares[i] += 1
+        shares_to_add = total_shares - sum(current_sub_shares)
+        max_shares_per_sub = self.initial_shares // num_subs
 
-        print(f"    Target:  {target_shares}")
+        for i in range(num_subs):
+            if shares_to_add > 0:
+                space_available = max_shares_per_sub - target_shares[i]
+                shares_added = min(space_available, shares_to_add)
+                target_shares[i] += shares_added
+                shares_to_add -= shares_added
 
-        # Adjust target shares based on current sub-position shares
-        for i in range(min(num_subs, len(current_sub_shares))):
-            
-            if target_shares[i] < current_sub_shares[i]:
-                print(current_sub_shares[i], target_shares[i])
-                
-                
-                excess = current_sub_shares[i] - target_shares[i]
-                target_shares[i] = current_sub_shares[i]
-                
-                # Redistribute excess to other sub-positions
-                for j in range(i + 1, num_subs):
-                    if target_shares[j] > excess:
-                        target_shares[j] -= excess
-                        break
-                    else:
-                        excess -= target_shares[j]
-                        target_shares[j] = 0
+        # If there are still shares to add, distribute them to the last sub-position
+        if shares_to_add > 0:
+            target_shares[-1] += shares_to_add
 
-        print(f"    Target:  {target_shares}")
-        
-        if len(target_shares) < len(current_sub_shares):
-            print('WARNING: target active sub-positions less than current active sub-positions.')
-        
         return target_shares
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
         new_total_shares = self.shares + shares_to_buy
-        new_num_subs = self.calculate_num_sub_positions(new_total_shares)  # should return the max allowed
-        
+        new_num_subs = self.calculate_num_sub_positions(new_total_shares)
+
         additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
         self.cash_committed += additional_cash_committed
 
-        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
-        current_sub_shares = [sp.shares for sp in active_sub_positions]
+        current_sub_shares = [sp.shares for sp in self.sub_positions if sp.exit_time is None]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
-        
-        print(f"  Debug - partial_entry:")
-        print(f"    Current shares: {self.shares}, Shares to buy: {shares_to_buy}")
-        print(f"    Current sub-positions: {current_sub_shares}")
-        print(f"    Target shares: {target_shares}")
-        print(f"    all_sub_shares: {[sp.shares for sp in self.sub_positions]}")
 
+        print(f"Debug - partial_entry:")
+        print(f"  New total shares: {new_total_shares}, New num subs: {new_num_subs}")
+        print(f"  All sub-positions: {[sp.shares for sp in self.sub_positions]}")
+        print(f"  Current active sub-positions: {current_sub_shares}")
+        print(f"  Target shares: {target_shares}")
+
+        shares_added = 0
         remaining_shares = shares_to_buy
-        new_sub_positions = []
 
-        for i in range(new_num_subs):
-            if i < len(active_sub_positions):
-                shares_to_add = target_shares[i] - active_sub_positions[i].shares
-                if shares_to_add > 0:
-                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
-                    active_sub_positions[i].shares += shares_to_add
-                    self.shares += shares_to_add
-                    active_sub_positions[i].cash_committed += sub_cash_committed
-                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True)
-                    remaining_shares -= shares_to_add
-            else:
-                new_shares = min(target_shares[i], remaining_shares)
-                self.shares += new_shares
-                sub_cash_committed = (new_shares * entry_price) / self.times_buying_power
-                new_sub_positions.append(SubPosition(entry_time, entry_price, new_shares, sub_cash_committed))
-                self.add_transaction(entry_time, new_shares, entry_price, is_entry=True)
-                remaining_shares -= new_shares
-
+        # Handle both initial entry and partial entries
+        target_index = 0
+        for sp in self.sub_positions:
             if remaining_shares == 0:
                 break
 
-        # Add new sub-positions at the end
-        self.sub_positions.extend(new_sub_positions)
-        
-        # self.shares += shares_to_buy
+            if sp.exit_time is None:
+                shares_to_add = min(target_shares[target_index] - sp.shares, remaining_shares)
+                if shares_to_add > 0:
+                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
+                    sp.shares += shares_to_add
+                    sp.cash_committed += sub_cash_committed
+                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True)
+                    shares_added += shares_to_add
+                    remaining_shares -= shares_to_add
+                target_index += 1
+
+        # Create new sub-positions if necessary
+        while remaining_shares > 0 and target_index < new_num_subs:
+            new_shares = min(target_shares[target_index], remaining_shares)
+            if new_shares > 0:
+                sub_cash_committed = (new_shares * entry_price) / self.times_buying_power
+                new_sub = SubPosition(entry_time, entry_price, new_shares, sub_cash_committed)
+                self.sub_positions.append(new_sub)
+                self.add_transaction(entry_time, new_shares, entry_price, is_entry=True)
+                shares_added += new_shares
+                remaining_shares -= new_shares
+            target_index += 1
+
+        self.shares += shares_added
+        assert shares_added == shares_to_buy, f"Incorrect number of shares added. Expected: {shares_to_buy}, Added: {shares_added}"
+
         self.market_value = self.shares * entry_price
         self.partial_entry_count += 1
-        
-        assert round(self.cash_committed,10) == round(sum([sp.cash_committed for sp in self.sub_positions]),10), (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions]), [sp.cash_committed for sp in self.sub_positions])
-        print(f"  Debug - After entry: all_sub_shares: {[sp.shares for sp in self.sub_positions]}, all_sub_cash_committed: {[sp.cash_committed for sp in self.sub_positions]}")
+
+        print(f"Partial entry: Position {self.id} {entry_time.time()} - {'Long' if self.is_long else 'Short'} "
+            f"Bought {shares_to_buy} @ {entry_price:.4f} "
+            f"(From {new_total_shares - shares_to_buy} to {new_total_shares}). "
+            f"Sub-pos: {len([sp for sp in self.sub_positions if sp.exit_time is None])}, "
+            f"Cash committed: {additional_cash_committed:.2f}")
+
+        assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.exit_time is None)) < 1e-8, \
+            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.exit_time is None)}, " \
+            f"Difference: {self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.exit_time is None)}, " \
+            f"Sub-position cash: {[sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]}"
 
         return additional_cash_committed
-                    
-            
-    def update_stop_price(self, current_price: float):
-        if self.is_long:
-            self.max_price = max(self.max_price or self.entry_price, current_price)
-            self.current_stop_price = self.max_price - self.area.get_range
-        else:
-            self.min_price = min(self.min_price or self.entry_price, current_price)
-            self.current_stop_price = self.min_price + self.area.get_range
+                                        
 
-    def should_exit(self, current_price: float) -> bool:
-        return (self.is_long and current_price <= self.current_stop_price) or \
-               (not self.is_long and current_price >= self.current_stop_price)
-
-    def close(self, exit_time: datetime, exit_price: float):
-        for sp in self.sub_positions:
-            if sp.exit_time is None:
-                sp.exit_time = exit_time
-                sp.exit_price = exit_price
-
-
-
-
-    def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime) -> float:
+    def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, start_time: Optional[datetime] = None) -> float:
         finra_taf = max(0.01, self.FINRA_TAF_RATE * shares)
         sec_fee = 0
         if not is_entry or (not self.is_long and is_entry):
@@ -343,12 +304,61 @@ class TradePosition:
             sec_fee = self.SEC_FEE_RATE * trade_value
         
         stock_borrow_cost = 0
-        if not self.is_long and is_entry:
-            # Calculate stock borrow cost for one day
+        if not self.is_long and not is_entry:
             daily_borrow_rate = self.stock_borrow_rate / 360
-            stock_borrow_cost = shares * price * daily_borrow_rate
+            # For exit, calculate cost based on actual holding time
+            if start_time is not None:
+                holding_time = timestamp - start_time
+                days_held = holding_time.total_seconds() / (24 * 60 * 60)
+                stock_borrow_cost = shares * price * daily_borrow_rate * days_held
+            else:
+                raise ValueError("start_time must be provided for exit transactions on short positions")
         
         return finra_taf + sec_fee + stock_borrow_cost
+
+    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool, sp_realized_pnl: Optional[float] = None, start_time: Optional[datetime] = None):
+        if not is_entry and not self.is_long and start_time is None:
+            raise ValueError("start_time must be provided for exit transactions on short positions")
+        
+        transaction_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp, start_time)
+        value = -shares * price if is_entry else shares * price  # Negative for buys, positive for sells
+        
+        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, value, sp_realized_pnl)
+        self.transactions.append(transaction)
+        
+        if not is_entry:
+            if sp_realized_pnl is None:
+                raise ValueError("sp_realized_pnl must be provided for exit transactions")
+            self.realized_pnl += sp_realized_pnl - transaction_cost
+        
+        print(f"    {'Entry' if is_entry else 'Exit'} transaction: {shares} shares at {price:.4f} = {value:.4f}. Fees = {transaction_cost:.4f}")
+        if not is_entry:
+            print(f"      Realized PnL = {sp_realized_pnl:.4f}")
+
+  
+    def update_stop_price(self, current_price: float):
+        if self.is_long:
+            self.max_price = max(self.max_price or self.entry_price, current_price)
+            self.current_stop_price = self.max_price - self.area.get_range
+        else:
+            self.min_price = min(self.min_price or self.entry_price, current_price)
+            self.current_stop_price = self.min_price + self.area.get_range
+        
+        self.update_market_value(current_price)
+        
+        return self.should_exit(current_price)
+
+    def should_exit(self, current_price: float) -> bool:
+        return (self.is_long and current_price <= self.current_stop_price) or \
+               (not self.is_long and current_price >= self.current_stop_price)
+
+    def close(self, exit_time: datetime, exit_price: float):
+        self.exit_time = exit_time
+        self.exit_price = exit_price
+        for sp in self.sub_positions:
+            if sp.exit_time is None:
+                sp.exit_time = exit_time
+                sp.exit_price = exit_price
 
     @property
     def entry_transaction_costs(self) -> float:
@@ -384,17 +394,42 @@ class TradePosition:
         start_time = min(sp.entry_time for sp in self.sub_positions)
         end_time = max(sp.exit_time or datetime.now() for sp in self.sub_positions)
         return end_time - start_time
+    
 
+    # @property
+    # def profit_loss(self) -> float:
+    #     print(f'  Debug - profit_loss\n    Calculating PnL from {sum(1 for sp in self.sub_positions if sp.exit_time is not None)} / {len(self.sub_positions)} (exited/all) sub-positions:')
+        
+    #     realized_pnl = sum((sp.exit_price - sp.entry_price) * sp.shares if self.is_long else
+    #                     (sp.entry_price - sp.exit_price) * sp.shares
+    #                     for sp in self.sub_positions if sp.exit_time is not None)
+        
+    #     total_pl = (realized_pnl + self.unrealized_pnl) / self.times_buying_power
+    #     ret = total_pl - self.total_transaction_costs
+        
+    #     print(f'    total_pl = (realized_pnl + unrealized_pnl) / times_buying_power')
+    #     print(f'    = ({realized_pnl:.2f} + {self.unrealized_pnl:.2f}) / {self.times_buying_power:.2f} = {total_pl:.2f}')
+    #     print(f'    - {self.total_transaction_costs:.2f} fees = {ret:.2f}')
+        
+    #     return ret
+    
+    
+    @property
+    def get_unrealized_pnl(self) -> float:
+        unrealized_pnl = sum((self.last_price - sp.entry_price) * sp.shares if self.is_long else
+                            (sp.entry_price - self.last_price) * sp.shares
+                            for sp in self.sub_positions if sp.shares > 0)
+        return unrealized_pnl / self.times_buying_power
+    
+    @property
+    def get_realized_pnl(self) -> float:
+        return self.realized_pnl / self.times_buying_power
+    
     @property
     def profit_loss(self) -> float:
-        realized_pl = sum((sp.exit_price - sp.entry_price) * sp.shares if self.is_long else
-                        (sp.entry_price - sp.exit_price) * sp.shares
-                        for sp in self.sub_positions if sp.exit_time is not None)
+        return self.get_unrealized_pnl + self.get_realized_pnl
         
-        # Use last_price for unrealized P&L
-        total_pl = (realized_pl + self.unrealized_pnl) / self.times_buying_power
-        
-        return total_pl - self.total_transaction_costs
+    
 
     @property
     def profit_loss_percentage(self) -> float:
@@ -437,36 +472,41 @@ class TradePosition:
 import csv
 from datetime import datetime
 
-def export_trades_to_csv(trades:List[TradePosition], filename:str):
+import pandas as pd
+
+def export_trades_to_csv(trades: List[TradePosition], filename: str):
     """
-    Export the trades data to a CSV file.
+    Export the trades data to a CSV file using pandas.
     
     Args:
     trades (list): List of TradePosition objects
     filename (str): Name of the CSV file to be created
     """
-    with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['ID', 'Type', 'Entry Time', 'Exit Time', 'Holding Time', 'Entry Price', 'Exit Price', 'Shares', 
-                      'P/L', 'P/L %', 'ROE %', 'Margin Multiplier', 'Transaction Costs']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for trade in trades:
-            writer.writerow({
-                'ID': trade.id,
-                'Type': 'Long' if trade.is_long else 'Short',
-                'Entry Time': trade.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
-                'Exit Time': trade.exit_time.strftime('%Y-%m-%d %H:%M:%S'),
-                'Holding Time': str(trade.holding_time),
-                'Entry Price': f"{trade.entry_price:.4f}",
-                'Exit Price': f"{trade.exit_price:.4f}",
-                'Shares': f"{trade.shares:.4f}",
-                'P/L': f"{trade.profit_loss:.4f}",
-                'P/L %': f"{trade.profit_loss_percentage:.2f}",
-                'ROE %': f"{trade.return_on_equity:.2f}",
-                'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
-                'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
-            })
+    data = []
+    for trade in trades:
+        row = {
+            'ID': trade.id,
+            'Type': 'Long' if trade.is_long else 'Short',
+            'Entry Time': trade.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'Exit Time': trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time else '',
+            'Holding Time': str(trade.holding_time),
+            'Entry Price': f"{trade.entry_price:.4f}",
+            'Exit Price': f"{trade.exit_price:.4f}" if trade.exit_price else '',
+            'Initial Shares': f"{trade.initial_shares:.4f}",
+            'Realized P/L': f"{trade.realized_pnl:.4f}",
+            'Unrealized P/L': f"{trade.get_unrealized_pnl:.4f}",
+            'Total P/L': f"{trade.profit_loss:.4f}",
+            'P/L %': f"{trade.profit_loss_percentage:.2f}",
+            'ROE %': f"{trade.return_on_equity:.2f}",
+            'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
+            'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
+        }
+        data.append(row)
+        # print(row)  # Print each row for verification
+        # print(trade.transactions)
 
+    df = pd.DataFrame(data)
+    df.to_csv(filename, index=False)
     print(f"Trade summary has been exported to {filename}")
 
 # # In your backtest_strategy function, replace or add after the print statements:
