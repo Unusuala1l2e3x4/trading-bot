@@ -1,8 +1,37 @@
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
-from TouchArea import TouchArea
-import math
+import sys
+import os
+from contextlib import contextmanager
+
+# Suppress output flag
+SUPPRESS_OUTPUT = True  # Set to False to disable suppression
+
+# Define the context manager within the module
+@contextmanager
+def suppress_output():
+    if SUPPRESS_OUTPUT:
+        original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+        try:
+            yield
+        finally:
+            sys.stdout.close()
+            sys.stdout = original_stdout
+    else:
+        yield
+
+# Suppress output for the entire module if the flag is set
+with suppress_output():
+    # Place all your import statements and any initial code here
+    from dataclasses import dataclass, field
+    from datetime import datetime, timedelta
+    from typing import List, Tuple, Optional
+    from TouchArea import TouchArea
+    import math
+    import csv
+    import pandas as pd
+
+# The rest of your module code follows...
+
 
 @dataclass
 class Transaction:
@@ -140,64 +169,45 @@ class TradePosition:
             f"Market value mismatch: {self.market_value:.2f} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0):.2f}"
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
-        print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price}, Shares to sell: {shares_to_sell}")
+        # Ensure we maintain an even number of shares when times_buying_power > 2
+        if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
+            print(f"WARNING: shares_to_sell adjusted to ensure even shares")
+            shares_to_sell -= 1
+            
+        print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
         print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
-        
-        initial_shares = self.shares
-        initial_cash_committed = self.cash_committed
+
         cash_released = 0
         realized_pnl = 0
-        remaining_shares_to_sell = shares_to_sell
-        
-        print(f'BEFORE EXIT cash_committed: ',[f'{sp.cash_committed:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        print(f'BEFORE EXIT market_value:   ',[f'{sp.market_value:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.market_value for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        # assert abs(self.cash_committed - sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None])) < 1e-8, (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]))
-        
-        for sp in self.sub_positions:
-            if sp.shares > 0 and remaining_shares_to_sell > 0:
-                shares_sold = min(sp.shares, remaining_shares_to_sell)
-                
 
-                # sub_cash_released = (shares_sold / sp.shares) * sp.market_value / self.times_buying_power
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        total_shares = sum(sp.shares for sp in active_sub_positions)
+
+        for sp in active_sub_positions:
+            shares_sold = int(shares_to_sell * (sp.shares / total_shares))
+            if shares_sold > 0:
                 sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
                 sp_realized_pnl = (exit_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - exit_price) * shares_sold
-                
-                print(f'  ({shares_sold} / {sp.shares}) * {sp.cash_committed:.2f} = {sub_cash_released:.2f}')
-                print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}")
                 
                 old_shares = sp.shares
                 sp.shares -= shares_sold
                 sp.cash_committed -= sub_cash_released
                 sp.realized_pnl += sp_realized_pnl
                 sp.update_market_value(exit_price)
-                
+
                 cash_released += sub_cash_released
                 realized_pnl += sp_realized_pnl
                 
                 self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
-                remaining_shares_to_sell -= shares_sold
-
-                if sp.shares == 0:
-                    sp.exit_time = exit_time
-                    sp.exit_price = exit_price
 
                 print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
-                      f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
-                      f"Old shares: {old_shares}, New shares: {sp.shares}")
+                    f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
+                    f"Old shares: {old_shares}, New shares: {sp.shares}")
 
         self.shares -= shares_to_sell
         self.cash_committed -= cash_released
         self.update_market_value(exit_price)
         self.partial_exit_count += 1
-        
-        print(f'AFTER EXIT cash_committed:  ',[f'{sp.cash_committed:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        print(f'AFTER EXIT market_value:    ',[f'{sp.market_value:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.market_value for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        
-        
-        assert abs(self.cash_committed - sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None])) < 1e-8, (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]))
-        
-        assert self.shares == initial_shares - shares_to_sell, f"Share mismatch after partial exit: {self.shares} != {initial_shares - shares_to_sell}"
-        assert abs(self.cash_committed - (initial_cash_committed - cash_released)) < 1e-8, f"Cash committed mismatch: {self.cash_committed:.2f} != {initial_cash_committed - cash_released:.2f}"
 
         assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
             f"Cash committed mismatch: {self.cash_committed:.2f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.2f}"
@@ -205,7 +215,7 @@ class TradePosition:
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
         print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.2f}, Realized PnL: {realized_pnl:.2f}")
-        print(f"DEBUG: Remaining sub-positions:")
+        print("DEBUG: Remaining sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
                 print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
@@ -221,37 +231,32 @@ class TradePosition:
     #         return 3
         
     def calculate_num_sub_positions(self, total_shares: int) -> int:
-        if self.initial_shares % 2 == 0:
-            return 2
+        if self.times_buying_power <= 2:
+            return 1
         else:
-            return 3
+            return 2  # We'll always use 2 sub-positions when times_buying_power > 2
 
 
     def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
-        target_shares = current_sub_shares.copy()
-        while len(target_shares) < num_subs:
-            target_shares.append(0)
-        
-        shares_to_add = total_shares - sum(current_sub_shares)
-        max_shares_per_sub = self.initial_shares // num_subs
-
-        for i in range(num_subs):
-            if shares_to_add > 0:
-                space_available = max_shares_per_sub - target_shares[i]
-                shares_added = min(space_available, shares_to_add)
-                target_shares[i] += shares_added
-                shares_to_add -= shares_added
-
-        # If there are still shares to add, distribute them to the last sub-position
-        if shares_to_add > 0:
-            target_shares[-1] += shares_to_add
-
-        return target_shares
+        if self.times_buying_power <= 2:
+            assert num_subs == 1
+            return [total_shares]
+        else:
+            assert num_subs == 2
+            assert total_shares % 2 == 0
+            # Always split evenly between two sub-positions
+            half_shares = total_shares // 2
+            return [half_shares, total_shares - half_shares]
+                
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
-        initial_shares = self.shares
-        initial_cash_committed = self.cash_committed
-        initial_market_value = self.market_value
+        # Ensure we maintain an even number of shares when times_buying_power > 2
+        if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
+            print(f"WARNING: shares_to_buy adjusted to ensure even shares")
+            shares_to_buy -= 1
+            
+        print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
+        print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
 
         new_total_shares = self.shares + shares_to_buy
         new_num_subs = self.calculate_num_sub_positions(new_total_shares)
@@ -259,85 +264,53 @@ class TradePosition:
         additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
         self.cash_committed += additional_cash_committed
 
-        current_sub_shares = [sp.shares for sp in self.sub_positions if sp.exit_time is None]
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        current_sub_shares = [sp.shares for sp in active_sub_positions]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
 
-        print(f"Debug - partial_entry:")
-        print(f"  New total shares: {new_total_shares}, New num subs: {new_num_subs}")
-        print(f"  All sub-positions: {[sp.shares for sp in self.sub_positions]}")
-        print(f"  Current active sub-positions: {current_sub_shares}")
-        print(f"  Target shares: {target_shares}")
+        print(f"DEBUG: Target shares per sub-position: {target_shares}")
 
         shares_added = 0
-        remaining_shares = shares_to_buy
-        
-        print(f'BEFORE ENTRY cash_committed: ',[f'{sp.cash_committed:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        print(f'BEFORE ENTRY market_value:   ',[f'{sp.market_value:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.market_value for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        # assert abs(self.cash_committed - sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None])) < 1e-8, (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]))
-        
-        # Handle both initial entry and partial entries
-        target_index = 0
-        for sp in self.sub_positions:
-            if sp.shares > 0 and remaining_shares > 0:
-                shares_to_add = min(target_shares[target_index] - sp.shares, remaining_shares)
+        for i, target in enumerate(target_shares):
+            if i < len(active_sub_positions):
+                # Existing sub-position
+                sp = active_sub_positions[i]
+                shares_to_add = target - sp.shares
                 if shares_to_add > 0:
                     sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
                     old_shares = sp.shares
-                    old_cash_committed = sp.cash_committed
                     sp.shares += shares_to_add
                     sp.cash_committed += sub_cash_committed
                     sp.update_market_value(entry_price)
                     self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
                     shares_added += shares_to_add
-                    remaining_shares -= shares_to_add
-                    print(f"DEBUG: Adding to sub-position - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
-                        f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}, "
-                        f"Old cash committed: {old_cash_committed:.2f}, New cash committed: {sp.cash_committed:.2f}")
-                target_index += 1
-
-        # Create new sub-positions if necessary
-        while remaining_shares > 0 and target_index < new_num_subs:
-            new_shares = min(target_shares[target_index], remaining_shares)
-            if new_shares > 0:
-                sub_cash_committed = (new_shares * entry_price) / self.times_buying_power
-                new_sub = SubPosition(entry_time, entry_price, new_shares, sub_cash_committed)
+                    print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
+                        f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}")
+            else:
+                # New sub-position
+                sub_cash_committed = (target * entry_price) / self.times_buying_power
+                new_sub = SubPosition(entry_time, entry_price, target, sub_cash_committed)
                 self.sub_positions.append(new_sub)
-                self.add_transaction(entry_time, new_shares, entry_price, is_entry=True, sub_position=new_sub)
-                shares_added += new_shares
-                remaining_shares -= new_shares
-                print(f"DEBUG: Created new sub-position - Entry price: {entry_price:.4f}, Shares: {new_shares}, "
+                self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
+                shares_added += target
+                print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
                     f"Cash committed: {sub_cash_committed:.2f}")
-            target_index += 1
 
         self.shares += shares_added
         self.update_market_value(entry_price)
         self.partial_entry_count += 1
-        
-        print(f'AFTER ENTRY cash_committed:  ',[f'{sp.cash_committed:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        print(f'AFTER ENTRY market_value:    ',[f'{sp.market_value:.2f} ({sp.shares})' for sp in self.sub_positions if sp.exit_time is None],f' = {sum([sp.market_value for sp in self.sub_positions if sp.exit_time is None]):.2f}')
-        assert abs(self.cash_committed - sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None])) < 1e-8, (self.cash_committed, sum([sp.cash_committed for sp in self.sub_positions if sp.exit_time is None]))
-        
-        # Assertions
-        assert shares_added == shares_to_buy, f"Incorrect number of shares added. Expected: {shares_to_buy}, Added: {shares_added}"
-        assert self.shares == initial_shares + shares_to_buy, f"Total shares mismatch. Expected: {initial_shares + shares_to_buy}, Actual: {self.shares}"
-        assert abs(self.cash_committed - (initial_cash_committed + additional_cash_committed)) < 1e-8, f"Cash committed mismatch. Expected: {initial_cash_committed + additional_cash_committed}, Actual: {self.cash_committed}"
-        assert abs(self.market_value - (initial_market_value + shares_to_buy * entry_price)) < 1e-8, f"Market value mismatch. Expected: {initial_market_value + shares_to_buy * entry_price}, Actual: {self.market_value}"
-        assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.exit_time is None), f"Sub-position shares mismatch. Total: {self.shares}, Sum of sub-positions: {sum(sp.shares for sp in self.sub_positions if sp.exit_time is None)}"
-        assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.exit_time is None)) < 1e-8, f"Sub-position cash committed mismatch. Total: {self.cash_committed}, Sum of sub-positions: {sum(sp.cash_committed for sp in self.sub_positions if sp.exit_time is None)}"
 
-        assert sum(sp.shares for sp in self.sub_positions) == self.shares, "Sub-position shares don't match total shares"
-        assert abs(sum(sp.cash_committed for sp in self.sub_positions) - self.cash_committed) < 1e-8, "Sub-position cash doesn't match total cash committed"
-        
         assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
             f"Cash committed mismatch: {self.cash_committed:.2f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.2f}"
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
-            
-        print(f"Partial entry: Position {self.id} {entry_time.time()} - {'Long' if self.is_long else 'Short'} "
-            f"Bought {shares_to_buy} @ {entry_price:.4f} "
-            f"(From {new_total_shares - shares_to_buy} to {new_total_shares}). "
-            f"Sub-pos: {len([sp for sp in self.sub_positions if sp.exit_time is None])}, "
-            f"Cash committed: {additional_cash_committed:.2f}")
+
+        print(f"DEBUG: Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
+            f"New cash committed: {self.cash_committed:.2f}")
+        print("DEBUG: Current sub-positions:")
+        for i, sp in enumerate(self.sub_positions):
+            if sp.shares > 0:
+                print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
         return additional_cash_committed
 

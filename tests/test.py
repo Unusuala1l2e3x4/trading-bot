@@ -1,117 +1,120 @@
-    # Certainly. I'll provide enhanced debug statements and assertions for the key functions involved in this process. We'll focus on the `partial_exit` method of the `TradePosition` class and the `update_positions` function in the main strategy loop. Here's how we can modify these:
+    # You're absolutely correct. We don't need to worry about already-exited sub-positions because, as you pointed out:
 
-    # 1. In the `TradePosition` class, update the `partial_exit` method:
+    # 1. We adjust all active sub-positions proportionally during partial exits.
+    # 2. Sub-positions only go to zero on the final exit.
+
+    # This approach simplifies our logic and ensures that we're always working with active sub-positions. Let's update our code to reflect this understanding:
+
+    # 1. In the `partial_exit` method, we can simplify our loop:
 
     # ```python
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
-        print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price}, Shares to sell: {shares_to_sell}")
+        print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
         print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
-        
-        initial_shares = self.shares
-        initial_cash_committed = self.cash_committed
+
         cash_released = 0
         realized_pnl = 0
-        remaining_shares_to_sell = shares_to_sell
 
-        for sp in self.sub_positions:
-            if sp.shares > 0 and remaining_shares_to_sell > 0:
-                shares_sold = min(sp.shares, remaining_shares_to_sell)
-                
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        total_shares = sum(sp.shares for sp in active_sub_positions)
+
+        for sp in active_sub_positions:
+            shares_sold = int(shares_to_sell * (sp.shares / total_shares))
+            if shares_sold > 0:
                 sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
                 sp_realized_pnl = (exit_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - exit_price) * shares_sold
                 
-                print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, Realized PnL: {sp_realized_pnl:.2f}")
-                
+                old_shares = sp.shares
                 sp.shares -= shares_sold
-                self.shares -= shares_sold
                 sp.cash_committed -= sub_cash_released
+                sp.realized_pnl += sp_realized_pnl
+                sp.update_market_value(exit_price)
+
                 cash_released += sub_cash_released
                 realized_pnl += sp_realized_pnl
                 
                 self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
-                remaining_shares_to_sell -= shares_sold
 
-                if sp.shares == 0:
-                    sp.exit_time = exit_time
-                    sp.exit_price = exit_price
+                print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
+                    f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
+                    f"Old shares: {old_shares}, New shares: {sp.shares}")
 
+        self.shares -= shares_to_sell
         self.cash_committed -= cash_released
-        self.market_value = self.shares * exit_price
+        self.update_market_value(exit_price)
         self.partial_exit_count += 1
 
-        assert self.shares == initial_shares - shares_to_sell, f"Share mismatch after partial exit: {self.shares} != {initial_shares - shares_to_sell}"
-        assert abs(self.cash_committed - (initial_cash_committed - cash_released)) < 1e-8, f"Cash committed mismatch: {self.cash_committed:.2f} != {initial_cash_committed - cash_released:.2f}"
-
-        print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.2f}, Realized PnL: {realized_pnl:.2f}")
-        print(f"DEBUG: Remaining sub-positions:")
-        for i, sp in enumerate(self.sub_positions):
-            if sp.shares > 0:
-                print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
-
-        return realized_pnl, realized_pnl / self.times_buying_power, cash_released
+        # ... (rest of the method, including assertions and debug prints)
     # ```
 
-    # 2. In the main strategy loop, update the `update_positions` function:
+    # 2. In the `partial_entry` method, we can simplify our logic for distributing new shares:
 
     # ```python
-    def update_positions(timestamp, open_price, high_price, low_price, close_price):
-        print(f"\nDEBUG: Updating positions at {timestamp}, Close price: {close_price:.4f}")
-        
-        for area_id, position in list(open_positions.items()):
-            print(f"\nDEBUG: Processing position {position.id} for area {area_id}")
-            print(f"  Current position - Shares: {position.shares}, Cash committed: {position.cash_committed:.2f}")
-            
-            if position.update_stop_price(close_price):
-                print(f"  Stop price triggered: {position.current_stop_price:.4f}")
-                perform_exit(area_id, position)
+    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
+        print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
+        print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
+
+        new_total_shares = self.shares + shares_to_buy
+        new_num_subs = self.calculate_num_sub_positions(new_total_shares)
+
+        additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
+        self.cash_committed += additional_cash_committed
+
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        current_sub_shares = [sp.shares for sp in active_sub_positions]
+        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
+
+        print(f"DEBUG: Target shares per sub-position: {target_shares}")
+
+        shares_added = 0
+        for i, target in enumerate(target_shares):
+            if i < len(active_sub_positions):
+                # Existing sub-position
+                sp = active_sub_positions[i]
+                shares_to_add = target - sp.shares
+                if shares_to_add > 0:
+                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
+                    old_shares = sp.shares
+                    sp.shares += shares_to_add
+                    sp.cash_committed += sub_cash_committed
+                    sp.update_market_value(entry_price)
+                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
+                    shares_added += shares_to_add
+                    print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
+                        f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}")
             else:
-                target_shares = calculate_target_shares(position, close_price)
-                print(f"  Target shares: {target_shares}, Current shares: {position.shares}")
-                
-                if target_shares < position.shares:
-                    shares_to_adjust = position.shares - target_shares
-                    print(f"  Initiating partial exit - Shares to sell: {shares_to_adjust}")
-                    realized_pnl, adjusted_realized_pnl, cash_released = position.partial_exit(timestamp, close_price, shares_to_adjust)
-                    print(f"  Partial exit complete - Realized PnL: {realized_pnl:.2f}, Adjusted PnL: {adjusted_realized_pnl:.2f}, Cash released: {cash_released:.2f}")
-                    rebalance(cash_released + adjusted_realized_pnl, close_price)
-                elif target_shares > position.shares:
-                    shares_to_adjust = target_shares - position.shares
-                    print(f"  Initiating partial entry - Shares to buy: {shares_to_adjust}")
-                    max_shares, actual_margin_multiplier, overall_margin_multiplier = calculate_max_position_size(close_price)
-                    shares_to_buy = min(shares_to_adjust, max_shares)
-                    if shares_to_buy > 0:
-                        cash_needed = position.partial_entry(timestamp, close_price, shares_to_buy)
-                        print(f"  Partial entry complete - Shares bought: {shares_to_buy}, Cash used: {cash_needed:.2f}")
-                        rebalance(-cash_needed, close_price)
-                    else:
-                        print(f"  WARNING: Insufficient balance to buy any shares. Desired: {shares_to_adjust}, Max possible: {max_shares}")
-            
-            print(f"  Final position - Shares: {position.shares}, Cash committed: {position.cash_committed:.2f}")
-            
-        update_total_account_value(close_price, 'AFTER removing exited positions')
+                # New sub-position
+                sub_cash_committed = (target * entry_price) / self.times_buying_power
+                new_sub = SubPosition(entry_time, entry_price, target, sub_cash_committed)
+                self.sub_positions.append(new_sub)
+                self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
+                shares_added += target
+                print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
+                    f"Cash committed: {sub_cash_committed:.2f}")
+
+        self.shares += shares_added
+        self.update_market_value(entry_price)
+        self.partial_entry_count += 1
+
+        # ... (rest of the method, including assertions and debug prints)
     # ```
 
-    # 3. Add an assertion in the `rebalance` function:
+    # 3. We can also simplify the `calculate_shares_per_sub` method:
 
     # ```python
-    def rebalance(cash_change: float, current_price: float = None):
-        nonlocal balance, total_account_value
-        old_balance = balance
-        new_balance = balance + cash_change
-        
-        assert new_balance >= 0, f"Negative balance encountered: {new_balance:.2f}"
-        
-        balance = new_balance
-
-        if current_price is not None:
-            update_total_account_value(current_price, 'REBALANCE')
-        
-        print(f"Rebalance: Old balance: {old_balance:.4f}, Change: {cash_change:.4f}, New balance: {balance:.4f}, Total Account Value: {total_account_value:.4f}")
-
-        assert abs(total_account_value - (balance + sum(pos.market_value for pos in open_positions.values()))) < 1e-8, \
-            f"Total account value mismatch: {total_account_value:.2f} != {balance + sum(pos.market_value for pos in open_positions.values()):.2f}"
+    def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
+        if num_subs == 1:
+            return [total_shares]
+        elif len(current_sub_shares) == 0:
+            # Initial entry
+            return [total_shares // 2, total_shares - (total_shares // 2)]
+        else:
+            # Adjusting existing sub-positions
+            total_current_shares = sum(current_sub_shares)
+            shares_to_add = total_shares - total_current_shares
+            return [s + (shares_to_add * s // total_current_shares) for s in current_sub_shares]
     # ```
 
-    # These debug statements and assertions will help track the flow of the partial exits and entries, providing more detailed information about the state of the positions and the changes being made. They will also help catch any inconsistencies in the calculations.
+    # These changes simplify our logic by focusing only on active sub-positions. We no longer need to worry about already-exited sub-positions, as they are effectively removed from our calculations.
 
-    # When you run the strategy with these modifications, you should get a clearer picture of what's happening during the critical moments, especially around the 11:46:00 timestamp where the deviation occurs. This will help identify any discrepancies in how the 2x and 2.1x leverage cases are being handled.
+    # This approach should make the code more straightforward and less prone to errors related to inactive sub-positions. It also ensures that we're always working with the correct set of active sub-positions when making adjustments to the position.
