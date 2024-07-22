@@ -59,13 +59,11 @@ class TradePosition:
     is_marginable: bool
     times_buying_power: float
     actual_margin_multiplier: float
-    # initial_cash_used: float
     entry_price: float
     market_value: float = 0
     shares: int = 0
     partial_entry_count: int = 0
     partial_exit_count: int = 0
-    # cumulative_realized_pnl = 0
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     sub_positions: List[SubPosition] = field(default_factory=list)
@@ -195,20 +193,12 @@ class TradePosition:
 
         return realized_pnl, realized_pnl / self.times_buying_power, cash_released
                         
-    # def calculate_num_sub_positions(self, total_shares: int) -> int:
-    #     if self.times_buying_power <= 2:
-    #         return 1
-    #     elif self.initial_shares % 2 == 0:
-    #         return 2
-    #     else:
-    #         return 3
         
     def calculate_num_sub_positions(self, total_shares: int) -> int:
         if self.times_buying_power <= 2:
             return 1
         else:
             return 2  # We'll always use 2 sub-positions when times_buying_power > 2
-
 
     def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
         if self.times_buying_power <= 2:
@@ -456,8 +446,6 @@ class TradePosition:
     def profit_loss(self) -> float:
         return self.get_unrealized_pnl + self.get_realized_pnl - self.total_transaction_costs
         
-    
-
     @property
     def profit_loss_percentage(self) -> float:
         return (self.profit_loss / self.initial_balance) * 100
@@ -475,14 +463,6 @@ class TradePosition:
         avg_exit_price = sum(sp.exit_price * sp.shares for sp in self.sub_positions) / sum(sp.shares for sp in self.sub_positions)
         diff = avg_exit_price - avg_entry_price
         return diff if self.is_long else -diff
-
-    # def current_value(self, current_price: float) -> float:
-    #     # market_value = self.shares * current_price
-    #     if self.is_long:
-    #         profit_loss = (current_price - self.entry_price) * self.shares
-    #     else:
-    #         profit_loss = (self.entry_price - current_price) * self.shares
-    #     return self.initial_cash_used + (profit_loss / self.actual_margin_multiplier)
                 
     @property
     def total_investment(self) -> float:
