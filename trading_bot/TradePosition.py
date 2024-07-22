@@ -116,9 +116,10 @@ class TradePosition:
         assert self.times_buying_power <= 4
         
         debug_print(f'initial_shares {self.initial_shares}')
-        
-        self.partial_entry(self.entry_time, self.entry_price, self.initial_shares)
 
+
+    def initial_entry(self):
+        return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares)
         
     @property
     def is_open(self) -> bool:
@@ -150,6 +151,7 @@ class TradePosition:
 
         cash_released = 0
         realized_pnl = 0
+        fees = 0
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
         total_shares = sum(sp.shares for sp in active_sub_positions)
@@ -164,12 +166,12 @@ class TradePosition:
                 sp.shares -= shares_sold
                 sp.cash_committed -= sub_cash_released
                 sp.realized_pnl += sp_realized_pnl
-                sp.update_market_value(exit_price)
+                # sp.update_market_value(exit_price)
 
                 cash_released += sub_cash_released
                 realized_pnl += sp_realized_pnl
                 
-                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
+                fees += self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
 
                 debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
                     f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
@@ -191,7 +193,7 @@ class TradePosition:
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
-        return realized_pnl, realized_pnl / self.times_buying_power, cash_released
+        return realized_pnl, cash_released, fees
                         
         
     def calculate_num_sub_positions(self, total_shares: int) -> int:
@@ -231,6 +233,8 @@ class TradePosition:
         current_sub_shares = [sp.shares for sp in active_sub_positions]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
 
+        fees = 0
+
         debug_print(f"DEBUG: Target shares per sub-position: {target_shares}")
 
         shares_added = 0
@@ -244,8 +248,8 @@ class TradePosition:
                     old_shares = sp.shares
                     sp.shares += shares_to_add
                     sp.cash_committed += sub_cash_committed
-                    sp.update_market_value(entry_price)
-                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
+                    # sp.update_market_value(entry_price)
+                    fees += self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
                     shares_added += shares_to_add
                     debug_print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
                         f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}")
@@ -254,7 +258,7 @@ class TradePosition:
                 sub_cash_committed = (target * entry_price) / self.times_buying_power
                 new_sub = SubPosition(entry_time, entry_price, target, sub_cash_committed)
                 self.sub_positions.append(new_sub)
-                self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
+                fees += self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
                 shares_added += target
                 debug_print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
                     f"Cash committed: {sub_cash_committed:.2f}")
@@ -275,7 +279,7 @@ class TradePosition:
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
-        return additional_cash_committed
+        return additional_cash_committed, fees
 
 
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
@@ -339,10 +343,8 @@ class TradePosition:
             f"Value: {value:.2f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
         debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.2f}, "
             f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
-        
-        # debug_print(f"    {'Entry' if is_entry else 'Exit'} transaction: {shares} shares at {price:.4f} = {value:.4f}. Fees = {transaction_cost:.4f}")
-        # if not is_entry:
-        #     debug_print(f"      Realized PnL = {sp_realized_pnl:.4f}")
+
+        return transaction_cost
 
   
     def update_stop_price(self, current_price: float):
@@ -368,18 +370,6 @@ class TradePosition:
             if sp.exit_time is None:
                 sp.exit_time = exit_time
                 sp.exit_price = exit_price
-
-    @property
-    def entry_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions if t.is_entry) / self.times_buying_power
-
-    @property
-    def exit_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions if not t.is_entry) / self.times_buying_power
-
-    @property
-    def total_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions) / self.times_buying_power
 
     @property
     def total_stock_borrow_cost(self) -> float:
@@ -433,14 +423,26 @@ class TradePosition:
         start_time = min(sp.entry_time for sp in self.sub_positions)
         end_time = max(sp.exit_time or datetime.now() for sp in self.sub_positions)
         return end_time - start_time
-                    
+
+    @property
+    def entry_transaction_costs(self) -> float:
+        return sum(t.transaction_cost for t in self.transactions if t.is_entry) # / self.times_buying_power
+
+    @property
+    def exit_transaction_costs(self) -> float:
+        return sum(t.transaction_cost for t in self.transactions if not t.is_entry) # / self.times_buying_power
+
+    @property
+    def total_transaction_costs(self) -> float:
+        return sum(t.transaction_cost for t in self.transactions) # / self.times_buying_power
+    
     @property
     def get_unrealized_pnl(self) -> float:
-        return self.unrealized_pnl / self.times_buying_power
+        return self.unrealized_pnl # / self.times_buying_power
                     
     @property
     def get_realized_pnl(self) -> float:
-        return self.realized_pnl / self.times_buying_power
+        return self.realized_pnl # / self.times_buying_power
             
     @property
     def profit_loss(self) -> float:
@@ -449,12 +451,7 @@ class TradePosition:
     @property
     def profit_loss_percentage(self) -> float:
         return (self.profit_loss / self.initial_balance) * 100
-
-    @property
-    def return_on_equity(self) -> float:
-        equity_used = self.initial_balance # / self.times_buying_power
-        return (self.profit_loss / equity_used) * 100
-
+    
     @property
     def price_diff(self) -> float:
         if not self.sub_positions or any(sp.exit_time is None for sp in self.sub_positions):
@@ -503,8 +500,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Realized P/L': f"{trade.realized_pnl:.4f}",
             'Unrealized P/L': f"{trade.get_unrealized_pnl:.4f}",
             'Total P/L': f"{trade.profit_loss:.4f}",
-            'P/L %': f"{trade.profit_loss_percentage:.2f}",
-            'ROE %': f"{trade.return_on_equity:.2f}",
+            'ROE (P/L %)': f"{trade.profit_loss_percentage:.2f}",
             'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
             'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
         }
