@@ -1,38 +1,19 @@
-import sys
-import os
-from contextlib import contextmanager
 
-# Suppress output flag
-SUPPRESS_OUTPUT = True  # Set to False to disable suppression
-
-# Define the context manager within the module
-@contextmanager
-def suppress_output():
-    if SUPPRESS_OUTPUT:
-        original_stdout = sys.stdout
-        sys.stdout = open(os.devnull, 'w')
-        try:
-            yield
-        finally:
-            sys.stdout.close()
-            sys.stdout = original_stdout
-    else:
-        yield
-
-# Suppress output for the entire module if the flag is set
-with suppress_output():
-    # Place all your import statements and any initial code here
-    from dataclasses import dataclass, field
-    from datetime import datetime, timedelta
-    from typing import List, Tuple, Optional
-    from TouchArea import TouchArea
-    import math
-    import csv
-    import pandas as pd
-
-# The rest of your module code follows...
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional
+from TouchArea import TouchArea
+import math
+import csv
+import pandas as pd
 
 
+debug = False
+def debug_print(*args, **kwargs):
+    if debug:
+        debug_print(*args, **kwargs)
+
+        
 @dataclass
 class Transaction:
     timestamp: datetime
@@ -136,7 +117,7 @@ class TradePosition:
         self.cash_committed = 0
         assert self.times_buying_power <= 4
         
-        print(f'initial_shares {self.initial_shares}')
+        debug_print(f'initial_shares {self.initial_shares}')
         
         self.partial_entry(self.entry_time, self.entry_price, self.initial_shares)
 
@@ -148,14 +129,6 @@ class TradePosition:
     @property
     def total_shares(self) -> int:
         return sum(sp.shares for sp in self.sub_positions if sp.exit_time is None)
-
-    # def update_last_price(self, price: float):
-    #     old_market_value = self.market_value
-    #     self.last_price = price
-    #     self.market_value = self.shares * price
-    #     self.unrealized_pnl = self.market_value - (self.shares * self.entry_price)
-    #     return self.market_value - old_market_value
-        
                         
     def update_market_value(self, current_price: float):
         self.last_price = current_price
@@ -171,11 +144,11 @@ class TradePosition:
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
-            print(f"WARNING: shares_to_sell adjusted to ensure even shares")
+            debug_print(f"WARNING: shares_to_sell adjusted to ensure even shares")
             shares_to_sell -= 1
             
-        print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
-        print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
+        debug_print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
+        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
 
         cash_released = 0
         realized_pnl = 0
@@ -200,7 +173,7 @@ class TradePosition:
                 
                 self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
 
-                print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
+                debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
                     f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
                     f"Old shares: {old_shares}, New shares: {sp.shares}")
 
@@ -214,11 +187,11 @@ class TradePosition:
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
-        print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.2f}, Realized PnL: {realized_pnl:.2f}")
-        print("DEBUG: Remaining sub-positions:")
+        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.2f}, Realized PnL: {realized_pnl:.2f}")
+        debug_print("DEBUG: Remaining sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
-                print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
+                debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
         return realized_pnl, realized_pnl / self.times_buying_power, cash_released
                         
@@ -252,11 +225,11 @@ class TradePosition:
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
-            print(f"WARNING: shares_to_buy adjusted to ensure even shares")
+            debug_print(f"WARNING: shares_to_buy adjusted to ensure even shares")
             shares_to_buy -= 1
             
-        print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
-        print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
+        debug_print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
+        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
 
         new_total_shares = self.shares + shares_to_buy
         new_num_subs = self.calculate_num_sub_positions(new_total_shares)
@@ -268,7 +241,7 @@ class TradePosition:
         current_sub_shares = [sp.shares for sp in active_sub_positions]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
 
-        print(f"DEBUG: Target shares per sub-position: {target_shares}")
+        debug_print(f"DEBUG: Target shares per sub-position: {target_shares}")
 
         shares_added = 0
         for i, target in enumerate(target_shares):
@@ -284,7 +257,7 @@ class TradePosition:
                     sp.update_market_value(entry_price)
                     self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
                     shares_added += shares_to_add
-                    print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
+                    debug_print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
                         f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}")
             else:
                 # New sub-position
@@ -293,7 +266,7 @@ class TradePosition:
                 self.sub_positions.append(new_sub)
                 self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
                 shares_added += target
-                print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
+                debug_print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
                     f"Cash committed: {sub_cash_committed:.2f}")
 
         self.shares += shares_added
@@ -305,12 +278,12 @@ class TradePosition:
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
-        print(f"DEBUG: Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
+        debug_print(f"DEBUG: Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
             f"New cash committed: {self.cash_committed:.2f}")
-        print("DEBUG: Current sub-positions:")
+        debug_print("DEBUG: Current sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
-                print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
+                debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
         return additional_cash_committed
 
@@ -352,8 +325,8 @@ class TradePosition:
             
             stock_borrow_cost = shares * price * daily_borrow_rate * (total_days_held / shares)
             
-            # print(f'stock_borrow_cost: {stock_borrow_cost:.4f}')
-            # print(f'{finra_taf + sec_fee:.4f} + {stock_borrow_cost:.4f} = {finra_taf + sec_fee + stock_borrow_cost:.4f}')
+            # debug_print(f'stock_borrow_cost: {stock_borrow_cost:.4f}')
+            # debug_print(f'{finra_taf + sec_fee:.4f} + {stock_borrow_cost:.4f} = {finra_taf + sec_fee + stock_borrow_cost:.4f}')
             
         return finra_taf + sec_fee + stock_borrow_cost
 
@@ -372,14 +345,14 @@ class TradePosition:
                 raise ValueError("sp_realized_pnl must be provided for exit transactions")
             self.realized_pnl += sp_realized_pnl
             
-        print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
+        debug_print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
             f"Value: {value:.2f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
-        print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.2f}, "
+        debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.2f}, "
             f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
         
-        # print(f"    {'Entry' if is_entry else 'Exit'} transaction: {shares} shares at {price:.4f} = {value:.4f}. Fees = {transaction_cost:.4f}")
+        # debug_print(f"    {'Entry' if is_entry else 'Exit'} transaction: {shares} shares at {price:.4f} = {value:.4f}. Fees = {transaction_cost:.4f}")
         # if not is_entry:
-        #     print(f"      Realized PnL = {sp_realized_pnl:.4f}")
+        #     debug_print(f"      Realized PnL = {sp_realized_pnl:.4f}")
 
   
     def update_stop_price(self, current_price: float):
@@ -556,8 +529,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
         }
         data.append(row)
-        # print(row)  # Print each row for verification
-        # print(trade.transactions)
+        # debug_print(row)  # Print each row for verification
+        # debug_print(trade.transactions)
 
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
