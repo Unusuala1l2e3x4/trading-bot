@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
-import csv
+import pandas as pd
+from datetime import datetime
 import pandas as pd
 
 
@@ -13,7 +14,7 @@ def debug_print(*args, **kwargs):
     if debug:
         debug_print(*args, **kwargs)
 
-        
+
 @dataclass
 class Transaction:
     timestamp: datetime
@@ -23,7 +24,7 @@ class Transaction:
     transaction_cost: float
     value: float  # This will be the cost (negative) or revenue (positive)
     realized_pnl: Optional[float] = None 
-    
+
 @dataclass
 class SubPosition:
     entry_time: datetime
@@ -194,8 +195,8 @@ class TradePosition:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
         return realized_pnl, cash_released, fees
-                        
-        
+
+
     def calculate_num_sub_positions(self, total_shares: int) -> int:
         if self.times_buying_power <= 2:
             return 1
@@ -212,7 +213,7 @@ class TradePosition:
             # Always split evenly between two sub-positions
             half_shares = total_shares // 2
             return [half_shares, total_shares - half_shares]
-                
+
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
         # Ensure we maintain an even number of shares when times_buying_power > 2
@@ -227,17 +228,16 @@ class TradePosition:
         new_num_subs = self.calculate_num_sub_positions(new_total_shares)
 
         additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
-        self.cash_committed += additional_cash_committed
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
         current_sub_shares = [sp.shares for sp in active_sub_positions]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
 
         fees = 0
+        shares_added = 0
 
         debug_print(f"DEBUG: Target shares per sub-position: {target_shares}")
 
-        shares_added = 0
         for i, target in enumerate(target_shares):
             if i < len(active_sub_positions):
                 # Existing sub-position
@@ -264,6 +264,7 @@ class TradePosition:
                     f"Cash committed: {sub_cash_committed:.2f}")
 
         self.shares += shares_added
+        self.cash_committed += additional_cash_committed
         self.update_market_value(entry_price)
         self.partial_entry_count += 1
 
@@ -281,7 +282,11 @@ class TradePosition:
 
         return additional_cash_committed, fees
 
-
+    @staticmethod
+    def estimate_entry_cost(shares: int):
+        entry_finra_taf = max(0.01, TradePosition.FINRA_TAF_RATE * shares)
+        return entry_finra_taf
+    
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
         finra_taf = max(0.01, self.FINRA_TAF_RATE * shares)
         sec_fee = 0
@@ -317,7 +322,7 @@ class TradePosition:
                     if shares_to_remove <= 0:
                         break
             
-            stock_borrow_cost = shares * price * daily_borrow_rate * (total_days_held / shares)
+            stock_borrow_cost = shares * price * daily_borrow_rate * total_days_held
             
             # debug_print(f'stock_borrow_cost: {stock_borrow_cost:.4f}')
             # debug_print(f'{finra_taf + sec_fee:.4f} + {stock_borrow_cost:.4f} = {finra_taf + sec_fee + stock_borrow_cost:.4f}')
@@ -435,23 +440,23 @@ class TradePosition:
     @property
     def total_transaction_costs(self) -> float:
         return sum(t.transaction_cost for t in self.transactions) # / self.times_buying_power
-    
+
     @property
     def get_unrealized_pnl(self) -> float:
         return self.unrealized_pnl # / self.times_buying_power
-                    
+
     @property
     def get_realized_pnl(self) -> float:
         return self.realized_pnl # / self.times_buying_power
-            
+
     @property
     def profit_loss(self) -> float:
         return self.get_unrealized_pnl + self.get_realized_pnl - self.total_transaction_costs
-        
+
     @property
-    def profit_loss_percentage(self) -> float:
+    def profit_loss_pct(self) -> float:
         return (self.profit_loss / self.initial_balance) * 100
-    
+
     @property
     def price_diff(self) -> float:
         if not self.sub_positions or any(sp.exit_time is None for sp in self.sub_positions):
@@ -468,15 +473,8 @@ class TradePosition:
     @property
     def margin_used(self) -> float:
         return self.total_investment - self.initial_balance
-            
-            
 
 
-
-import csv
-from datetime import datetime
-
-import pandas as pd
 
 def export_trades_to_csv(trades: List[TradePosition], filename: str):
     """
@@ -497,20 +495,16 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Entry Price': f"{trade.entry_price:.4f}",
             'Exit Price': f"{trade.exit_price:.4f}" if trade.exit_price else '',
             'Initial Shares': f"{trade.initial_shares:.4f}",
-            'Realized P/L': f"{trade.realized_pnl:.4f}",
+            'Realized P/L': f"{trade.get_realized_pnl:.4f}",
             'Unrealized P/L': f"{trade.get_unrealized_pnl:.4f}",
             'Total P/L': f"{trade.profit_loss:.4f}",
-            'ROE (P/L %)': f"{trade.profit_loss_percentage:.2f}",
+            'ROE (P/L %)': f"{trade.profit_loss_pct:.2f}",
             'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
+            'Times Buying Power': f"{trade.times_buying_power:.2f}",
             'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
         }
         data.append(row)
-        # debug_print(row)  # Print each row for verification
-        # debug_print(trade.transactions)
 
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
     print(f"Trade summary has been exported to {filename}")
-
-# # In your backtest_strategy function, replace or add after the print statements:
-# export_trades_to_csv(trades)
