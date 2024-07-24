@@ -105,8 +105,11 @@ class TradePosition:
     
     See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#margin-interest-rate
     """
-    FINRA_TAF_RATE = 0.000119  # per share
-    SEC_FEE_RATE = 22.90 / 1_000_000  # per dollar
+    
+    # https://alpaca.markets/blog/reg-taf-fees/
+    SEC_FEE_RATE = 0.000008  # $8 per $1,000,000
+    FINRA_TAF_RATE = 0.000166  # $166 per 1,000,000 shares
+    FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
     
     def __post_init__(self):
         # self.market_value = self.initial_shares * self.entry_price
@@ -284,11 +287,11 @@ class TradePosition:
 
     @staticmethod
     def estimate_entry_cost(shares: int):
-        entry_finra_taf = max(0.01, TradePosition.FINRA_TAF_RATE * shares)
-        return entry_finra_taf
+        finra_taf = min(TradePosition.FINRA_TAF_RATE * shares, TradePosition.FINRA_TAF_MAX)
+        return finra_taf
     
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
-        finra_taf = max(0.01, self.FINRA_TAF_RATE * shares)
+        finra_taf = min(self.FINRA_TAF_RATE * shares, self.FINRA_TAF_MAX)
         sec_fee = 0
         if not is_entry:  # SEC fee only applies to exits
             trade_value = price * shares

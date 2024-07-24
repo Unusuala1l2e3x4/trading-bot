@@ -1,7 +1,8 @@
 from datetime import datetime
 from dataclasses import dataclass, field
-from bisect import bisect_right
+from bisect import bisect_right, bisect_left
 from collections import defaultdict
+from itertools import takewhile
 
 @dataclass
 class TouchArea:
@@ -77,36 +78,38 @@ class TouchArea:
 class TouchAreaCollection:
     def __init__(self, touch_areas, min_touches):
         self.areas_by_date = defaultdict(list)
-        self.date_sorted_times = defaultdict(list)
         
         for area in touch_areas:
             if len(area.touches) >= min_touches:
                 area_date = area.min_touches_time.date()
                 self.areas_by_date[area_date].append(area)
-                if area.min_touches_time not in self.date_sorted_times[area_date]:
-                    self.date_sorted_times[area_date].append(area.min_touches_time)
         
-        for date in self.date_sorted_times:
-            self.date_sorted_times[date].sort()
+        for date in self.areas_by_date:
+            # Sort areas for each date by their min_touches_time, then by id
+            self.areas_by_date[date].sort(key=lambda x: (x.min_touches_time, x.id))
 
-    def get_active_areas(self, current_time:datetime):
+    def get_active_areas(self, current_time: datetime):
         current_date = current_time.date()
-        if current_date not in self.date_sorted_times:
+        if current_date not in self.areas_by_date:
             return []
         
-        index = bisect_right(self.date_sorted_times[current_date], current_time) # should be the last index if in real time
-        active_times = self.date_sorted_times[current_date][:index]
+        return list(takewhile(lambda area: area.min_touches_time <= current_time, 
+                              self.areas_by_date[current_date]))
 
-        return [area for time in active_times for area in self.areas_by_date[current_date] if area.min_touches_time == time]
-
-    def terminate_area(self, area:TouchArea):
+    def terminate_area(self, area: TouchArea):
         area_date = area.min_touches_time.date()
         if area_date in self.areas_by_date:
-            self.areas_by_date[area_date] = [a for a in self.areas_by_date[area_date] if a.id != area.id]
-            self.date_sorted_times[area_date] = [t for t in self.date_sorted_times[area_date] if t != area.min_touches_time]
-            if not self.areas_by_date[area_date]:
+            areas = self.areas_by_date[area_date]
+            
+            # Find the exact position of the area to remove
+            index = bisect_left(areas, (area.min_touches_time, area.id), 
+                                key=lambda x: (x.min_touches_time, x.id))
+            
+            if index < len(areas) and areas[index].id == area.id:
+                del areas[index]
+            
+            if not areas:
                 del self.areas_by_date[area_date]
-                del self.date_sorted_times[area_date]
-                
+                    
                 
                 

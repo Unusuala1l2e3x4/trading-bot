@@ -2,144 +2,170 @@
 
 ## Overview
 
-The `calculate_touch_detection_area` function is designed to perform custom volatility analysis and identify strong support and resistance levels based on historical stock data. It leverages the Average True Range (ATR) or Median True Range (MTR) to define touch areas and considers only market hours for its analysis. This function also incorporates flexibility to switch between using the mean or median for level calculations and true range calculations.
-
-## Goals
-
-1. **Identify Support and Resistance Levels**: Detect significant support and resistance levels in historical stock price data.
-2. **Volatility Analysis**: Utilize ATR or MTR to define the width of touch areas around these levels.
-3. **Market Hours Filtering**: Ensure analysis considers only market hours.
-4. **Customizable Level Calculation**: Allow switching between mean and median calculations for touch areas and true range calculations.
+- The `calculate_touch_detection_area` function performs custom volatility analysis to identify strong support and resistance levels in 1-minute stock bars data. It uses Average True Range (ATR) or Median True Range (MTR) to define touch areas and considers only market hours for its analysis. The function incorporates flexibility to switch between mean and median calculations for levels and volatility measures.
+- This documentation provides a comprehensive overview of the `calculate_touch_detection_area` function, including its helper functions, key concepts, and usage. 
 
 ## Parameters
 
-- `symbol (str)`: The stock symbol to analyze.
-- `start_date (str|datetime)`: The start datetime for historical data (format: 'YYYY-MM-DD HH:MM:SS.%f').
-- `end_date (str|datetime)`: The end datetime for historical data (format: 'YYYY-MM-DD HH:MM:SS.%f').
-- `atr_period (int)`: The period for calculating Average True Range (ATR) or Median True Range (MTR).
-- `multiplier (float)`: The multiplier for ATR or MTR to define the touch detection area width.
-- `min_touches (int)`: The minimum number of touches to consider a level as strong support or resistance.
-- `bid_buffer_pct (float)`: The percentage above the high or below the low to place a stop market buy.
-- `sell_time (str)`: The time to sell all positions before (format: 'HH:MM'). If None, defaults to market close time.
-- `use_median (bool)`: Flag to switch between using mean or median for levels and touch areas, and for true range
-
- calculation.
+- `symbol (str|list)`: The stock symbol(s) to analyze.
+- `start_date (str|datetime)`: The start datetime for historical data (format: 'YYYY-MM-DD HH:MM:SS').
+- `end_date (str|datetime)`: The end datetime for historical data (format: 'YYYY-MM-DD HH:MM:SS').
+- `atr_period (int)`: The period for calculating ATR or MTR. Default is 10.
+- `multiplier (float)`: The multiplier for ATR/MTR to define the touch detection area width. Default is 2.
+- `min_touches (int)`: The minimum number of touches to consider a level as strong support or resistance. Default is 2.
+- `bid_buffer_pct (float)`: The percentage above the high or below the low to place a stop market buy. Default is 0.005.
+- `sell_time (str|None)`: The time to sell all positions before (format: 'HH:MM'). If None, defaults to market close.
+- `use_median (bool)`: Flag to switch between using mean (False) or median (True) for levels and touch areas. Default is False.
+- `touch_area_width_agg (function)`: Aggregation function for calculating touch area width. Default is np.median.
 
 ## Returns
 
 - `dict`: A dictionary containing:
-  - `long_touch_area`: List of tuples with resistance touch areas.
-  - `short_touch_area`: List of tuples with support touch areas.
-  - `bars`: Filtered historical data bars.
-  - `atr`: ATR values if `use_median` is `False`, otherwise MTR values.
-  - `bid_buffer_pct`: The bid buffer percentage.
-  - `min_touches`: The minimum number of touches.
-  - `sell_time`: The sell time.
-  - `central_value`: The central value (mean or median) used in calculations.
+  - `symbol`: The stock symbol(s) to analyze.
+  - `long_touch_area`: List of TouchArea objects for resistance levels.
+  - `short_touch_area`: List of TouchArea objects for support levels.
+  - `market_hours`: Dictionary of market hours for each date.
+  - `bars`: DataFrame of historical price data.
+  - `mask`: Boolean mask for filtering data within market hours.
+  - `bid_buffer_pct`: The bid buffer percentage used.
+  - `min_touches`: The minimum number of touches used.
+  - `sell_time`: The sell time used.
+  - `use_median`: Boolean indicating whether median was used for calculations.
+
+## Helper Functions
+
+### `calculate_touch_area`
+
+This function processes the identified levels and creates TouchArea objects.
+
+#### Parameters
+- `levels_by_date`: Dictionary of levels grouped by date.
+- `is_long`: Boolean indicating if it's for long (resistance) or short (support) positions.
+- `df`: DataFrame of historical price data.
+- `symbol`: The stock symbol.
+- `market_hours`: Dictionary of market hours for each date.
+- `min_touches`: Minimum number of touches required.
+- `bid_buffer_pct`: Bid buffer percentage.
+- `use_median`: Boolean for using median instead of mean.
+- `touch_area_width_agg`: Function for aggregating touch area width.
+- `multiplier`: Multiplier for ATR/MTR.
+- `sell_time`: Time to sell positions before.
+
+#### Returns
+- List of TouchArea objects.
+- List of touch area widths.
+
+### `process_touches`
+
+This function processes the touches for a specific level and determines if it qualifies as a touch area.
+
+#### Parameters
+- `touches`: Array of touch indices.
+- `prices`: Array of price values.
+- `touch_area_lower`: Lower bound of the touch area.
+- `touch_area_upper`: Upper bound of the touch area.
+- `level`: The price level being analyzed.
+- `level_lower_bound`: Lower bound of the original level.
+- `level_upper_bound`: Upper bound of the original level.
+- `is_long`: Boolean indicating if it's for long (resistance) or short (support) positions.
+- `min_touches`: Minimum number of touches required.
+
+#### Returns
+- NumPy array of consecutive touch indices if criteria are met, otherwise an empty array.
 
 ## Key Concepts and Calculations
 
-### Average True Range (ATR) and Median True Range (MTR) Calculation
+1. **True Range (TR) Calculation**:
+   $$TR = \max(High - Low, |High - PreviousClose|, |Low - PreviousClose|)$$
 
-1. **True Range (TR)**:
-   \[
-   \text{TR}_t = \max \left( \text{High}_t - \text{Low}_t, \left| \text{High}_t - \text{Close}_{t-1} \right|, \left| \text{Low}_t - \text{Close}_{t-1} \right| \right)
-   \]
-   where:
-   - \(\text{High}_t\): High price of the current period.
-   - \(\text{Low}_t\): Low price of the current period.
-   - \(\text{Close}_{t-1}\): Closing price of the previous period.
+2. **ATR/MTR Calculation**:
+   $$ATR = \frac{1}{n}\sum_{i=1}^n TR_i$$
+   $$MTR = \text{median}(TR_1, TR_2, ..., TR_n)$$
+   where $n$ is the `atr_period`.
 
-2. **Average True Range (ATR)**:
-   \[
-   \text{ATR}_t = \frac{1}{n} \sum_{i=0}^{n-1} \text{TR}_{t-i}
-   \]
-   where \(n\) is the number of periods (e.g., 10).
+3. **Touch Area Width**:
+   $$TouchAreaWidth = (ATR \text{ or } MTR) \times multiplier$$
 
-3. **Median True Range (MTR)**:
-   \[
-   \text{MTR}_t = \text{Median} (\text{TR}_{t-i} \text{ for } i \text{ from } 0 \text{ to } n-1)
-   \]
+4. **Touch Area Bounds**:
+   For long positions (resistance):
+   $$UpperBound = Level + \frac{TouchAreaWidth}{3}$$
+   $$LowerBound = Level - \frac{2 \times TouchAreaWidth}{3}$$
+   
+   For short positions (support):
+   $$UpperBound = Level + \frac{2 \times TouchAreaWidth}{3}$$
+   $$LowerBound = Level - \frac{TouchAreaWidth}{3}$$
 
-### Touch Detection Area
+5. **Level Identification**:
+   Levels are identified based on price movements and clustering of price points. The process involves:
+   
+   a. Calculating a price range for each candle:
+      $$w = \frac{High - Low}{2}$$
+   
+   b. Defining potential level bounds for each candle:
+      $$x = Close - w$$
+      $$y = Close + w$$
+   
+   c. Grouping similar price levels:
+      - A price point is added to an existing level if it falls within the level's bounds.
+      - If a price point doesn't fall within any existing level, it creates a new potential level.
 
-1. **Touch Area Width**:
-   \[
-   \text{Touch Area Width} = \text{(ATR or MTR)} \times \text{Multiplier}
-   \]
+   d. Filtering levels:
+      - Levels with fewer touches than `min_touches` are discarded.
+      - Levels are classified as support or resistance based on their relation to the central value:
+        $$\text{Classification} = \begin{cases} 
+        \text{Resistance} & \text{if } Level > CentralValue \\
+        \text{Support} & \text{if } Level \leq CentralValue
+        \end{cases}$$
 
-2. **Bounds of Touch Area**:
-   - **Upper Bound**:
-     \[
-     \text{Upper Bound} = \text{Level} + \frac{\text{Touch Area Width}}{2}
-     \]
-   - **Lower Bound**:
-     \[
-     \text{Lower Bound} = \text{Level} - \frac{\text{Touch Area Width}}{2}
-     \]
+6. **Touch Criteria**:
+   A touch is counted when one of the following conditions is met:
+   
+   a. Price crosses the level from below (for resistance) or above (for support):
+      $$\text{For Resistance: } PreviousClose < Level \leq CurrentClose$$
+      $$\text{For Support: } PreviousClose > Level \geq CurrentClose$$
+   
+   b. Price exactly equals the level:
+      $$CurrentClose = Level$$
+   
+   c. Price is within the level bounds:
+      $$LowerBound \leq CurrentClose \leq UpperBound$$
+   
+   Consecutive touches are tracked, and a touch area is created when the number of consecutive touches reaches `min_touches`.
 
-3. **Support and Resistance Levels**:
-   - Identified as local minima and maxima in the price data.
+7. **Touch Area Creation**:
+   When a level accumulates `min_touches` consecutive touches, a TouchArea object is created with the following properties:
+   - `id`: A unique identifier for the touch area
+   - `level`: The price level of the touch area
+   - `upper_bound` and `lower_bound`: Calculated as per the Touch Area Bounds formulas
+   - `touches`: List of timestamps when touches occurred
+   - `is_long`: Boolean indicating if it's a resistance (long) or support (short) level
+   - `min_touches`: The minimum number of touches required (as per input parameter)
+   - `bid_buffer_pct`: The bid buffer percentage (as per input parameter)
 
-### Central Value Calculation
 
-- **Mean**:
-  \[
-  \text{Central Value (Mean)} = \text{Level}
-  \]
-- **Median**:
-  \[
-  \text{Central Value (Median)} = \text{Median of Close Prices within the Touch Area Bounds}
-  \]
+## Function Logic
 
-### Identifying Potential Levels
-
-1. **Local Minima (Support Levels)**:
-   - If \( \text{Low}_i \leq \text{Low}_{i-1} \) and \( \text{Low}_i \leq \text{Low}_{i+1} \), it's a potential support level.
-
-2. **Local Maxima (Resistance Levels)**:
-   - If \( \text{High}_i \geq \text{High}_{i-1} \) and \( \text{High}_i \geq \text{High}_{i+1} \), it's a potential resistance level.
-
-### Function Logic
-
-1. **Historical Data Retrieval**:
-   - Fetch historical stock data using Alpaca API.
-
-2. **TR, ATR or MTR Calculation**:
-   - Compute the TR and then calculate ATR or MTR based on the `use_median` flag.
-
-3. **Identify Potential Levels**:
-   - Loop through the data to find local minima and maxima.
-
-4. **Filter Strong Levels**:
-   - Filter out levels that do not meet the minimum touch criteria.
-
-5. **Calculate Central Value**:
-   - Based on the `use_median` flag, calculate either the mean or median central value for touch areas.
-
-6. **Define Touch Areas**:
-   - Calculate upper and lower bounds and central value for each touch area.
-
-7. **Market Hours Filtering**:
-   - Ensure only data within market hours is considered.
-
-8. **Return Results**:
-   - Return the calculated touch areas, filtered data, ATR or MTR values, and other parameters.
+1. Fetch historical stock data using Alpaca API.
+2. Calculate TR, ATR, and MTR.
+3. Identify potential levels for each trading day.
+4. Filter levels based on the minimum number of touches.
+5. Create touch areas for qualifying levels.
+6. Apply market hours filtering.
+7. Return the results including touch areas and related data.
 
 ## Example Usage
 
 ```python
-result = calculate_touch_detection_area(
+touch_detection_areas = calculate_touch_detection_area(
     symbol='AAPL',
-    start_date='2024-06-27 08:00:00',
-    end_date='2024-06-28 23:59:59',
-    atr_period=10,
-    multiplier=2,
-    min_touches=2,
-    bid_buffer_pct=0.005,
-    sell_time='15:30',
-    use_median=True
+    start_date='2024-06-01 08:00:00',
+    end_date='2024-06-30 23:59:59',
+    atr_period=15,
+    multiplier=1.6,
+    min_touches=3,
+    sell_time='16:00',
+    use_median=True,
+    touch_area_width_agg=np.median
 )
 ```
-
-This function call would analyze AAPL stock data from June 27, 2024, to June 28, 2024, using a 10-period MTR, an MTR multiplier of 2, requiring at least 2 touches for strong levels, a bid buffer percentage of 0.5%, and selling all positions before 3:30 PM, using the median for touch area calculations.
+This call analyzes AAPL stock from June 1 to June 30, 2024, using a 15-period MTR, an MTR multiplier of 1.6, requiring at least 3 touches for strong levels, selling positions before 4:00 PM, and using median calculations for touch areas and volatility measures.
