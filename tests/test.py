@@ -1,107 +1,85 @@
-@jit(nopython=True)
-def process_touches(touches, prices, touch_area_lower, touch_area_upper, level, level_lower_bound, level_upper_bound, is_long, min_touches):
-    consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
-    count = 0
-    prev_price = None
-    for i in range(len(prices)):
-        price = prices[i]
-        is_touch = (prev_price is not None and 
-                    ((prev_price < level <= price) or (prev_price > level >= price)) or 
-                    (price == level))
-        
-        if level_lower_bound <= price <= level_upper_bound:
-            if is_touch:
-                consecutive_touches[count] = touches[i]
-                count += 1
-                if count == min_touches:
-                    return consecutive_touches
-        else:
-            buy_price = touch_area_upper if is_long else touch_area_lower
-            if (is_long and price > buy_price) or (not is_long and price < buy_price):
-                consecutive_touches[:] = -1
-                count = 0
-        
-        prev_price = price
-    return np.empty(0, dtype=np.int64)  # Return empty array instead of empty list
+import asyncio
+from alpaca.data.live import StockDataStream
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.enums import Adjustment
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_touches, bid_buffer_pct, use_median, touch_area_width_agg, multiplier, sell_time):
-    current_id = 0
-    touch_areas = []
-    widths = []
+debug = True
 
-    for date, levels in tqdm(levels_by_date.items()):
-        market_open, market_close = market_hours.get(str(date), (None, None))
-        if market_open and market_close and sell_time:
-            market_close = min(
-                datetime.strptime(str(date), '%Y-%m-%d') + timedelta(hours=sell_time.hour, minutes=sell_time.minute),
-                market_close - timedelta(minutes=3)
-            )
-        
-        if not market_open or not market_close:
-            # print('Hours not available. Skipping',date)
-            continue
-        
-        day_data = df[df.index.get_level_values('timestamp').date == date]
-        day_timestamps = day_data.index.get_level_values('timestamp')
-        day_timestamps_np = day_timestamps.astype(np.int64)  # Convert to nanoseconds
-        day_prices = day_data['close'].values
-        day_atr = day_data['MTR' if use_median else 'ATR'].values
+def debug_print(*args, **kwargs):
+    if debug:
+        print(*args, **kwargs)
 
-        for (level_lower_bound, level_upper_bound, level), touches in levels.items():
-            if len(touches) < min_touches:
-                continue
-            
-            touch_timestamps_np = np.array([t.timestamp() * 1e9 for t in touches], dtype=np.int64)  # Convert to nanoseconds
-            touch_indices = np.searchsorted(day_timestamps_np, touch_timestamps_np)
-            
-            touch_area_width = touch_area_width_agg(day_atr[touch_indices]) * multiplier
+class LiveTrader:
+    def __init__(self, api_key, secret_key, symbol, initial_balance):
+        self.trading_client = TradingClient(api_key, secret_key, paper=True)
+        self.data_stream = StockDataStream(api_key, secret_key)
+        self.historical_client = StockHistoricalDataClient(api_key, secret_key)
+        self.symbol = symbol
+        self.balance = initial_balance
+        self.data = None
+        self.is_ready = False
+        self.current_position = None
+        self.ny_tz = ZoneInfo("America/New_York")
 
-            if touch_area_width is None or np.isnan(touch_area_width) or touch_area_width <= 0:
-                continue
-            
-            widths.append(touch_area_width)
-            
-            # SUBJECt TO CHANGE
-            touch_area_lower = level - (2 * touch_area_width / 3) if is_long else level - (1 * touch_area_width / 3)
-            touch_area_upper = level + (1 * touch_area_width / 3) if is_long else level + (2 * touch_area_width / 3)
-            
-            # touch_area_lower = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
-            # touch_area_upper = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
-            
-            # touch_area_lower = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
-            # touch_area_upper = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
+    async def initialize_data(self):
+        try:
+            debug_start = datetime(2024, 7, 24, 9, 30).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
+            debug_end = datetime(2024, 7, 24, 16, 0).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
             
             
-            
-            valid_mask = (day_timestamps[touch_indices] >= market_open) & (day_timestamps[touch_indices] < market_close)
-            valid_touch_indices = touch_indices[valid_mask]
-            valid_prices = day_prices[valid_touch_indices]
-            
-            consecutive_touch_indices = process_touches(
-                valid_touch_indices, 
-                valid_prices,
-                touch_area_lower, 
-                touch_area_upper,  
-                level, 
-                level_lower_bound,
-                level_upper_bound, 
-                is_long, 
-                min_touches
-            )
-            
-            if len(consecutive_touch_indices) == min_touches:
-                consecutive_touches = day_timestamps[consecutive_touch_indices[consecutive_touch_indices != -1]]
-                touch_area = TouchArea(
-                    id=current_id,
-                    level=level,
-                    upper_bound=touch_area_upper,
-                    lower_bound=touch_area_lower,
-                    touches=consecutive_touches.tolist(),
-                    is_long=is_long,
-                    min_touches=min_touches,
-                    bid_buffer_pct=bid_buffer_pct
-                )
-                touch_areas.append(touch_area)
-                current_id += 1
+            end = datetime.now(self.ny_tz)
+            start = end.replace(hour=4, minute=0, second=0, microsecond=0)
+            if end.time() < datetime.time(4, 0):
+                start -= timedelta(days=1)
 
-    return touch_areas, widths
+            debug_print(f"Fetching historical data from {start} to {end}")
+            
+            self.data = self.get_historical_bars(start, end)
+            
+            if self.data.empty:
+                debug_print("No historical data available. Waiting for data.")
+                return
+
+            latest_data_time = self.data.index.get_level_values('timestamp').max().tz_convert(self.ny_tz)
+            debug_print(f"Initialized historical data: {len(self.data)} bars")
+            debug_print(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {latest_data_time}")
+            self.is_ready = True
+
+        except Exception as e:
+            debug_print(f"Error initializing data: {e}")
+
+    def get_historical_bars(self, start, end):
+        request_params = StockBarsRequest(
+            symbol_or_symbols=self.symbol,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            adjustment=Adjustment.ALL
+        )
+        bars = self.historical_client.get_stock_bars(request_params).df
+        return bars
+
+    async def on_bar(self, bar):
+        try:
+            debug_print(f"Received bar: {bar}")
+            # Process the bar data here
+            # Update your strategy, make trading decisions, etc.
+        except Exception as e:
+            debug_print(f"Error in on_bar: {e}")
+
+    async def run(self):
+        try:
+            await self.initialize_data()
+            
+            async def _process_bar(bar):
+                await self.on_bar(bar)
+
+            self.data_stream.subscribe_bars(_process_bar, self.symbol)
+            await self.data_stream.run()
+        except Exception as e:
+            debug_print(f"Error in run: {e}")
