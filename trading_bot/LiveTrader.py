@@ -77,13 +77,11 @@ class LiveTrader:
     # OTC (str): Over the counter feed
     
     def get_historical_bars(self, start:datetime, end:datetime):
-        start_utc = start.astimezone(ZoneInfo("UTC"))
-        end_utc = end.astimezone(ZoneInfo("UTC"))
         request_params = StockBarsRequest(
             symbol_or_symbols=self.symbol,
             timeframe=TimeFrame.Minute,
-            start=start_utc,
-            end=end_utc,
+            start=start.astimezone(ZoneInfo("UTC")),
+            end=end.astimezone(ZoneInfo("UTC")),
             adjustment=Adjustment.ALL,
             feed='iex' # iex, sip, otc
         )
