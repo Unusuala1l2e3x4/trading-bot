@@ -1,6 +1,6 @@
 import asyncio
 import pandas as pd
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import StockBarsRequest
@@ -56,18 +56,44 @@ class LiveTrader:
     def is_market_open(self, check_time=None):
         if check_time is None:
             check_time = datetime.now(self.ny_tz)
-        return True
-        # return (check_time.weekday() < 5 and 
-        #         time(4, 0) <= check_time.time() <= time(20, 0))
+        else:
+            # Ensure check_time is in Eastern Time
+            check_time = check_time.astimezone(self.ny_tz)
+        
+        return (check_time.weekday() < 5 and 
+                time(4, 0) <= check_time.time() <= time(20, 0))
         
         
     def get_current_trading_day_start(self):
         now = datetime.now(self.ny_tz)
         current_date = now.date()
-        if now.time() < time(4, 0):  # If it's before 4:00 AM, use the previous day
+        if now.time() < time(4, 0):  # If it's before 4:00 AM ET, use the previous day
             current_date -= timedelta(days=1)
         return datetime.combine(current_date, time(4, 0)).replace(tzinfo=self.ny_tz)
     
+    
+    # IEX (str): Investor's exchange data feed
+    # SIP (str): Securities Information Processor feed
+    # OTC (str): Over the counter feed
+    
+    def get_historical_bars(self, start:datetime, end:datetime):
+        start_utc = start.astimezone(ZoneInfo("UTC"))
+        end_utc = end.astimezone(ZoneInfo("UTC"))
+        request_params = StockBarsRequest(
+            symbol_or_symbols=self.symbol,
+            timeframe=TimeFrame.Minute,
+            start=start_utc,
+            end=end_utc,
+            adjustment=Adjustment.ALL,
+            feed='iex' # iex, sip, otc
+        )
+        df = self.historical_client.get_stock_bars(request_params).df
+        df.index = df.index.set_levels(
+            pd.Series(df.index.get_level_values('timestamp').to_list()).dt.tz_convert(self.ny_tz),
+            level='timestamp'
+        )
+        df.sort_index(inplace=True)
+        return df
     
     async def initialize_data(self):
         try:
@@ -78,13 +104,15 @@ class LiveTrader:
             # Debug: Uncomment these lines to use a specific time range for testing
             debug_start = datetime(2024, 7, 24, 9, 30).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
             debug_end = datetime(2024, 7, 24, 16, 0).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
+            
+            # - timedelta(minutes=15,seconds=1) needed for SIP but not IEX
+            
+            end = datetime.now(self.ny_tz) - timedelta(minutes=15,seconds=1)
+            start = self.get_current_trading_day_start()
 
-            # end = datetime.now(self.ny_tz)
-            # start = self.get_current_trading_day_start()
-
-            # Debug: Uncomment these lines to use the debug time range
-            start, end = debug_start, debug_end
-            print('initialize_data - DEBUG MODE DATES:',start, end)
+            # # Debug: Uncomment these lines to use the debug time range
+            # start, end = debug_start, debug_end
+            # print('initialize_data - DEBUG MODE DATES:',start, end)
             
             debug_print(f"Fetching historical data from {start} to {end}")
             
@@ -94,7 +122,7 @@ class LiveTrader:
                 debug_print("No historical data available. Waiting for data.")
                 return
             
-            self.data.index = self.data.index.set_levels(pd.Series(self.data.index.get_level_values('timestamp').to_list()).map(lambda x: x.replace(tzinfo=None)), level='timestamp')
+            self.data.index = self.data.index.set_levels(pd.Series(self.data.index.get_level_values('timestamp').to_list()).map(lambda x: x.tz_convert(self.ny_tz)), level='timestamp')
             self.data.sort_index(inplace=True)
             
             print(self.data.index.get_level_values('timestamp'))
@@ -114,25 +142,13 @@ class LiveTrader:
 
         except Exception as e:
             debug_print(f"Error initializing data: {e}")
-
-    # IEX (str): Investor's exchange data feed
-    # SIP (str): Securities Information Processor feed
-    # OTC (str): Over the counter feed
-    
-    def get_historical_bars(self, start, end):
-        request_params = StockBarsRequest(
-            symbol_or_symbols=self.symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            adjustment=Adjustment.ALL,
-            # feed='iex' # iex, sip, otc
-        )
-        bars = self.historical_client.get_stock_bars(request_params).df
-        return bars
+            
 
     async def on_bar(self, bar):
         debug_print('on_bar')
+        
+        debug_print(f"Received bar: {bar}")
+
         try:
             if not self.is_market_open():
                 debug_print("Received bar outside market hours. Ignoring.")
@@ -269,10 +285,13 @@ async def main():
     initial_balance = 10000
     trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance)
     
+    timeout = 120
+    
     try:
-        await asyncio.wait_for(trader.run(), timeout=30)  # 30 seconds timeout
+        # Wait for up to 2 minutes (120 seconds) to receive data
+        await asyncio.wait_for(trader.run(), timeout=timeout)
     except asyncio.TimeoutError:
-        print("Operation timed out. This is expected outside of market hours.")
+        print(f"No data received within {timeout} seconds timeout. This may be normal outside of market hours.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
