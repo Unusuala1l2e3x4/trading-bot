@@ -8,11 +8,13 @@ import pandas as pd
 from datetime import datetime
 import pandas as pd
 
+import matplotlib.pyplot as plt
+
 
 debug = False
 def debug_print(*args, **kwargs):
     if debug:
-        debug_print(*args, **kwargs)
+        print(*args, **kwargs)
 
 
 @dataclass
@@ -142,7 +144,7 @@ class TradePosition:
         self.market_value = sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)
 
         assert abs(self.market_value - sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Market value mismatch: {self.market_value:.2f} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0):.2f}"
+            f"Market value mismatch: {self.market_value:.4f} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0):.4f}"
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
         # Ensure we maintain an even number of shares when times_buying_power > 2
@@ -151,7 +153,7 @@ class TradePosition:
             shares_to_sell -= 1
             
         debug_print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
-        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
+        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
         cash_released = 0
         realized_pnl = 0
@@ -178,7 +180,7 @@ class TradePosition:
                 fees += self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
 
                 debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
-                    f"Realized PnL: {sp_realized_pnl:.2f}, Cash released: {sub_cash_released:.2f}, "
+                    f"Realized PnL: {sp_realized_pnl:.4f}, Cash released: {sub_cash_released:.4f}, "
                     f"Old shares: {old_shares}, New shares: {sp.shares}")
 
         self.shares -= shares_to_sell
@@ -187,11 +189,11 @@ class TradePosition:
         self.partial_exit_count += 1
 
         assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed:.2f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.2f}"
+            f"Cash committed mismatch: {self.cash_committed:.4f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.4f}"
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
-        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.2f}, Realized PnL: {realized_pnl:.2f}")
+        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pnl:.4f}")
         debug_print("DEBUG: Remaining sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
@@ -200,13 +202,13 @@ class TradePosition:
         return realized_pnl, cash_released, fees
 
 
-    def calculate_num_sub_positions(self, total_shares: int) -> int:
+    def calculate_num_sub_positions(self) -> int:
         if self.times_buying_power <= 2:
             return 1
         else:
             return 2  # We'll always use 2 sub-positions when times_buying_power > 2
 
-    def calculate_shares_per_sub(self, total_shares: int, num_subs: int, current_sub_shares: List[int]) -> List[int]:
+    def calculate_shares_per_sub(self, total_shares: int, num_subs: int) -> List[int]:
         if self.times_buying_power <= 2:
             assert num_subs == 1
             return [total_shares]
@@ -215,7 +217,8 @@ class TradePosition:
             assert total_shares % 2 == 0
             # Always split evenly between two sub-positions
             half_shares = total_shares // 2
-            return [half_shares, total_shares - half_shares]
+            # return [half_shares, total_shares - half_shares]
+            return [half_shares, half_shares]
 
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
@@ -225,16 +228,15 @@ class TradePosition:
             shares_to_buy -= 1
             
         debug_print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
-        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.2f}")
+        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
         new_total_shares = self.shares + shares_to_buy
-        new_num_subs = self.calculate_num_sub_positions(new_total_shares)
+        new_num_subs = self.calculate_num_sub_positions()
 
         additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
-        current_sub_shares = [sp.shares for sp in active_sub_positions]
-        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs, current_sub_shares)
+        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
 
         fees = 0
         shares_added = 0
@@ -255,7 +257,7 @@ class TradePosition:
                     fees += self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True, sub_position=sp)
                     shares_added += shares_to_add
                     debug_print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
-                        f"Cash committed: {sub_cash_committed:.2f}, Old shares: {old_shares}, New shares: {sp.shares}")
+                        f"Cash committed: {sub_cash_committed:.4f}, Old shares: {old_shares}, New shares: {sp.shares}")
             else:
                 # New sub-position
                 sub_cash_committed = (target * entry_price) / self.times_buying_power
@@ -264,7 +266,7 @@ class TradePosition:
                 fees += self.add_transaction(entry_time, target, entry_price, is_entry=True, sub_position=new_sub)
                 shares_added += target
                 debug_print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
-                    f"Cash committed: {sub_cash_committed:.2f}")
+                    f"Cash committed: {sub_cash_committed:.4f}")
 
         self.shares += shares_added
         self.cash_committed += additional_cash_committed
@@ -272,24 +274,61 @@ class TradePosition:
         self.partial_entry_count += 1
 
         assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed:.2f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.2f}"
+            f"Cash committed mismatch: {self.cash_committed:.4f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.4f}"
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
         debug_print(f"DEBUG: Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
-            f"New cash committed: {self.cash_committed:.2f}")
+            f"New cash committed: {self.cash_committed:.4f}")
         debug_print("DEBUG: Current sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
-
+        # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.4f}, "
+        #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
+        
+        
         return additional_cash_committed, fees
 
     @staticmethod
-    def estimate_entry_cost(shares: int):
-        finra_taf = min(TradePosition.FINRA_TAF_RATE * shares, TradePosition.FINRA_TAF_MAX)
-        return finra_taf
-    
+    def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: Optional[List[int]] = None):
+        def calculate_num_sub_positions(times_buying_power: float) -> int:
+            return 2 if times_buying_power > 2 else 1
+
+        def calculate_shares_per_sub(total_shares: int, num_subs: int) -> List[int]:
+            if num_subs == 1:
+                return [total_shares]
+            else:
+                half_shares = total_shares // 2
+                return [half_shares, half_shares]
+
+        num_subs = calculate_num_sub_positions(times_buying_power)
+        target_shares = calculate_shares_per_sub(total_shares, num_subs)
+
+        total_cost = 0
+        
+        print(f"Estimate entry cost - existing_sub_positions: {existing_sub_positions}, target_shares: {target_shares}")
+        
+        if existing_sub_positions:
+            for i, target in enumerate(target_shares):
+                if i < len(existing_sub_positions):
+                    shares_to_add = max(0, target - existing_sub_positions[i])
+                    finra_taf = min(TradePosition.FINRA_TAF_RATE * shares_to_add, TradePosition.FINRA_TAF_MAX)
+                    print(f"Sub-position {i}: existing: {existing_sub_positions[i]}, target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
+                else:
+                    shares_to_add = target
+                    finra_taf = min(TradePosition.FINRA_TAF_RATE * shares_to_add, TradePosition.FINRA_TAF_MAX)
+                    print(f"New sub-position {i}: target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
+                total_cost += finra_taf
+        else:
+            for i, target in enumerate(target_shares):
+                finra_taf = min(TradePosition.FINRA_TAF_RATE * target, TradePosition.FINRA_TAF_MAX)
+                print(f"Initial sub-position {i}: target: {target}, finra_taf: {finra_taf:.6f}")
+                total_cost += finra_taf
+
+        print(f"Total estimated entry cost: {total_cost:.6f}")
+        return total_cost
+        
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
         finra_taf = min(self.FINRA_TAF_RATE * shares, self.FINRA_TAF_MAX)
         sec_fee = 0
@@ -338,6 +377,9 @@ class TradePosition:
         transaction_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp, sub_position)
         value = -shares * price if is_entry else shares * price
         
+        if is_entry:
+            print('add_transaction', shares, transaction_cost)
+        
         transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, value, sp_realized_pnl)
         self.transactions.append(transaction)
         sub_position.add_transaction(transaction)
@@ -348,9 +390,8 @@ class TradePosition:
             self.realized_pnl += sp_realized_pnl
             
         debug_print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
-            f"Value: {value:.2f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
-        debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.2f}, "
-            f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
+            f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
+
 
         return transaction_cost
 
@@ -495,19 +536,79 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Entry Time': trade.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
             'Exit Time': trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time else '',
             'Holding Time': str(trade.holding_time),
-            'Entry Price': f"{trade.entry_price:.4f}",
-            'Exit Price': f"{trade.exit_price:.4f}" if trade.exit_price else '',
-            'Initial Shares': f"{trade.initial_shares:.4f}",
-            'Realized P/L': f"{trade.get_realized_pnl:.4f}",
-            'Unrealized P/L': f"{trade.get_unrealized_pnl:.4f}",
-            'Total P/L': f"{trade.profit_loss:.4f}",
-            'ROE (P/L %)': f"{trade.profit_loss_pct:.2f}",
-            'Margin Multiplier': f"{trade.actual_margin_multiplier:.2f}",
-            'Times Buying Power': f"{trade.times_buying_power:.2f}",
-            'Transaction Costs': f"{trade.total_transaction_costs:.4f}"
+            'Entry Price': f"{trade.entry_price}",
+            'Exit Price': f"{trade.exit_price}" if trade.exit_price else '',
+            'Initial Shares': f"{trade.initial_shares}",
+            'Realized P/L': f"{trade.get_realized_pnl}",
+            'Unrealized P/L': f"{trade.get_unrealized_pnl}",
+            'Total P/L': f"{trade.profit_loss}",
+            'ROE (P/L %)': f"{trade.profit_loss_pct}",
+            'Margin Multiplier': f"{trade.actual_margin_multiplier}",
+            'Times Buying Power': f"{trade.times_buying_power}",
+            'Transaction Costs': f"{trade.total_transaction_costs}"
         }
         data.append(row)
 
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
     print(f"Trade summary has been exported to {filename}")
+
+
+
+def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float): # , filename: str
+    """
+    Create a graph that plots the cumulative profit/loss at each corresponding exit time
+    overlaid on the close price from the DataFrame, using a dual y-axis.
+    
+    Args:
+    trades (list): List of TradePosition objects
+    df (pd.DataFrame): DataFrame containing the price data
+    filename (str): Name of the image file to be created
+    """
+    # Prepare data for plotting
+    exit_times = []
+    cumulative_pnl = []
+    running_pnl = 0
+    
+    for trade in trades:
+        if trade.exit_time:
+            exit_times.append(trade.exit_time)
+            running_pnl += trade.profit_loss
+            cumulative_pnl.append(100 * running_pnl / initial_investment)
+    
+    # Create figure and primary y-axis
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Plot close price on primary y-axis
+    ax1.plot(df.index.get_level_values('timestamp'), df['close'], color='blue', label='Close Price')
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Close Price', color='blue')
+    ax1.tick_params(axis='y', labelcolor='blue')
+    
+    # Create secondary y-axis
+    ax2 = ax1.twinx()
+    
+    # Plot cumulative P/L on secondary y-axis
+    ax2.plot(exit_times, cumulative_pnl, color='green', label='Cumulative P/L %')
+    ax2.set_ylabel('Cumulative P/L %', color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+    
+    # Set title and legend
+    plt.title('Cumulative P/L % and Close Price Over Time')
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    # Rotate and align the tick labels so they look better
+    fig.autofmt_xdate()
+    
+    # Use a tight layout
+    plt.tight_layout()
+    
+    plt.show()
+    
+    # # Save the figure
+    # plt.savefig(filename)
+    # plt.close()
+    
+    # print(f"Graph has been saved as {filename}")

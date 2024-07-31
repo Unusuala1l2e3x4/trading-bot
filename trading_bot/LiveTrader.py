@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
@@ -11,6 +12,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 
+from typing import List, Tuple, Optional
 from time import sleep
 from TradePosition import TradePosition, SubPosition, export_trades_to_csv
 from TouchArea import TouchArea, TouchAreaCollection
@@ -42,18 +44,21 @@ def debug_print(*args, **kwargs):
 
 class LiveTrader:
     def __init__(self, api_key, secret_key, symbol, initial_balance):
-        self.trading_client = TradingClient(api_key, secret_key, paper=True)
-        self.data_stream = StockDataStream(api_key, secret_key)
-        self.historical_client = StockHistoricalDataClient(api_key, secret_key)
-        self.symbol = symbol
-        self.balance = initial_balance
-        self.data = None
-        self.is_ready = False
-        self.current_position = None
-        self.ny_tz = ZoneInfo("America/New_York")
         
+        try:
+            self.trading_client = TradingClient(api_key, secret_key, paper=True)
+            self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX)
+            self.historical_client = StockHistoricalDataClient(api_key, secret_key)
+            self.symbol = symbol
+            self.balance = initial_balance
+            self.data = None
+            self.is_ready = False
+            self.current_position = None
+            self.ny_tz = ZoneInfo("America/New_York")
+        except Exception as e:
+            debug_print(f"Error at init: {e}")
     
-    def is_market_open(self, check_time=None):
+    def is_market_open(self, check_time:Optional[datetime]=None):
         if check_time is None:
             check_time = datetime.now(self.ny_tz)
         else:
@@ -83,11 +88,11 @@ class LiveTrader:
             start=start.astimezone(ZoneInfo("UTC")),
             end=end.astimezone(ZoneInfo("UTC")),
             adjustment=Adjustment.ALL,
-            feed='iex' # iex, sip, otc
+            # feed='iex' # iex, sip, otc
         )
         df = self.historical_client.get_stock_bars(request_params).df
         df.index = df.index.set_levels(
-            pd.Series(df.index.get_level_values('timestamp').to_list()).dt.tz_convert(self.ny_tz),
+            df.index.get_level_values('timestamp').tz_convert(self.ny_tz),
             level='timestamp'
         )
         df.sort_index(inplace=True)
@@ -136,6 +141,9 @@ class LiveTrader:
 
             debug_print(f"Initialized historical data: {len(self.data)} bars")
             debug_print(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {latest_data_time}")
+            
+            # debug_print(self.data)
+            
             self.is_ready = True
 
         except Exception as e:
@@ -146,32 +154,40 @@ class LiveTrader:
         debug_print('on_bar')
         
         debug_print(f"Received bar: {bar}")
+        # Received bar: symbol='AAPL' timestamp=datetime.datetime(2024, 7, 30, 19, 22, tzinfo=datetime.timezone.utc) 
+        # open=218.3 high=218.3 low=218.26 close=218.26 volume=332.0 trade_count=7.0 vwap=218.30762
 
         try:
             if not self.is_market_open():
                 debug_print("Received bar outside market hours. Ignoring.")
                 return
 
-            bar_time = pd.to_datetime(bar.t).tz_convert(self.ny_tz)
+            bar_time = pd.to_datetime(bar.timestamp).tz_convert(self.ny_tz)
             now = datetime.now(self.ny_tz)
             time_diff = (now - bar_time).total_seconds() / 60
+            
+            print(bar_time, now, time_diff)
 
-            if time_diff > 1:  # If the bar is more than 1 minute old
-                debug_print(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}")
-                return
+            # if time_diff > 1:  # If the bar is more than 1 minute old
+            #     debug_print(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}")
+            #     return
 
             bar_data = {
                 'timestamp': bar_time,
-                'open': bar.o,
-                'high': bar.h,
-                'low': bar.l,
-                'close': bar.c,
-                'volume': bar.v,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'trade_count': bar.trade_count,
+                'vwap': bar.vwap
             }
             new_row = pd.DataFrame([bar_data])
             new_row.set_index('timestamp', inplace=True)
             self.data = pd.concat([self.data, new_row])
             debug_print(f"Received bar: {bar_data}")
+            
+            debug_print(f"Added streamed bar. {len(self.data)} bars total.")
 
             await self.execute_trading_logic()
 
@@ -289,7 +305,7 @@ async def main():
         # Wait for up to 2 minutes (120 seconds) to receive data
         await asyncio.wait_for(trader.run(), timeout=timeout)
     except asyncio.TimeoutError:
-        print(f"No data received within {timeout} seconds timeout. This may be normal outside of market hours.")
+        print(f"No data received within {timeout} seconds timeout. This is normal outside of market hours for IEX feed. \nNeed market data subcription to access SIP feed when outside market hours.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:

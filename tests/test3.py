@@ -1,121 +1,86 @@
-# You're absolutely right, and I apologize for missing that earlier. Your analysis is spot on, and your proposed solution is excellent. Let's implement these changes:
+    # You're right, that's a good optimization. We can calculate max_shares earlier in the process and use it in calculate_target_shares. Here's how we can modify the code to implement this change:
 
-# 1. First, let's modify the Transaction class:
+    # 1. First, let's create a new function to calculate max_shares independently:
 
-# ```python
-@dataclass
-class Transaction:
-    timestamp: datetime
-    shares: int
-    price: float
-    is_entry: bool
-    transaction_cost: float
-    value: float  # This will be the cost (negative) or revenue (positive)
-# ```
-
-# 2. Now, let's modify the TradePosition class to keep track of realized PnL:
-
-# ```python
-@dataclass
-class TradePosition:
-    # ... (other attributes)
-    realized_pnl: float = 0
-    
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool):
-        transaction_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
-        value = -shares * price if is_entry else shares * price  # Negative for buys, positive for sells
-        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, value)
-        self.transactions.append(transaction)
+    # ```python
+    def calculate_max_shares(current_price, balance, times_buying_power, is_marginable):
+        if is_marginable:
+            initial_margin_requirement = 0.5  # 50% for marginable securities
+            overall_margin_multiplier = min(times_buying_power, 4.0)
+        else:
+            initial_margin_requirement = 1.0  # 100% for non-marginable securities
+            overall_margin_multiplier = min(times_buying_power, 1.0)
         
-        self.realized_pnl += value - transaction_cost
+        available_balance = balance * overall_margin_multiplier
+        max_shares = math.floor(available_balance / current_price)
+        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, overall_margin_multiplier)
         
-        print(f'    add_transaction {timestamp}, {shares}, {price:.4f}, {is_entry}, {transaction_cost:.4f}, {value:.4f}')
-# ```
-
-# 3. Update the partial_entry and partial_exit functions:
-
-# ```python
-    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
-        # ... (existing code)
+        # Adjust max_shares if necessary
+        if max_shares * current_price + estimated_entry_cost * overall_margin_multiplier > available_balance:
+            max_shares = math.floor((available_balance - estimated_entry_cost * overall_margin_multiplier) / current_price)
         
-        for i in range(len(self.sub_positions)):
-            if self.sub_positions[i].shares > 0:
-                shares_to_add = target_shares[i] - self.sub_positions[i].shares
-                if shares_to_add > 0:
-                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
-                    self.sub_positions[i].shares += shares_to_add
-                    self.shares += shares_to_add
-                    self.sub_positions[i].cash_committed += sub_cash_committed
-                    self.add_transaction(entry_time, shares_to_add, entry_price, is_entry=True)
-                    remaining_shares -= shares_to_add
+        # Ensure max_shares is a multiple of 2 when times_buying_power > 2 and is_marginable
+        if times_buying_power > 2 and is_marginable and max_shares % 2 == 1:
+            max_shares -= 1
+        
+        return max_shares
+    # ```
 
-        # ... (rest of the function)
+    # 2. Now, let's modify the calculate_target_shares function to use max_shares:
 
-        print(f"Partial entry: {self.id} {entry_time.time()} - {'Long' if self.is_long else 'Short'} "
-            f"Bought {shares_to_buy} @ {entry_price:.4f} "
-            f"(From {self.shares - shares_to_buy} to {self.shares}). "
-            f"Sub-pos: {len([sp for sp in self.sub_positions if sp.shares > 0])}, "
-            f"Cash committed: {additional_cash_committed:.2f}, "
-            f"Realized PnL: {self.realized_pnl:.2f}")
+    # ```python
+    def calculate_target_shares(position: TradePosition, current_price, max_shares):
+        if position.is_long:
+            price_movement = current_price - position.current_stop_price
+        else:
+            price_movement = position.current_stop_price - current_price
+        target_pct = min(max(0, price_movement / position.area.get_range), 1.0)
+        target_shares = math.floor(target_pct * max_shares)
+        
+        # Ensure target_shares is even when times_buying_power > 2
+        if position.times_buying_power > 2 and target_shares % 2 != 0:
+            target_shares -= 1
+        
+        return target_shares
+    # ```
 
-        return additional_cash_committed
+    # 3. Update the update_positions function to calculate max_shares before calling calculate_target_shares:
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
+    # ```python
+    def update_positions(timestamp:datetime, open_price, high_price, low_price, close_price):
         # ... (existing code)
 
-        for sp in self.sub_positions:
-            if sp.shares > 0 and remaining_shares_to_sell > 0:
-                shares_sold = min(sp.shares, remaining_shares_to_sell)
-                
-                sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
-                sp.shares -= shares_sold
-                self.shares -= shares_sold
-                sp.cash_committed -= sub_cash_released
-                cash_released += sub_cash_released
-                self.add_transaction(exit_time, shares_sold, exit_price, is_entry=False)
-                remaining_shares_to_sell -= shares_sold
+        for area_id, position in open_positions.items():
+            # ... (existing code)
 
-        # ... (rest of the function)
+            price_at_action = close_price
+            max_shares = calculate_max_shares(price_at_action, balance, position.times_buying_power, position.is_marginable)
+            target_shares = calculate_target_shares(position, price_at_action, max_shares)
 
-        print(f"Partial exit: {self.id} {exit_time.time()} - {'Long' if self.is_long else 'Short'} "
-            f"Sold {shares_to_sell} @ {exit_price:.4f} "
-            f"(From {self.shares + shares_to_sell} to {self.shares}). "
-            f"Cash released: {cash_released:.2f}, "
-            f"Realized PnL: {self.realized_pnl:.2f}")
+            # ... (rest of the function remains the same)
+    # ```
 
-        return self.realized_pnl, cash_released
-# ```
+    # 4. Finally, update the calculate_position_details function to use the pre-calculated max_shares:
 
-# 4. Update the profit_loss function:
+    # ```python
+    def calculate_position_details(current_price, times_buying_power, existing_sub_positions, target_shares, max_shares):
+        # ... (existing code, remove the max_shares calculation for initial entry)
 
-# ```python
-    @property
-    def profit_loss(self) -> float:
-        unrealized_pnl = sum((self.last_price - sp.entry_price) * sp.shares if self.is_long else
-                            (sp.entry_price - self.last_price) * sp.shares
-                            for sp in self.sub_positions if sp.shares > 0)
-        
-        total_pl = (self.realized_pnl + unrealized_pnl) / self.times_buying_power
-        return total_pl
-# ```
+        if existing_sub_positions is None:
+            # Initial entry
+            debug3_print(f"  initial: max_shares: {max_shares}")
+        else:
+            # Partial entry
+            current_shares = sum(existing_sub_positions)
+            max_additional_shares = min(target_shares - current_shares, max_shares - current_shares)
+            
+            debug3_print(f"  BEFORE adjust - partial: Current shares: {current_shares}, Max additional shares: {max_additional_shares}, Target shares: {target_shares}")
+            
+            max_shares = current_shares + max_additional_shares
+            
+            debug3_print(f"  AFTER adjust - partial: Current shares: {current_shares}, Max additional shares: {max_additional_shares}")
 
-# 5. Update the backtest_strategy function:
+        # ... (rest of the function remains the same)
+    # ```
 
-# ```python
-def backtest_strategy(...):
-    # ... (existing code)
-
-    winning_trades = sum(1 for trade in trades if trade.realized_pnl > 0)
-    losing_trades = sum(1 for trade in trades if trade.realized_pnl < 0)
-
-    # ... (rest of the function)
-# ```
-
-# With these changes:
-
-# 1. We're now correctly tracking realized PnL for each transaction.
-# 2. The profit_loss function now correctly calculates both realized and unrealized PnL.
-# 3. We've removed the need for multiple calls to update_total_account_value, as the PnL is now being tracked accurately within each position.
-# 4. The winrate calculation is now based on the realized PnL of closed trades, which should give you a more accurate representation of the strategy's performance.
-
-# These modifications should resolve the issues you've identified and provide a more accurate and consistent way of tracking and calculating profits and losses across your backtesting system.
+    # These changes will optimize the process by calculating max_shares once and using it throughout the update_positions function, including in the calculate_target_shares function. This should improve efficiency and consistency in your calculations.
