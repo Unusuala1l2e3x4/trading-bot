@@ -1,15 +1,15 @@
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
 import pandas as pd
 from datetime import datetime
 import pandas as pd
-
+import numpy as np
 import matplotlib.pyplot as plt
-
+import matplotlib.dates as mdates
 
 debug = False
 def debug_print(*args, **kwargs):
@@ -67,6 +67,7 @@ class TradePosition:
     shares: int = 0
     partial_entry_count: int = 0
     partial_exit_count: int = 0
+    max_shares: int = field(init=False)
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     sub_positions: List[SubPosition] = field(default_factory=list)
@@ -119,6 +120,7 @@ class TradePosition:
         self.shares = 0
         self.last_price = self.entry_price
         self.cash_committed = 0
+        self.max_shares = self.initial_shares
         assert self.times_buying_power <= 4
         
         debug_print(f'initial_shares {self.initial_shares}')
@@ -304,6 +306,9 @@ class TradePosition:
 
         num_subs = calculate_num_sub_positions(times_buying_power)
         target_shares = calculate_shares_per_sub(total_shares, num_subs)
+        
+        print(existing_sub_positions)
+        print(num_subs, target_shares)
 
         total_cost = 0
         
@@ -554,15 +559,19 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     print(f"Trade summary has been exported to {filename}")
 
 
+def time_to_minutes(t: time):
+    return t.hour * 60 + t.minute - (9 * 60 + 30)
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float): # , filename: str
+def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float,  filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss at each corresponding exit time
     overlaid on the close price from the DataFrame, using a dual y-axis.
+    Empty intervals before and after intraday trading are removed.
     
     Args:
     trades (list): List of TradePosition objects
     df (pd.DataFrame): DataFrame containing the price data
+    initial_investment (float): Initial investment balance for normalization
     filename (str): Name of the image file to be created
     """
     # Prepare data for plotting
@@ -576,39 +585,93 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
             running_pnl += trade.profit_loss
             cumulative_pnl.append(100 * running_pnl / initial_investment)
     
+    # Filter df to include only intraday data
+    df['time'] = df.index.get_level_values('timestamp').time
+    df['date'] = df.index.get_level_values('timestamp').date
+    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))]
+    
+    # Create a continuous index
+    unique_dates = sorted(df_intraday['date'].unique())
+    continuous_index = []
+    cumulative_minutes = 0
+    
+    for date in unique_dates:
+        day_data = df_intraday[df_intraday['date'] == date]
+        day_minutes = day_data['time'].apply(time_to_minutes)
+        continuous_index.extend(cumulative_minutes + day_minutes)
+        cumulative_minutes += 390  # 6.5 hours of trading
+    
+    df_intraday['continuous_index'] = continuous_index
+    
     # Create figure and primary y-axis
     fig, ax1 = plt.subplots(figsize=(12, 6))
     
     # Plot close price on primary y-axis
-    ax1.plot(df.index.get_level_values('timestamp'), df['close'], color='blue', label='Close Price')
-    ax1.set_xlabel('Time')
+    ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='blue', label='Close Price')
+    ax1.set_xlabel('Trading Time (minutes)')
     ax1.set_ylabel('Close Price', color='blue')
     ax1.tick_params(axis='y', labelcolor='blue')
     
     # Create secondary y-axis
     ax2 = ax1.twinx()
     
+    # Convert exit times to continuous index
+    exit_continuous_index = []
+    for exit_time in exit_times:
+        exit_date = exit_time.date()
+        exit_minute = time_to_minutes(exit_time.time())
+        days_passed = unique_dates.index(exit_date)
+        exit_continuous_index.append(days_passed * 390 + exit_minute)
+    
     # Plot cumulative P/L on secondary y-axis
-    ax2.plot(exit_times, cumulative_pnl, color='green', label='Cumulative P/L %')
-    ax2.set_ylabel('Cumulative P/L %', color='green')
+    ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='Cumulative P/L')
+    ax2.set_ylabel('Cumulative P/L', color='green')
     ax2.tick_params(axis='y', labelcolor='green')
     
     # Set title and legend
-    plt.title('Cumulative P/L % and Close Price Over Time')
+    plt.title('Cumulative P/L and Close Price Over Trading Time')
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    # Rotate and align the tick labels so they look better
-    fig.autofmt_xdate()
-    
+    # Set x-axis ticks to show dates
+    all_days = [date.strftime('%Y-%m-%d') for date in unique_dates]
+    week_starts = []
+    for i, date in enumerate(unique_dates):
+        if i == 0 or date.weekday() < unique_dates[i-1].weekday():
+            week_starts.append(i)
+
+    major_ticks = [i * 390 for i in week_starts]
+    all_ticks = list(range(0, len(unique_dates) * 390, 390))
+
+    ax1.set_xticks(major_ticks)
+    ax1.set_xticks(all_ticks, minor=True)
+
+    if len(week_starts) < 5:
+        ax1.set_xticklabels(all_days, minor=True, rotation=45, ha='right')
+        ax1.tick_params(axis='x', which='minor', labelsize=8)
+    else:
+        ax1.set_xticklabels([], minor=True)
+
+    ax1.set_xticklabels([all_days[i] for i in week_starts], rotation=45, ha='right')
+    # ax1.tick_params(axis='x', which='major', colors='red')
+
+    # Format minor ticks
+    ax1.tick_params(axis='x', which='minor', bottom=True)
+
+    # Add gridlines for major ticks (week starts)
+    ax1.grid(which='major', axis='x', linestyle='--', alpha=0.7)
+        
     # Use a tight layout
     plt.tight_layout()
     
     plt.show()
     
-    # # Save the figure
-    # plt.savefig(filename)
-    # plt.close()
+    if filename:
+        # Save the figure
+        plt.savefig(filename)
+        print(f"Graph has been saved as {filename}")
+        
+    plt.close()
     
-    # print(f"Graph has been saved as {filename}")
+
