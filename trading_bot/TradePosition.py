@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
@@ -149,6 +149,7 @@ class TradePosition:
             f"Market value mismatch: {self.market_value:.4f} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0):.4f}"
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
+        # debug_print('partial_exit')
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
             debug_print(f"WARNING: shares_to_sell adjusted to ensure even shares")
@@ -224,6 +225,7 @@ class TradePosition:
 
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
+        # debug_print('partial_entry')
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
             debug_print(f"WARNING: shares_to_buy adjusted to ensure even shares")
@@ -307,33 +309,33 @@ class TradePosition:
         num_subs = calculate_num_sub_positions(times_buying_power)
         target_shares = calculate_shares_per_sub(total_shares, num_subs)
         
-        print(existing_sub_positions)
-        print(num_subs, target_shares)
+        debug_print(existing_sub_positions)
+        debug_print(num_subs, target_shares)
 
         total_cost = 0
         
-        print(f"Estimate entry cost - existing_sub_positions: {existing_sub_positions}, target_shares: {target_shares}")
+        debug_print(f"Estimate entry cost - existing_sub_positions: {existing_sub_positions}, target_shares: {target_shares}")
         
         if existing_sub_positions:
             for i, target in enumerate(target_shares):
                 if i < len(existing_sub_positions):
                     shares_to_add = max(0, target - existing_sub_positions[i])
                     finra_taf = min(TradePosition.FINRA_TAF_RATE * shares_to_add, TradePosition.FINRA_TAF_MAX)
-                    print(f"Sub-position {i}: existing: {existing_sub_positions[i]}, target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
+                    debug_print(f"Sub-position {i}: existing: {existing_sub_positions[i]}, target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
                 else:
                     shares_to_add = target
                     finra_taf = min(TradePosition.FINRA_TAF_RATE * shares_to_add, TradePosition.FINRA_TAF_MAX)
-                    print(f"New sub-position {i}: target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
+                    debug_print(f"New sub-position {i}: target: {target}, shares_to_add: {shares_to_add}, finra_taf: {finra_taf:.6f}")
                 total_cost += finra_taf
         else:
             for i, target in enumerate(target_shares):
                 finra_taf = min(TradePosition.FINRA_TAF_RATE * target, TradePosition.FINRA_TAF_MAX)
-                print(f"Initial sub-position {i}: target: {target}, finra_taf: {finra_taf:.6f}")
+                debug_print(f"Initial sub-position {i}: target: {target}, finra_taf: {finra_taf:.6f}")
                 total_cost += finra_taf
 
-        print(f"Total estimated entry cost: {total_cost:.6f}")
+        debug_print(f"Total estimated entry cost: {total_cost:.6f}")
         return total_cost
-        
+            
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
         finra_taf = min(self.FINRA_TAF_RATE * shares, self.FINRA_TAF_MAX)
         sec_fee = 0
@@ -344,36 +346,31 @@ class TradePosition:
         stock_borrow_cost = 0
         if not self.is_long and not is_entry:  # Stock borrow cost applies only to short position exits
             daily_borrow_rate = self.stock_borrow_rate / 360
-            # Calculate holding time from transactions
-            total_days_held = 0
+            total_cost = 0
             
-            # Walk backwards to find the earliest share included in current sub_position.shares
+            # Walk backwards to find relevant entry transactions
+            relevant_entries = []
             cumulative_shares = 0
             for transaction in reversed(sub_position.transactions):
                 if transaction.is_entry:
-                    cumulative_shares += transaction.shares
-                if cumulative_shares >= sub_position.shares:
-                    earliest_relevant_timestamp = transaction.timestamp
-                    break
-            
-            # Walk forwards to calculate the cost for the shares being removed
-            shares_to_remove = shares
-            for transaction in sub_position.transactions:
-                if transaction.is_entry and transaction.timestamp >= earliest_relevant_timestamp:
-                    holding_time = timestamp - transaction.timestamp
-                    days_held = holding_time.total_seconds() / (24 * 60 * 60)
-                    shares_to_calculate = min(shares_to_remove, transaction.shares)
-                    total_days_held += shares_to_calculate * days_held
-                    shares_to_remove -= shares_to_calculate
-                    
-                    if shares_to_remove <= 0:
+                    relevant_shares = min(transaction.shares, shares - cumulative_shares)
+                    relevant_entries.insert(0, (transaction, relevant_shares))
+                    cumulative_shares += relevant_shares
+                    if cumulative_shares >= shares:
                         break
             
-            stock_borrow_cost = shares * price * daily_borrow_rate * total_days_held
+            # Calculate borrow cost for relevant entries
+            for entry_transaction, relevant_shares in relevant_entries:
+                holding_time = timestamp - entry_transaction.timestamp
+                days_held = holding_time.total_seconds() / (24 * 60 * 60)
+                total_cost += relevant_shares * price * daily_borrow_rate * days_held
+                
+                # debug_print(f"Entry: {entry_transaction.timestamp}, Total Shares: {entry_transaction.shares}, Relevant Shares: {relevant_shares}, Days Held: {days_held:.2f}")
             
-            # debug_print(f'stock_borrow_cost: {stock_borrow_cost:.4f}')
-            # debug_print(f'{finra_taf + sec_fee:.4f} + {stock_borrow_cost:.4f} = {finra_taf + sec_fee + stock_borrow_cost:.4f}')
-            
+            assert cumulative_shares == shares, f"Mismatch in shares calculation: {cumulative_shares} != {shares}"
+            stock_borrow_cost = total_cost
+
+        # debug_print(f"FINRA TAF: {finra_taf:.6f}, SEC Fee: {sec_fee:.6f}, Stock Borrow Cost: {stock_borrow_cost:.6f}")
         return finra_taf + sec_fee + stock_borrow_cost
 
 
@@ -383,7 +380,7 @@ class TradePosition:
         value = -shares * price if is_entry else shares * price
         
         if is_entry:
-            print('add_transaction', shares, transaction_cost)
+            debug_print('add_transaction', shares, transaction_cost)
         
         transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, value, sp_realized_pnl)
         self.transactions.append(transaction)
@@ -427,6 +424,9 @@ class TradePosition:
 
     @property
     def total_stock_borrow_cost(self) -> float:
+        if self.is_long:
+            return 0.0  # Stock borrow cost only applies to short positions
+
         daily_borrow_rate = self.stock_borrow_rate / 360
         total_borrow_cost = 0.0
 
@@ -447,25 +447,34 @@ class TradePosition:
                 exit_time = transaction.timestamp
                 while shares_to_remove > 0 and remaining_shares_list:
                     entry = remaining_shares_list[0]
-                    if entry['shares'] <= shares_to_remove:
-                        # Entire entry transaction shares are being sold
-                        holding_time = exit_time - entry['timestamp']
-                        days_held = holding_time.total_seconds() / (24 * 60 * 60)
-                        borrow_cost = entry['shares'] * entry['price'] * daily_borrow_rate * days_held
-                        total_borrow_cost += borrow_cost
+                    shares_to_calculate = min(entry['shares'], shares_to_remove)
 
-                        shares_to_remove -= entry['shares']
+                    holding_time = exit_time - entry['timestamp']
+                    days_held = holding_time.total_seconds() / (24 * 60 * 60)
+                    borrow_cost = shares_to_calculate * entry['price'] * daily_borrow_rate * days_held
+                    total_borrow_cost += borrow_cost
+
+                    debug_print(f"Exit: {exit_time}, Entry: {entry['timestamp']}, Shares: {shares_to_calculate}, Days Held: {days_held:.2f}, Borrow Cost: {borrow_cost:.6f}")
+
+                    shares_to_remove -= shares_to_calculate
+                    entry['shares'] -= shares_to_calculate
+                    if entry['shares'] == 0:
                         remaining_shares_list.pop(0)
-                    else:
-                        # Partial entry transaction shares are being sold
-                        holding_time = exit_time - entry['timestamp']
-                        days_held = holding_time.total_seconds() / (24 * 60 * 60)
-                        borrow_cost = shares_to_remove * entry['price'] * daily_borrow_rate * days_held
-                        total_borrow_cost += borrow_cost
 
-                        entry['shares'] -= shares_to_remove
-                        shares_to_remove = 0
+                assert shares_to_remove == 0, f"Mismatch in shares calculation: {shares_to_remove} shares not accounted for"
 
+        # # Check if there are any remaining shares (open position)
+        # if remaining_shares_list:
+        #     current_time = datetime.now(timezone.utc)  # Use current time for open positions
+        #     for entry in remaining_shares_list:
+        #         holding_time = current_time - entry['timestamp']
+        #         days_held = holding_time.total_seconds() / (24 * 60 * 60)
+        #         borrow_cost = entry['shares'] * entry['price'] * daily_borrow_rate * days_held
+        #         total_borrow_cost += borrow_cost
+
+        #         debug_print(f"Open Position - Entry: {entry['timestamp']}, Shares: {entry['shares']}, Days Held: {days_held:.2f}, Borrow Cost: {borrow_cost:.6f}")
+
+        debug_print(f"Total Stock Borrow Cost: {total_borrow_cost:.6f}")
         return total_borrow_cost
 
 
@@ -556,7 +565,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
 
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
-    print(f"Trade summary has been exported to {filename}")
+    debug_print(f"Trade summary has been exported to {filename}")
 
 
 def time_to_minutes(t: time):
@@ -601,7 +610,8 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
         continuous_index.extend(cumulative_minutes + day_minutes)
         cumulative_minutes += 390  # 6.5 hours of trading
     
-    df_intraday['continuous_index'] = continuous_index
+    # df_intraday['continuous_index'] = continuous_index
+    df_intraday.loc[:,'continuous_index'] = continuous_index
     
     # Create figure and primary y-axis
     fig, ax1 = plt.subplots(figsize=(12, 6))
@@ -670,7 +680,7 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     if filename:
         # Save the figure
         plt.savefig(filename)
-        print(f"Graph has been saved as {filename}")
+        debug_print(f"Graph has been saved as {filename}")
         
     plt.close()
     
