@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from decimal import Decimal, getcontext
 
 debug = False
 def debug_print(*args, **kwargs):
@@ -21,32 +22,32 @@ def debug_print(*args, **kwargs):
 class Transaction:
     timestamp: datetime
     shares: int
-    price: float
+    price: Decimal
     is_entry: bool # Was it a buy (entry) or sell (exit)
-    transaction_cost: float # total of next 3 fields
-    finra_taf: float
-    sec_fee: float  # 0 if is_entry is True
-    stock_borrow_cost: float # 0 if it is a long.
-    value: float  # Positive if profit, negative if loss (before transaction costs are applied)
-    realized_pnl: Optional[float] = None # None if is_entry is True
+    transaction_cost: Decimal # total of next 3 fields
+    finra_taf: Decimal
+    sec_fee: Decimal  # 0 if is_entry is True
+    stock_borrow_cost: Decimal # 0 if it is a long.
+    value: Decimal  # Positive if profit, negative if loss (before transaction costs are applied)
+    realized_pnl: Optional[Decimal] = None # None if is_entry is True
 
 @dataclass
 class SubPosition:
     entry_time: datetime
-    entry_price: float
+    entry_price: Decimal
     shares: int
-    cash_committed: float
-    market_value: float = field(init=False)
-    unrealized_pnl: float = field(init=False)
-    realized_pnl: float = 0
+    cash_committed: Decimal
+    market_value: Decimal = field(init=False)
+    unrealized_pnl: Decimal = field(init=False)
+    realized_pnl: Decimal = Decimal('0.0')
     transactions: List[Transaction] = field(default_factory=list)
     exit_time: Optional[datetime] = None
-    exit_price: Optional[float] = None
+    exit_price: Optional[Decimal] = None
 
     def __post_init__(self):
         self.update_market_value(self.entry_price)
 
-    def update_market_value(self, current_price: float):
+    def update_market_value(self, current_price: Decimal):
         self.market_value = self.shares * current_price
         self.unrealized_pnl = self.market_value - (self.shares * self.entry_price)
 
@@ -59,31 +60,31 @@ class TradePosition:
     area: TouchArea
     is_long: bool
     entry_time: datetime
-    initial_balance: float
+    initial_balance: Decimal
     initial_shares: int
     use_margin: bool
     is_marginable: bool
-    times_buying_power: float
-    actual_margin_multiplier: float
-    entry_price: float
-    market_value: float = 0
+    times_buying_power: Decimal
+    actual_margin_multiplier: Decimal
+    entry_price: Decimal
+    market_value: Decimal = Decimal('0.0')
     shares: int = 0
     partial_entry_count: int = 0
     partial_exit_count: int = 0
     max_shares: int = field(init=False)
     exit_time: Optional[datetime] = None
-    exit_price: Optional[float] = None
+    exit_price: Optional[Decimal] = None
     sub_positions: List[SubPosition] = field(default_factory=list)
     transactions: List[Transaction] = field(default_factory=list)
-    current_stop_price: Optional[float] = None
-    max_price: Optional[float] = None
-    min_price: Optional[float] = None
-    last_price: float = field(default=0.0)
-    cash_committed: float = field(init=False)
-    unrealized_pnl: float = field(default=0.0)
-    realized_pnl: float = 0
-    # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
-    stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
+    current_stop_price: Optional[Decimal] = None
+    max_price: Optional[Decimal] = None
+    min_price: Optional[Decimal] = None
+    last_price: Decimal = field(default=Decimal('0.0'))
+    cash_committed: Decimal = field(init=False)
+    unrealized_pnl: Decimal = field(default=Decimal('0.0'))
+    realized_pnl: Decimal = Decimal('0.0')
+    # stock_borrow_rate: Decimal = Decimal('0.003')    # Default to 30 bps (0.3%) annually
+    stock_borrow_rate: Decimal = Decimal('0.03')      # Default to 300 bps (3%) annually
     
     # Note: This class assumes intraday trading. No overnight interest is calculated.
      
@@ -113,9 +114,9 @@ class TradePosition:
     """
     
     # https://alpaca.markets/blog/reg-taf-fees/
-    SEC_FEE_RATE = 0.000008  # $8 per $1,000,000
-    FINRA_TAF_RATE = 0.000166  # $166 per 1,000,000 shares
-    FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
+    SEC_FEE_RATE = Decimal('0.000008')  # $8 per $1,000,000
+    FINRA_TAF_RATE = Decimal('0.000166')  # $166 per 1,000,000 shares
+    FINRA_TAF_MAX = Decimal('8.30')  # Maximum $8.30 per trade
     
     def __post_init__(self):
         # self.market_value = self.initial_shares * self.entry_price
@@ -140,7 +141,7 @@ class TradePosition:
     def total_shares(self) -> int:
         return sum(sp.shares for sp in self.sub_positions if sp.exit_time is None)
                         
-    def update_market_value(self, current_price: float):
+    def update_market_value(self, current_price: Decimal):
         self.last_price = current_price
         for sp in self.sub_positions:
             if sp.shares > 0:
@@ -148,10 +149,11 @@ class TradePosition:
         self.unrealized_pnl = sum(sp.unrealized_pnl for sp in self.sub_positions if sp.shares > 0)
         self.market_value = sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)
 
-        assert abs(self.market_value - sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Market value mismatch: {self.market_value:.4f} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0):.4f}"
+        t = abs(self.market_value - sum(sp.market_value for sp in self.sub_positions if sp.shares > 0))
+        assert t < Decimal('1e-4'), \
+            f"Market value mismatch: {self.market_value} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int):
+    def partial_exit(self, exit_time: datetime, exit_price: Decimal, shares_to_sell: int):
         # debug_print('partial_exit')
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
@@ -169,9 +171,10 @@ class TradePosition:
         total_shares = sum(sp.shares for sp in active_sub_positions)
 
         for sp in active_sub_positions:
-            shares_sold = int(shares_to_sell * (sp.shares / total_shares))
+            assert sp.shares == int(Decimal(total_shares)/Decimal(self.calculate_num_sub_positions())), (sp.shares, total_shares, self.calculate_num_sub_positions())
+            shares_sold = int(shares_to_sell * (Decimal(sp.shares) / Decimal(total_shares)))
             if shares_sold > 0:
-                sub_cash_released = (shares_sold / sp.shares) * sp.cash_committed
+                sub_cash_released = (Decimal(shares_sold) / Decimal(sp.shares)) * sp.cash_committed
                 sp_realized_pnl = (exit_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - exit_price) * shares_sold
                 
                 old_shares = sp.shares
@@ -194,8 +197,9 @@ class TradePosition:
         self.update_market_value(exit_price)
         self.partial_exit_count += 1
 
-        assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed:.4f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.4f}"
+        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
+        assert t < Decimal('1e-4'), \
+            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
@@ -227,7 +231,7 @@ class TradePosition:
             return [half_shares, half_shares]
 
 
-    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int):
+    def partial_entry(self, entry_time: datetime, entry_price: Decimal, shares_to_buy: int):
         # debug_print('partial_entry')
         # Ensure we maintain an even number of shares when times_buying_power > 2
         if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
@@ -280,8 +284,9 @@ class TradePosition:
         self.update_market_value(entry_price)
         self.partial_entry_count += 1
 
-        assert abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)) < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed:.4f} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0):.4f}"
+        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
+        assert t < Decimal('1e-4'), \
+            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
@@ -297,8 +302,8 @@ class TradePosition:
         return additional_cash_committed, fees
 
     @staticmethod
-    def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: Optional[List[int]] = None):
-        def calculate_num_sub_positions(times_buying_power: float) -> int:
+    def estimate_entry_cost(total_shares: int, times_buying_power: Decimal, existing_sub_positions: Optional[List[int]] = None):
+        def calculate_num_sub_positions(times_buying_power: Decimal) -> int:
             return 2 if times_buying_power > 2 else 1
 
         def calculate_shares_per_sub(total_shares: int, num_subs: int) -> List[int]:
@@ -338,7 +343,7 @@ class TradePosition:
         debug_print(f"Total estimated entry cost: {total_cost:.6f}")
         return total_cost
             
-    def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
+    def calculate_transaction_cost(self, shares: int, price: Decimal, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> Decimal:
         finra_taf = min(self.FINRA_TAF_RATE * shares, self.FINRA_TAF_MAX)
         sec_fee = 0
         if not is_entry:  # SEC fee only applies to exits
@@ -365,7 +370,7 @@ class TradePosition:
             # Calculate borrow cost for relevant entries
             for entry_transaction, relevant_shares in relevant_entries:
                 holding_time = timestamp - entry_transaction.timestamp
-                days_held = holding_time.total_seconds() / (24 * 60 * 60)
+                days_held = Decimal(holding_time.total_seconds()) / Decimal(24 * 60 * 60)
                 total_cost += relevant_shares * price * daily_borrow_rate * days_held
                 
                 # debug_print(f"Entry: {entry_transaction.timestamp}, Total Shares: {entry_transaction.shares}, Relevant Shares: {relevant_shares}, Days Held: {days_held:.2f}")
@@ -379,7 +384,7 @@ class TradePosition:
 
 
 
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool, sub_position: SubPosition, sp_realized_pnl: Optional[float] = None):
+    def add_transaction(self, timestamp: datetime, shares: int, price: Decimal, is_entry: bool, sub_position: SubPosition, sp_realized_pnl: Optional[Decimal] = None):
         finra_taf, sec_fee, stock_borrow_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp, sub_position)
         transaction_cost = finra_taf + sec_fee + stock_borrow_cost
         value = -shares * price if is_entry else shares * price
@@ -402,7 +407,7 @@ class TradePosition:
         return transaction_cost
 
   
-    def update_stop_price(self, current_price: float):
+    def update_stop_price(self, current_price: Decimal):
         if self.is_long:
             self.max_price = max(self.max_price or self.entry_price, current_price)
             self.current_stop_price = self.max_price - self.area.get_range
@@ -414,11 +419,11 @@ class TradePosition:
         
         return self.should_exit(current_price)
 
-    def should_exit(self, current_price: float) -> bool:
+    def should_exit(self, current_price: Decimal) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \
                (not self.is_long and current_price >= self.current_stop_price)
 
-    def close(self, exit_time: datetime, exit_price: float):
+    def close(self, exit_time: datetime, exit_price: Decimal):
         self.exit_time = exit_time
         self.exit_price = exit_price
         for sp in self.sub_positions:
@@ -427,11 +432,11 @@ class TradePosition:
                 sp.exit_price = exit_price
 
     @property
-    def total_stock_borrow_cost(self) -> float:
+    def total_stock_borrow_cost(self) -> Decimal:
         if self.is_long:
-            return 0.0
+            return Decimal('0.0')
         
-        total_cost = 0.0
+        total_cost = Decimal('0.0')
         for sub_position in self.sub_positions:
             for transaction in sub_position.transactions:
                 if not transaction.is_entry:  # We only consider exit transactions
@@ -449,35 +454,35 @@ class TradePosition:
         return end_time - start_time
 
     @property
-    def entry_transaction_costs(self) -> float:
+    def entry_transaction_costs(self) -> Decimal:
         return sum(t.transaction_cost for t in self.transactions if t.is_entry) # / self.times_buying_power
 
     @property
-    def exit_transaction_costs(self) -> float:
+    def exit_transaction_costs(self) -> Decimal:
         return sum(t.transaction_cost for t in self.transactions if not t.is_entry) # / self.times_buying_power
 
     @property
-    def total_transaction_costs(self) -> float:
+    def total_transaction_costs(self) -> Decimal:
         return sum(t.transaction_cost for t in self.transactions) # / self.times_buying_power
 
     @property
-    def get_unrealized_pnl(self) -> float:
+    def get_unrealized_pnl(self) -> Decimal:
         return self.unrealized_pnl # / self.times_buying_power
 
     @property
-    def get_realized_pnl(self) -> float:
+    def get_realized_pnl(self) -> Decimal:
         return self.realized_pnl # / self.times_buying_power
 
     @property
-    def profit_loss(self) -> float:
+    def profit_loss(self) -> Decimal:
         return self.get_unrealized_pnl + self.get_realized_pnl - self.total_transaction_costs
 
     @property
-    def profit_loss_pct(self) -> float:
+    def profit_loss_pct(self) -> Decimal:
         return (self.profit_loss / self.initial_balance) * 100
 
     @property
-    def price_diff(self) -> float:
+    def price_diff(self) -> Decimal:
         if not self.sub_positions or any(sp.exit_time is None for sp in self.sub_positions):
             return 0
         avg_entry_price = sum(sp.entry_price * sp.shares for sp in self.sub_positions) / sum(sp.shares for sp in self.sub_positions)
@@ -486,11 +491,11 @@ class TradePosition:
         return diff if self.is_long else -diff
                 
     @property
-    def total_investment(self) -> float:
+    def total_investment(self) -> Decimal:
         return sum(sp.entry_price * sp.shares for sp in self.sub_positions)
 
     @property
-    def margin_used(self) -> float:
+    def margin_used(self) -> Decimal:
         return self.total_investment - self.initial_balance
 
 
@@ -534,7 +539,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
 def time_to_minutes(t: time):
     return t.hour * 60 + t.minute - (9 * 60 + 30)
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float,  filename: Optional[str]=None):
+def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: Decimal,  filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss at each corresponding exit time
     overlaid on the close price from the DataFrame, using a dual y-axis.
@@ -543,7 +548,7 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     Args:
     trades (list): List of TradePosition objects
     df (pd.DataFrame): DataFrame containing the price data
-    initial_investment (float): Initial investment balance for normalization
+    initial_investment (Decimal): Initial investment balance for normalization
     filename (str): Name of the image file to be created
     """
     # Prepare data for plotting
