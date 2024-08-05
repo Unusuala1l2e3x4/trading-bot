@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, time
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
@@ -22,13 +22,13 @@ class Transaction:
     timestamp: datetime
     shares: int
     price: float
-    is_entry: bool
-    transaction_cost: float
+    is_entry: bool # Was it a buy (entry) or sell (exit)
+    transaction_cost: float # total of next 3 fields
     finra_taf: float
-    sec_fee: float
-    stock_borrow_cost: float
-    value: float  # This will be the cost (negative) or revenue (positive)
-    realized_pnl: Optional[float] = None 
+    sec_fee: float  # 0 if is_entry is True
+    stock_borrow_cost: float # 0 if it is a long.
+    value: float  # Positive if profit, negative if loss (before transaction costs are applied)
+    realized_pnl: Optional[float] = None # None if is_entry is True
 
 @dataclass
 class SubPosition:
@@ -158,7 +158,7 @@ class TradePosition:
             debug_print(f"WARNING: shares_to_sell adjusted to ensure even shares")
             shares_to_sell -= 1
             
-        debug_print(f"DEBUG: Entering partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
+        debug_print(f"DEBUG: partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
         cash_released = 0
@@ -234,7 +234,7 @@ class TradePosition:
             debug_print(f"WARNING: shares_to_buy adjusted to ensure even shares")
             shares_to_buy -= 1
             
-        debug_print(f"DEBUG: Entering partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
+        debug_print(f"DEBUG: partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
         new_total_shares = self.shares + shares_to_buy
@@ -293,7 +293,6 @@ class TradePosition:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
         # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.4f}, "
         #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
-        
         
         return additional_cash_committed, fees
 
@@ -400,7 +399,6 @@ class TradePosition:
         debug_print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
             f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
 
-
         return transaction_cost
 
   
@@ -506,7 +504,9 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     filename (str): Name of the CSV file to be created
     """
     data = []
+    cumulative_pct_change = 0
     for trade in trades:
+        cumulative_pct_change += trade.profit_loss_pct
         row = {
             'ID': trade.id,
             'Type': 'Long' if trade.is_long else 'Short',
@@ -520,12 +520,12 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Unrealized P/L': f"{trade.get_unrealized_pnl}",
             'Total P/L': f"{trade.profit_loss}",
             'ROE (P/L %)': f"{trade.profit_loss_pct}",
+            'Cumulative P/L %': f"{cumulative_pct_change}",  # New column
             'Margin Multiplier': f"{trade.actual_margin_multiplier}",
             'Times Buying Power': f"{trade.times_buying_power}",
             'Transaction Costs': f"{trade.total_transaction_costs}"
         }
         data.append(row)
-
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
     debug_print(f"Trade summary has been exported to {filename}")
@@ -549,18 +549,31 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     # Prepare data for plotting
     exit_times = []
     cumulative_pnl = []
+    cumulative_pnl_longs = []
+    cumulative_pnl_shorts = []
     running_pnl = 0
+    running_pnl_longs = 0
+    running_pnl_shorts = 0
     
     for trade in trades:
         if trade.exit_time:
             exit_times.append(trade.exit_time)
-            running_pnl += trade.profit_loss
-            cumulative_pnl.append(100 * running_pnl / initial_investment)
+            # running_pnl += trade.profit_loss
+            # cumulative_pnl.append(100 * running_pnl / initial_investment)
+            running_pnl += trade.profit_loss_pct
+            if trade.is_long:
+                running_pnl_longs += trade.profit_loss_pct
+            else:
+                running_pnl_shorts += trade.profit_loss_pct
+            cumulative_pnl.append(running_pnl)
+            cumulative_pnl_longs.append(running_pnl_longs)
+            cumulative_pnl_shorts.append(running_pnl_shorts)
+            
     
     # Filter df to include only intraday data
     df['time'] = df.index.get_level_values('timestamp').time
     df['date'] = df.index.get_level_values('timestamp').date
-    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))]
+    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))].copy()
     
     # Create a continuous index
     unique_dates = sorted(df_intraday['date'].unique())
@@ -573,17 +586,16 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
         continuous_index.extend(cumulative_minutes + day_minutes)
         cumulative_minutes += 390  # 6.5 hours of trading
     
-    # df_intraday['continuous_index'] = continuous_index
-    df_intraday.loc[:,'continuous_index'] = continuous_index
+    df_intraday['continuous_index'] = continuous_index
     
     # Create figure and primary y-axis
     fig, ax1 = plt.subplots(figsize=(12, 6))
     
     # Plot close price on primary y-axis
-    ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='blue', label='Close Price')
+    ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='gray', label='Close Price')
     ax1.set_xlabel('Trading Time (minutes)')
-    ax1.set_ylabel('Close Price', color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.set_ylabel('Close Price', color='black')
+    ax1.tick_params(axis='y', labelcolor='black')
     
     # Create secondary y-axis
     ax2 = ax1.twinx()
@@ -597,12 +609,16 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
         exit_continuous_index.append(days_passed * 390 + exit_minute)
     
     # Plot cumulative P/L on secondary y-axis
-    ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='Cumulative P/L')
-    ax2.set_ylabel('Cumulative P/L', color='green')
-    ax2.tick_params(axis='y', labelcolor='green')
+    ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='All')
+    ax2.plot(exit_continuous_index, cumulative_pnl_longs, color='blue', label='Longs')
+    ax2.plot(exit_continuous_index, cumulative_pnl_shorts, color='yellow', label='Shorts')
+    # ax2.set_ylabel('Cumulative P/L', color='green')
+    ax2.set_ylabel('Cumulative P/L % Change', color='black')
+    ax2.tick_params(axis='y', labelcolor='black')
     
     # Set title and legend
-    plt.title('Cumulative P/L and Close Price Over Trading Time')
+    # plt.title('Cumulative P/L and Close Price Over Trading Time')
+    plt.title('Cumulative P/L % Change and Close Price Over Trading Time')
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')

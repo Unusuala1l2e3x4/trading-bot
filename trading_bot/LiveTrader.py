@@ -1,6 +1,6 @@
 import asyncio
 import pandas as pd
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import StockBarsRequest

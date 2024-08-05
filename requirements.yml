@@ -16,3 +16,5 @@ dependencies:
     - matplotlib
     - tqdm
     - numba
+    - line_profiler
+    - snakeviz
