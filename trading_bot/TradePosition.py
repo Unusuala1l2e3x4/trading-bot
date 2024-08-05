@@ -7,6 +7,7 @@ import math
 import pandas as pd
 from datetime import datetime
 import pandas as pd
+from pandas import Timestamp
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -539,7 +540,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
 def time_to_minutes(t: time):
     return t.hour * 60 + t.minute - (9 * 60 + 30)
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: Decimal,  filename: Optional[str]=None):
+def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: Decimal, when_above_max_investment: List[pd.Timestamp], filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss at each corresponding exit time
     overlaid on the close price from the DataFrame, using a dual y-axis.
@@ -602,6 +603,21 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     ax1.set_ylabel('Close Price', color='black')
     ax1.tick_params(axis='y', labelcolor='black')
     
+    # Convert when_above_max_investment to continuous index
+    above_max_continuous_index = []
+    for timestamp in when_above_max_investment:
+        date = timestamp.date()
+        minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
+        days_passed = unique_dates.index(date)
+        above_max_continuous_index.append(days_passed * 390 + minute)
+
+    # Get the minimum close price for y-value of the points
+    min_close = df_intraday['close'].min()
+
+    # Plot points for when above max investment
+    ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
+                color='red', label='Above Max Investment')
+
     # Create secondary y-axis
     ax2 = ax1.twinx()
     
