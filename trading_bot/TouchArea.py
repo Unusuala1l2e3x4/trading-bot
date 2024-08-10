@@ -6,8 +6,9 @@ from itertools import takewhile
 
 @dataclass
 class TouchArea:
-    def __init__(self, id, level, upper_bound, lower_bound, touches, is_long, min_touches, bid_buffer_pct):
+    def __init__(self, date, id, level, upper_bound, lower_bound, touches, is_long, min_touches, bid_buffer_pct):
         assert lower_bound < level < upper_bound
+        self.date = date
         self.id = id
         self.level = level
         self.upper_bound = upper_bound

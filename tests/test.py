@@ -1,85 +1,126 @@
-import asyncio
-from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.enums import Adjustment
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+# You're absolutely right about the slippage calculation and its implementation. Let's modify the code to incorporate your suggestions. We'll adjust the `calculate_slippage` function and modify the `partial_entry` and `partial_exit` methods to handle slippage correctly.
 
-debug = True
+# First, let's update the `calculate_slippage` function:
 
-def debug_print(*args, **kwargs):
-    if debug:
-        print(*args, **kwargs)
+# ```python
+def calculate_slippage(is_long: bool, trade_size: int, volume: Decimal, slippage_factor: Decimal) -> Decimal:
+    if is_long:    
+        return -slippage_factor * (Decimal(trade_size) / volume)  # decreases price for longs
+    else:
+        return slippage_factor * (Decimal(trade_size) / volume)  # increases price for shorts
+# ```
 
-class LiveTrader:
-    def __init__(self, api_key, secret_key, symbol, initial_balance):
-        self.trading_client = TradingClient(api_key, secret_key, paper=True)
-        self.data_stream = StockDataStream(api_key, secret_key)
-        self.historical_client = StockHistoricalDataClient(api_key, secret_key)
-        self.symbol = symbol
-        self.balance = initial_balance
-        self.data = None
-        self.is_ready = False
-        self.current_position = None
-        self.ny_tz = ZoneInfo("America/New_York")
+# Now, let's modify the `partial_entry` and `partial_exit` methods to incorporate slippage:
 
-    async def initialize_data(self):
-        try:
-            debug_start = datetime(2024, 7, 24, 9, 30).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
-            debug_end = datetime(2024, 7, 24, 16, 0).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
-            
-            
-            end = datetime.now(self.ny_tz)
-            start = end.replace(hour=4, minute=0, second=0, microsecond=0)
-            if end.time() < datetime.time(4, 0):
-                start -= timedelta(days=1)
+# ```python
+class TradePosition:
+    # ... (other methods remain the same)
 
-            debug_print(f"Fetching historical data from {start} to {end}")
-            
-            self.data = self.get_historical_bars(start, end)
-            
-            if self.data.empty:
-                debug_print("No historical data available. Waiting for data.")
-                return
+    def partial_entry(self, entry_time: datetime, entry_price: Decimal, shares_to_buy: int, vwap: Decimal, volume: Decimal, slippage_factor: Decimal):
+        if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
+            shares_to_buy -= 1
 
-            latest_data_time = self.data.index.get_level_values('timestamp').max().tz_convert(self.ny_tz)
-            debug_print(f"Initialized historical data: {len(self.data)} bars")
-            debug_print(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {latest_data_time}")
-            self.is_ready = True
+        slippage = calculate_slippage(self.is_long, shares_to_buy, volume, slippage_factor)
+        adjusted_price = entry_price * (1 + slippage)
 
-        except Exception as e:
-            debug_print(f"Error initializing data: {e}")
+        new_total_shares = self.shares + shares_to_buy
+        new_num_subs = self.calculate_num_sub_positions()
 
-    def get_historical_bars(self, start, end):
-        request_params = StockBarsRequest(
-            symbol_or_symbols=self.symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            adjustment=Adjustment.ALL
-        )
-        bars = self.historical_client.get_stock_bars(request_params).df
-        return bars
+        additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
 
-    async def on_bar(self, bar):
-        try:
-            debug_print(f"Received bar: {bar}")
-            # Process the bar data here
-            # Update your strategy, make trading decisions, etc.
-        except Exception as e:
-            debug_print(f"Error in on_bar: {e}")
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
 
-    async def run(self):
-        try:
-            await self.initialize_data()
-            
-            async def _process_bar(bar):
-                await self.on_bar(bar)
+        fees = 0
+        shares_added = 0
 
-            self.data_stream.subscribe_bars(_process_bar, self.symbol)
-            await self.data_stream.run()
-        except Exception as e:
-            debug_print(f"Error in run: {e}")
+        for i, target in enumerate(target_shares):
+            if i < len(active_sub_positions):
+                # Existing sub-position
+                sp = active_sub_positions[i]
+                shares_to_add = target - sp.shares
+                if shares_to_add > 0:
+                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
+                    old_shares = sp.shares
+                    sp.shares += shares_to_add
+                    sp.cash_committed += sub_cash_committed
+                    fees += self.add_transaction(entry_time, shares_to_add, adjusted_price, is_entry=True, vwap=vwap, sub_position=sp)
+                    shares_added += shares_to_add
+            else:
+                # New sub-position
+                sub_cash_committed = (target * entry_price) / self.times_buying_power
+                new_sub = SubPosition(entry_time, adjusted_price, target, sub_cash_committed)
+                self.sub_positions.append(new_sub)
+                fees += self.add_transaction(entry_time, target, adjusted_price, is_entry=True, vwap=vwap, sub_position=new_sub)
+                shares_added += target
+
+        self.shares += shares_added
+        self.cash_committed += additional_cash_committed
+        self.update_market_value(adjusted_price)
+        self.partial_entry_count += 1
+        return additional_cash_committed, fees
+
+    def partial_exit(self, exit_time: datetime, exit_price: Decimal, shares_to_sell: int, vwap: Decimal, volume: Decimal, slippage_factor: Decimal):
+        if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
+            shares_to_sell -= 1
+
+        slippage = calculate_slippage(not self.is_long, shares_to_sell, volume, slippage_factor)
+        adjusted_price = exit_price * (1 + slippage)
+
+        cash_released = 0
+        realized_pnl = 0
+        fees = 0
+
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        total_shares = sum(sp.shares for sp in active_sub_positions)
+
+        for sp in active_sub_positions:
+            assert sp.shares == int(Decimal(total_shares)/Decimal(self.calculate_num_sub_positions())), (sp.shares, total_shares, self.calculate_num_sub_positions())
+            shares_sold = int(shares_to_sell * (Decimal(sp.shares) / Decimal(total_shares)))
+            if shares_sold > 0:
+                sub_cash_released = (Decimal(shares_sold) / Decimal(sp.shares)) * sp.cash_committed
+                sp_realized_pnl = (adjusted_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - adjusted_price) * shares_sold
+                old_shares = sp.shares
+                sp.shares -= shares_sold
+                sp.cash_committed -= sub_cash_released
+                sp.realized_pnl += sp_realized_pnl
+                cash_released += sub_cash_released
+                realized_pnl += sp_realized_pnl
+                fees += self.add_transaction(exit_time, shares_sold, adjusted_price, is_entry=False, vwap=vwap, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
+
+        self.shares -= shares_to_sell
+        self.cash_committed -= cash_released
+        self.update_market_value(adjusted_price)
+        self.partial_exit_count += 1
+        return realized_pnl, cash_released, fees
+
+    def add_transaction(self, timestamp: datetime, shares: int, price: Decimal, is_entry: bool, vwap: float, sub_position: SubPosition, sp_realized_pnl: Optional[Decimal] = None):
+        finra_taf, sec_fee, stock_borrow_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp, sub_position)
+        transaction_cost = finra_taf + sec_fee + stock_borrow_cost
+        value = -shares * price if is_entry else shares * price
+        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, value, vwap, sp_realized_pnl)
+        self.transactions.append(transaction)
+        sub_position.add_transaction(transaction)
+        if not is_entry:
+            if sp_realized_pnl is None:
+                raise ValueError("sp_realized_pnl must be provided for exit transactions")
+            self.realized_pnl += sp_realized_pnl
+        return transaction_cost
+# ```
+
+# These changes implement slippage in the following way:
+
+# 1. Slippage is calculated based on the trade size, volume, and whether it's a long or short position.
+# 2. The adjusted price (including slippage) is used for creating new sub-positions, adding transactions, and updating market value.
+# 3. The original price is still used for calculating cash committed, ensuring that the balance remains accurate.
+# 4. Realized PnL is calculated using the adjusted price, reflecting the actual execution price after slippage.
+
+# To use these modified methods, you'll need to pass the `volume` and `slippage_factor` parameters when calling `partial_entry` and `partial_exit`. For example:
+
+# ```python
+additional_cash_committed, fees = position.partial_entry(entry_time, entry_price, shares_to_buy, vwap, volume, slippage_factor)
+
+realized_pnl, cash_released, fees = position.partial_exit(exit_time, exit_price, shares_to_sell, vwap, volume, slippage_factor)
+# ```
+
+# These changes should accurately model unfavorable slippage for both long and short positions while maintaining the correct balance and cash committed values.
