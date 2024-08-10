@@ -11,7 +11,7 @@ from pandas import Timestamp
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from decimal import Decimal, getcontext
+from decimal import Decimal
 
 debug = False
 def debug_print(*args, **kwargs):
