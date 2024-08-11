@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from bisect import bisect_right, bisect_left
 from collections import defaultdict
 from itertools import takewhile
-from decimal import Decimal
+from numba import jit
 
 @dataclass
 class TouchArea:
@@ -31,7 +31,7 @@ class TouchArea:
         self.touches.append(touch_time)
 
     
-    def record_entry_exit(self, entry_time: datetime, entry_price: Decimal, exit_time: datetime, exit_price: Decimal):
+    def record_entry_exit(self, entry_time: datetime, entry_price: float, exit_time: datetime, exit_price: float):
         self.entries_exits.append((entry_time, entry_price, exit_time, exit_price))
 
     @property
@@ -47,12 +47,12 @@ class TouchArea:
         return self.touches[-1] if self.touches else None
     
     @property
-    def get_buy_price(self) -> Decimal:
+    def get_buy_price(self) -> float:
         # return self.upper_bound * (1 + self.bid_buffer_pct / 100) if self.is_long else self.lower_bound * (1 - self.bid_buffer_pct / 100)
         return self.upper_bound if self.is_long else self.lower_bound
     
     @property
-    def calculate_profit(self) -> Decimal:
+    def calculate_profit(self) -> float:
         total_profit = 0
         for _, entry_price, _, exit_price in self.entries_exits:
             if self.is_long:
@@ -62,7 +62,7 @@ class TouchArea:
         return total_profit
     
     @property
-    def get_range(self) -> Decimal:
+    def get_range(self) -> float:
         return self.upper_bound - self.lower_bound
     
     def terminate(self, touch_area_collection):
