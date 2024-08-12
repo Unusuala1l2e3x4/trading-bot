@@ -6,8 +6,6 @@ from TouchArea import TouchArea
 import math
 import pandas as pd
 from datetime import datetime, date
-import pandas as pd
-from pandas import Timestamp
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -31,8 +29,8 @@ def calculate_num_sub_positions(times_buying_power: float) -> int:
     if times_buying_power <= 2:
         return 1
     else:
-        return 2  # We'll always use 2 sub-positions when times_buying_power > 2
-    # in the future, if capital is much higher, more sub-positions may be needed to reduce slippage
+        return 2  # Use 2 sub-positions when times_buying_power > 2
+    # If capital is much higher, more sub-positions (and distribution among multiple symbols) may be needed to reduce slippage.
 
 @jit(nopython=True)
 def calculate_shares_per_sub(total_shares: int, num_subs: int) -> np.ndarray:
@@ -226,12 +224,10 @@ class TradePosition:
             f"Market value mismatch: {self.market_value} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        # debug_print('partial_exit')
-        # Ensure we maintain an even number of shares when times_buying_power > 2
-        if self.times_buying_power > 2 and (self.shares - shares_to_sell) % 2 != 0:
-            debug_print(f"WARNING: shares_to_sell adjusted to ensure even shares")
-            shares_to_sell -= 1
-            
+        num_subs = self.calculate_num_sub_positions(self.times_buying_power)
+        new_total_shares = self.shares - shares_to_sell
+        assert new_total_shares % num_subs == 0, f"Total shares {new_total_shares} is not evenly divisible by number of sub-positions {num_subs}"
+
         debug_print(f"DEBUG: partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
         
@@ -245,7 +241,7 @@ class TradePosition:
         total_shares = sum(sp.shares for sp in active_sub_positions)
 
         for sp in active_sub_positions:
-            assert sp.shares == int(float(total_shares)/float(self.calculate_num_sub_positions(self.times_buying_power))), (sp.shares, total_shares, self.calculate_num_sub_positions(self.times_buying_power))
+            assert sp.shares == int(float(total_shares)/float(num_subs)), (sp.shares, total_shares, num_subs)
             shares_sold = int(shares_to_sell * (float(sp.shares) / float(total_shares)))
             if shares_sold > 0:
                 sub_cash_released = (float(shares_sold) / float(sp.shares)) * sp.cash_committed
@@ -286,12 +282,6 @@ class TradePosition:
         return realized_pnl, cash_released, fees
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        # debug_print('partial_entry')
-        # Ensure we maintain an even number of shares when times_buying_power > 2
-        # if self.times_buying_power > 2 and (self.shares + shares_to_buy) % 2 != 0:
-        #     debug_print(f"WARNING: shares_to_buy adjusted to ensure even shares")
-        #     shares_to_buy -= 1
-            
         debug_print(f"DEBUG: partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
@@ -603,7 +593,8 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
             cumulative_pnl.append(running_pnl)
             cumulative_pnl_longs.append(running_pnl_longs)
             cumulative_pnl_shorts.append(running_pnl_shorts)
-            
+
+    symbol = df.index.get_level_values('symbol')[0]
     
     # Filter df to include only intraday data
     df['time'] = df.index.get_level_values('timestamp').time
@@ -632,20 +623,21 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     ax1.set_ylabel('Close Price', color='black')
     ax1.tick_params(axis='y', labelcolor='black')
     
-    # Convert when_above_max_investment to continuous index
-    above_max_continuous_index = []
-    for timestamp in when_above_max_investment:
-        date = timestamp.date()
-        minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
-        days_passed = unique_dates.index(date)
-        above_max_continuous_index.append(days_passed * 390 + minute)
+    if len(when_above_max_investment) > 0:
+        # Convert when_above_max_investment to continuous index
+        above_max_continuous_index = []
+        for timestamp in when_above_max_investment:
+            date = timestamp.date()
+            minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
+            days_passed = unique_dates.index(date)
+            above_max_continuous_index.append(days_passed * 390 + minute)
 
-    # Get the minimum close price for y-value of the points
-    min_close = df_intraday['close'].min()
+        # Get the minimum close price for y-value of the points
+        min_close = df_intraday['close'].min()
 
-    # Plot points for when above max investment
-    ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
-                color='red', label='Above Max Investment')
+        # Plot points for when above max investment
+        ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
+                    color='red', label='Above Max Investment')
 
     # Create secondary y-axis
     ax2 = ax1.twinx()
@@ -667,8 +659,7 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     ax2.tick_params(axis='y', labelcolor='black')
     
     # Set title and legend
-    # plt.title('Cumulative P/L and Close Price Over Trading Time')
-    plt.title('Cumulative P/L % Change and Close Price Over Trading Time')
+    plt.title(f'{symbol}: Cumulative P/L % Change vs Close Price')
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')

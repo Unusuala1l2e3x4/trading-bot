@@ -274,22 +274,7 @@ class LiveTrader:
         if hasattr(self, 'data_stream'):
             await self.data_stream.stop_ws()
             # await self.data_stream.close()
-           
-        
-# async def BaseStream_run_custom(data_stream) -> None:
-#     """Starts up the websocket connection's event loop"""
-#     try:
-#         print('BaseStream_run_custom - data_stream._run_forever()...')
-#         await data_stream._run_forever()
-#         print('...done')
-#     except KeyboardInterrupt:
-#         print("keyboard interrupt, bye")
-#         pass
-#     finally:
-#         data_stream.stop()
-            
-            
-            
+
 import tracemalloc
 tracemalloc.start()
 
@@ -299,7 +284,7 @@ async def main():
     initial_balance = 10000
     trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance)
     
-    timeout = 120
+    timeout = 70 # should be more than 60
     
     try:
         # Wait for up to 2 minutes (120 seconds) to receive data
