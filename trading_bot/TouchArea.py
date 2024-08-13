@@ -40,11 +40,11 @@ class TouchArea:
 
     @property
     def get_min_touch_time(self) -> datetime:
-        return self.touches[self.min_touches-1] if self.touches else None
+        return self.touches[self.min_touches-1] if self.touches is not None else None
     
     @property
     def get_last_touch(self) -> datetime:
-        return self.touches[-1] if self.touches else None
+        return self.touches[-1] if self.touches is not None else None
     
     @property
     def get_buy_price(self) -> float:

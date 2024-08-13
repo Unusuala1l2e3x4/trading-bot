@@ -358,8 +358,6 @@ class TradePosition:
     
     @staticmethod
     def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: Optional[np.ndarray] = np.array([])) -> float:
-        if existing_sub_positions is None:
-            existing_sub_positions = np.array([])
         return estimate_entry_cost(total_shares, times_buying_power, existing_sub_positions)
     
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
@@ -559,7 +557,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
 def time_to_minutes(t: time):
     return t.hour * 60 + t.minute - (9 * 60 + 30)
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: List[pd.Timestamp], filename: Optional[str]=None):
+def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss at each corresponding exit time
     overlaid on the close price from the DataFrame, using a dual y-axis.
@@ -623,7 +621,7 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     ax1.set_ylabel('Close Price', color='black')
     ax1.tick_params(axis='y', labelcolor='black')
     
-    if len(when_above_max_investment) > 0:
+    if when_above_max_investment and len(when_above_max_investment) > 0:
         # Convert when_above_max_investment to continuous index
         above_max_continuous_index = []
         for timestamp in when_above_max_investment:
