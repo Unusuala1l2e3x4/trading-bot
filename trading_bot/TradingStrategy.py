@@ -116,19 +116,9 @@ class StrategyParameters:
 class TradingStrategy:
     def __init__(self, touch_detection_areas: TouchDetectionAreas, params: StrategyParameters, export_trades_path: Optional[str]=None):
         self.touch_detection_areas = touch_detection_areas
-        self.params = params
-        
-        self.current_id = 0
-        self.count_entry_adjust = 0
-        self.count_exit_adjust = 0
-        self.count_entry_skip = 0
-        self.count_exit_skip = 0
-        
+        self.params = params        
         self.export_trades_path = export_trades_path
         
-        self.initialize_strategy()
-
-    def initialize_strategy(self):
         self.symbol = self.touch_detection_areas.symbol
         self.long_touch_area = self.touch_detection_areas.long_touch_area
         self.short_touch_area = self.touch_detection_areas.short_touch_area
@@ -138,10 +128,13 @@ class TradingStrategy:
         self.min_touches = self.touch_detection_areas.min_touches
         self.start_time = self.touch_detection_areas.start_time
         self.end_time = self.touch_detection_areas.end_time
-        
+
         self.df = self.bars[self.mask].sort_index(level='timestamp')
         self.timestamps = self.df.index.get_level_values('timestamp')
         
+        self.initialize_strategy()
+
+    def initialize_strategy(self, export_trades_path: Optional[str]=None):
         self.balance = self.params.initial_investment
         self.total_account_value = self.params.initial_investment
         self.open_positions = {}
@@ -150,7 +143,16 @@ class TradingStrategy:
 
         self.is_marginable = is_security_marginable(self.symbol) 
         self.is_etb = is_security_shortable_and_etb(self.symbol)
-
+        
+        self.current_id = 0
+        self.count_entry_adjust = 0
+        self.count_exit_adjust = 0
+        self.count_entry_skip = 0
+        self.count_exit_skip = 0
+        
+        if export_trades_path:
+            self.export_trades_path = export_trades_path
+        
         print(f'{self.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
         
@@ -564,9 +566,6 @@ class TradingStrategy:
         
         self.update_total_account_value(close_price, 'AFTER removing exited positions')
 
-
-
-
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
         
@@ -604,16 +603,27 @@ class TradingStrategy:
             elif i >= len(self.df) - 1: # only for testing. not in live environment
                 self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
                                          self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
-            
             daily_index += 1
-            
-        
         
         if current_time >= day_end_time:
             assert not self.open_positions
 
         return self.generate_backtest_results()
 
+
+    # def can_open_new_position(self, current_time: datetime) -> bool:
+    #     # Check if we can open a new position based on time and existing positions
+    #     pass
+
+    # def should_enter_position(self, area: TouchArea) -> bool:
+    #     # Check if we should enter a position for this area
+    #     pass
+
+    # def should_close_all_positions(self, current_time: datetime) -> bool:
+    #     # Check if we should close all positions (e.g., end of day)
+    #     pass
+    
+    
     def handle_new_trading_day(self, current_time, timestamps):
         self.current_id = 0
         # Any other new day initialization logic
@@ -664,18 +674,6 @@ class TradingStrategy:
                 (not area.is_long and (self.params.do_shorts or self.params.sim_shorts))):
                 if self.place_stop_market_buy(area, current_time, data, prev_close):
                     break  # Exit the loop after placing a position
-
-    # def can_open_new_position(self, current_time: datetime) -> bool:
-    #     # Check if we can open a new position based on time and existing positions
-    #     pass
-
-    # def should_enter_position(self, area: TouchArea) -> bool:
-    #     # Check if we should enter a position for this area
-    #     pass
-
-    # def should_close_all_positions(self, current_time: datetime) -> bool:
-    #     # Check if we should close all positions (e.g., end of day)
-    #     pass
 
     def generate_backtest_results(self):
         # Calculate and return backtest results
@@ -766,9 +764,6 @@ class TradingStrategy:
         return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
             win_trades / len(self.trades) * 100,  \
             total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
-
-    # Add any additional helper methods here
-
 
 
 
