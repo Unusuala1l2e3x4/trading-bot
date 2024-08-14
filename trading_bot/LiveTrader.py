@@ -8,14 +8,12 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 
-from typing import List, Tuple, Optional
-from time import sleep
-from TradePosition import TradePosition, SubPosition, export_trades_to_csv
-from TouchArea import TouchArea, TouchAreaCollection
+import logging
+
 
 import os, toml
 from dotenv import load_dotenv
@@ -32,63 +30,70 @@ API_KEY = config[livepaper]['key']
 API_SECRET = config[livepaper]['secret']
 
 
-import logging
-logging.getLogger('alpaca').setLevel(logging.DEBUG)
-
 
 debug = True
-
 def debug_print(*args, **kwargs):
     if debug:
         print(*args, **kwargs)
 
+
 class LiveTrader:
     def __init__(self, api_key, secret_key, symbol, initial_balance):
-        
-        try:
-            self.trading_client = TradingClient(api_key, secret_key, paper=True)
-            self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX)
-            self.historical_client = StockHistoricalDataClient(api_key, secret_key)
-            self.symbol = symbol
-            self.balance = initial_balance
-            self.data = None
-            self.is_ready = False
-            self.current_position = None
-            self.ny_tz = ZoneInfo("America/New_York")
-        except Exception as e:
-            debug_print(f"Error at init: {e}")
-    
-    def is_market_open(self, check_time:Optional[datetime]=None):
+        self.trading_client = TradingClient(api_key, secret_key, paper=True)
+        self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX, websocket_params={"ping_interval": 1,"ping_timeout": 180,"max_queue": 1024})
+        self.historical_client = StockHistoricalDataClient(api_key, secret_key)
+        self.symbol = symbol
+        self.balance = initial_balance
+        self.data = pd.DataFrame()
+        self.is_ready = False
+        self.gap_filled = False
+        self.streamed_data = pd.DataFrame()
+        self.last_historical_timestamp = None
+        self.first_streamed_timestamp = None
+        self.open_positions = {}
+        self.ny_tz = ZoneInfo("America/New_York")
+        self.logger = self.setup_logger()
+
+    def setup_logger(self):
+        logger = logging.getLogger('LiveTrader')
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return logger
+
+    def log(self, message, level=logging.INFO):
+        self.logger.log(level, message)
+
+    def is_market_open(self, check_time=None):
         if check_time is None:
             check_time = datetime.now(self.ny_tz)
         else:
-            # Ensure check_time is in Eastern Time
             check_time = check_time.astimezone(self.ny_tz)
         
         return (check_time.weekday() < 5 and 
                 time(4, 0) <= check_time.time() <= time(20, 0))
-        
-        
+
     def get_current_trading_day_start(self):
         now = datetime.now(self.ny_tz)
         current_date = now.date()
-        if now.time() < time(4, 0):  # If it's before 4:00 AM ET, use the previous day
+        if now.time() < time(4, 0):
             current_date -= timedelta(days=1)
         return datetime.combine(current_date, time(4, 0)).replace(tzinfo=self.ny_tz)
-    
-    
-    # IEX (str): Investor's exchange data feed
-    # SIP (str): Securities Information Processor feed
-    # OTC (str): Over the counter feed
-    
-    def get_historical_bars(self, start:datetime, end:datetime):
+
+    async def wait_for_market_open(self):
+        while not self.is_market_open():
+            self.log("Market is closed. Waiting for market to open.")
+            await asyncio.sleep(60)
+
+    def get_historical_bars(self, start, end):
         request_params = StockBarsRequest(
             symbol_or_symbols=self.symbol,
             timeframe=TimeFrame.Minute,
             start=start.astimezone(ZoneInfo("UTC")),
             end=end.astimezone(ZoneInfo("UTC")),
             adjustment=Adjustment.ALL,
-            # feed='iex' # iex, sip, otc
         )
         df = self.historical_client.get_stock_bars(request_params).df
         df.index = df.index.set_levels(
@@ -97,82 +102,70 @@ class LiveTrader:
         )
         df.sort_index(inplace=True)
         return df
-    
+
+
     async def initialize_data(self):
         try:
-            if not self.is_market_open():
-                debug_print("Market is closed. Waiting for market to open.")
-                return
-
-            # Debug: Uncomment these lines to use a specific time range for testing
-            debug_start = datetime(2024, 7, 24, 9, 30).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
-            debug_end = datetime(2024, 7, 24, 16, 0).replace(tzinfo=None)#.replace(tzinfo=self.ny_tz)
-            
-            # - timedelta(minutes=15,seconds=1) needed for SIP but not IEX
-            
-            end = datetime.now(self.ny_tz) - timedelta(minutes=15,seconds=1)
+            end = datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=1)
             start = self.get_current_trading_day_start()
-
-            # # Debug: Uncomment these lines to use the debug time range
-            # start, end = debug_start, debug_end
-            # print('initialize_data - DEBUG MODE DATES:',start, end)
             
-            debug_print(f"Fetching historical data from {start} to {end}")
+            self.log(f"Fetching historical data from {start} to {end}")
             
             self.data = self.get_historical_bars(start, end)
             
             if self.data.empty:
-                debug_print("No historical data available. Waiting for data.")
+                self.log("No historical data available. Waiting for data.", logging.WARNING)
                 return
             
-            self.data.index = self.data.index.set_levels(pd.Series(self.data.index.get_level_values('timestamp').to_list()).map(lambda x: x.tz_convert(self.ny_tz)), level='timestamp')
-            self.data.sort_index(inplace=True)
-            
-            print(self.data.index.get_level_values('timestamp'))
-            
-            latest_data_time = pd.to_datetime(self.data.index.get_level_values('timestamp').max())#.tz_convert(self.ny_tz)
-            time_diff = (end - latest_data_time).total_seconds() / 60
-            
-            print(latest_data_time, end, time_diff)
+            self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
+            time_diff = (end - self.last_historical_timestamp).total_seconds() / 60
 
-            if time_diff > 16:  # Allow for a small buffer beyond 15 minutes
-                debug_print(f"Historical data is too old. Latest data point: {latest_data_time}")
+            if time_diff >= 16:
+                self.log(f"Historical data is too old. Latest data point: {self.last_historical_timestamp}", logging.WARNING)
                 return
 
-            debug_print(f"Initialized historical data: {len(self.data)} bars")
-            debug_print(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {latest_data_time}")
-            
-            # debug_print(self.data)
-            
-            self.is_ready = True
+            self.log(f"Initialized historical data: {len(self.data)} bars")
+            self.log(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
 
         except Exception as e:
-            debug_print(f"Error initializing data: {e}")
+            self.log(f"Error initializing data: {e}", logging.ERROR)
+
+    async def update_historical_data(self):
+        try:
+            end = datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=1)
+            start = self.last_historical_timestamp + timedelta(minutes=1)
             
+            new_data = self.get_historical_bars(start, end)
+            
+            if not new_data.empty:
+                self.data = pd.concat([self.data, new_data])
+                debug_print('update_historical_data')
+                debug_print('before remove dups',len(self.data))
+                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index() # probably not necessary, but test to make sure
+                debug_print('after remove dups ',len(self.data))
+                self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
+                self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
+
+        except Exception as e:
+            self.log(f"Error updating historical data: {e}", logging.ERROR)
 
     async def on_bar(self, bar):
-        debug_print('on_bar')
         
-        debug_print(f"Received bar: {bar}")
-        # Received bar: symbol='AAPL' timestamp=datetime.datetime(2024, 7, 30, 19, 22, tzinfo=datetime.timezone.utc) 
-        # open=218.3 high=218.3 low=218.26 close=218.26 volume=332.0 trade_count=7.0 vwap=218.30762
-
         try:
             if not self.is_market_open():
-                debug_print("Received bar outside market hours. Ignoring.")
+                self.log("Received bar outside market hours. Ignoring.")
                 return
 
             bar_time = pd.to_datetime(bar.timestamp).tz_convert(self.ny_tz)
             now = datetime.now(self.ny_tz)
             time_diff = (now - bar_time).total_seconds() / 60
-            
-            print(bar_time, now, time_diff)
 
-            # if time_diff > 1:  # If the bar is more than 1 minute old
-            #     debug_print(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}")
-            #     return
+            if time_diff >= 16:
+                self.log(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}", logging.WARNING)
+                return
 
             bar_data = {
+                'symbol': self.symbol,
                 'timestamp': bar_time,
                 'open': bar.open,
                 'high': bar.high,
@@ -183,46 +176,87 @@ class LiveTrader:
                 'vwap': bar.vwap
             }
             new_row = pd.DataFrame([bar_data])
-            new_row.set_index('timestamp', inplace=True)
-            self.data = pd.concat([self.data, new_row])
-            debug_print(f"Received bar: {bar_data}")
-            
-            debug_print(f"Added streamed bar. {len(self.data)} bars total.")
+            new_row.set_index(['symbol','timestamp'], inplace=True)
+            debug_print(new_row)
+            self.streamed_data = pd.concat([self.streamed_data, new_row])
+            debug_print('on_bar streamed_data')
+            debug_print('before remove dups',len(self.streamed_data))
+            self.streamed_data = self.streamed_data.loc[~self.streamed_data.index.duplicated(keep='last')].sort_index()
+            debug_print('after remove dups ',len(self.streamed_data))
+            self.log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
 
-            await self.execute_trading_logic()
+            if self.first_streamed_timestamp is None:
+                self.first_streamed_timestamp = bar_time
+            
+            # Check if we've filled the gap
+            if not self.is_ready:
+                await self.check_gap_filled()
+            else:
+                self.data = pd.concat([self.data, new_row])
+                debug_print('on_bar data')
+                debug_print('before remove dups',len(self.streamed_data))
+                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
+                debug_print('after remove dups ',len(self.streamed_data))
+                
+                debug_print('data final:',self.data)
+                
+                await self.execute_trading_logic()
 
         except Exception as e:
-            debug_print(f"Error in on_bar: {e}")
+            self.log(f"Error in on_bar: {e}", logging.ERROR)
+
+    async def check_gap_filled(self):
+        # if len(self.streamed_data) >= 15:  # We have at least 15 minutes of streamed data
+        time_diff = (self.first_streamed_timestamp - self.last_historical_timestamp).total_seconds() / 60
+        # if abs(time_diff - 1) <= 0.1 or time_diff <= 0:  # Allow for a small tolerance due to potential timing issues
+        if time_diff <= 1:
+            self.is_ready = True
+            
+            # debug_print('data:')
+            # debug_print(self.data)
+            # debug_print('streamed_data:')
+            # debug_print(self.streamed_data)
+            
+            self.data = pd.concat([self.data, self.streamed_data])
+            debug_print('check_gap_filled')
+            debug_print('before remove dups',len(self.data))
+            self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
+            debug_print('after remove dups ',len(self.data))
+            self.log("Gap filled. Data is now ready for trading.")
+            self.log(f"Continuous data range: {self.data.index.get_level_values('timestamp').min()} to {self.data.index.get_level_values('timestamp').max()}")
+        else:
+            self.log(f"Gap not properly filled. Time difference: {time_diff} minutes", logging.WARNING)
+
 
     async def execute_trading_logic(self):
-        debug_print('execute_trading_logic')
         try:
             if not self.is_ready:
-                debug_print("Data not ready for trading")
+                self.log("Data not ready for trading")
                 return
 
+            self.log("Data READY for trading. Creating touch detection areas...")
             # Implement your trading logic here
             touch_areas = self.calculate_touch_detection_area()
             if touch_areas:
-                await self.backtest_strategy(touch_areas)
+                await self.process_touch_areas(touch_areas)
         except Exception as e:
-            debug_print(f"Error in execute_trading_logic: {e}")
+            self.log(f"Error in execute_trading_logic: {e}", logging.ERROR)
 
     def calculate_touch_detection_area(self):
         # Implement your touch detection logic here
         # This should be adapted from your backtesting code
         pass
 
-    async def backtest_strategy(self, touch_areas):
+    async def process_touch_areas(self, touch_areas):
         # Implement your strategy logic here
         # This should be adapted from your backtesting code
         # Use self.place_order() to execute trades
         pass
 
-    async def place_order(self, side, qty):
+    async def place_order(self, side, qty, order_type=OrderType.MARKET, limit_price=None):
         try:
             if not self.is_market_open():
-                debug_print("Market is closed. Cannot place order.")
+                self.log("Market is closed. Cannot place order.")
                 return
 
             order_data = MarketOrderRequest(
@@ -231,50 +265,70 @@ class LiveTrader:
                 side=side,
                 time_in_force=TimeInForce.DAY
             )
-            order = self.trading_client.submit_order(order_data)
-            debug_print(f"Placed {side} order for {qty} shares of {self.symbol}")
-            return order
-        except Exception as e:
-            debug_print(f"Error placing order: {e}")
+            
+            # if order_type == OrderType.LIMIT and limit_price is not None:
+            #     order_data.type = "limit"
+            #     order_data.limit_price = limit_price
 
+            if self.validate_order(order_data):
+                order = self.trading_client.submit_order(order_data)
+                self.log(f"Placed {side} order for {qty} shares of {self.symbol}")
+                return order
+            else:
+                self.log("Order validation failed", logging.WARNING)
+                return None
+
+        except Exception as e:
+            self.log(f"Error placing order: {e}", logging.ERROR)
+
+    def validate_order(self, order_data):
+        # Implement order validation logic
+        # Check for sufficient balance, position limits, etc.
+        return True
+
+    async def manage_positions(self):
+        # Implement position management logic
+        # Check for open positions, update stop losses, take profits, etc.
+        pass
+
+    async def close_positions(self):
+        # Implement logic to close all positions at end of day
+        pass
+    
+    def is_receiving_data(self):
+        if not self.streamed_data.empty:
+            last_data_time = self.streamed_data.index.get_level_values('timestamp').max()
+            time_since_last_data = (datetime.now(self.ny_tz) - last_data_time).total_seconds()
+            return time_since_last_data < 120  # Consider it active if data received in last 2 minutes
+        return False
+    
     async def run(self):
         try:
             while True:
-                if self.is_market_open(): # set return to True when testing outsite horus
-                    if not self.is_ready:
-                        print('self.initialize_data()...')
-                        await self.initialize_data()
-                        print('...done')
+                await self.wait_for_market_open()
+                if self.data.empty:
+                    await self.initialize_data()
 
-                    print('self.is_ready',self.is_ready)
-                    if self.is_ready:
-                        print('self.data_stream.subscribe_bars...')
-                        self.data_stream.subscribe_bars(self.on_bar, self.symbol)
-                        print('...done')
-                        
-                        # print('self.data_stream.run()...')
-                        # await self.data_stream.run()
-                        
-                        # print('BaseStream_run_custom(self.data_stream)...')
-                        # await BaseStream_run_custom(self.data_stream)
-                        
-                        print('self.data_stream._run_forever()...')
-                        await self.data_stream._run_forever()
-                        
-                        print('...done')
-                else:
-                    debug_print("Market is closed. Waiting for market to open.")
-                    await asyncio.sleep(60)  # Check every minute
-                    
-                sleep(2)
+                self.data_stream.subscribe_bars(self.on_bar, self.symbol)
+                
+                async def update_historical_periodically():
+                    while not self.is_ready:
+                        await asyncio.sleep(59)  # Wait for 1 minute
+                        await self.update_historical_data()
+
+                update_task = asyncio.create_task(update_historical_periodically())
+                await self.data_stream._run_forever()
+                update_task.cancel()  # Cancel the update task when the stream stops
+                
+                await asyncio.sleep(1)
         except Exception as e:
-            debug_print(f"Error in run: {e}")
-            
+            self.log(f"Error in run: {e}", logging.ERROR)
+
     async def close(self):
         if hasattr(self, 'data_stream'):
             await self.data_stream.stop_ws()
-            # await self.data_stream.close()
-
+            
+            
 import tracemalloc
 tracemalloc.start()
 
@@ -284,16 +338,34 @@ async def main():
     initial_balance = 10000
     trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance)
     
-    timeout = 70 # should be more than 60
+    run_task = asyncio.create_task(trader.run())
     
     try:
-        # Wait for up to 2 minutes (120 seconds) to receive data
-        await asyncio.wait_for(trader.run(), timeout=timeout)
-    except asyncio.TimeoutError:
-        print(f"No data received within {timeout} seconds timeout. This is normal outside of market hours for IEX feed. \nNeed market data subcription to access SIP feed when outside market hours.")
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            if trader.is_receiving_data():
+                print("Receiving data successfully.")
+                break
+            
+            if asyncio.get_event_loop().time() - start_time > 240:
+                raise TimeoutError("No data received within 240 seconds.")
+            
+            await asyncio.sleep(10)  # Check every 10 seconds
+        
+        # If we've reached here, we're receiving data. Let the trader run indefinitely.
+        print("Trader is now running indefinitely.")
+        await run_task
+        
+    except TimeoutError as e:
+        print(f"{e} This is normal outside of market hours for IEX feed.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
         await trader.close()
         print("Trader stopped.")
 

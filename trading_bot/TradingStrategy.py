@@ -768,17 +768,21 @@ class TradingStrategy:
 
 
         
-# # Usage
+# # # Usage
 # params = StrategyParameters(
 #     initial_investment=10_000,
 #     do_longs=True,
 #     do_shorts=True,
+#     sim_longs=True,
+#     sim_shorts=True,
+    
 #     use_margin=True,
+    
 #     times_buying_power=4,
-#     min_stop_dist_relative_change_for_partial=0,
-#     soft_start_time=None,
-#     soft_end_time=time(15, 50)
+    
+#     soft_start_time = None, 
+#     soft_end_time = '15:50'
 # )
 
-# strategy = TradingStrategy(TouchDetectionAreas.from_dict(touch_detection_areas), params)
+# strategy = TradingStrategy(TouchDetectionAreas.from_dict(touch_detection_areas), params, export_trades_path='trades_output.csv')
 # results = strategy.run_backtest()
