@@ -65,7 +65,29 @@ class LiveTrader:
 
     def log(self, message, level=logging.INFO):
         self.logger.log(level, message)
-
+            
+    async def reset_daily_data(self):
+        self.log("Resetting daily data...")
+        current_day_start = self.get_current_trading_day_start()
+        
+        # Reset data and streamed_data
+        if not self.data.empty:
+            # self.data = self.data[self.data.index.get_level_values('timestamp') >= current_day_start]
+            self.data = pd.DataFrame()
+        self.streamed_data = pd.DataFrame()
+        
+        # Reset other daily variables
+        self.is_ready = False
+        self.gap_filled = False
+        self.last_historical_timestamp = None
+        self.first_streamed_timestamp = None
+        
+        # Re-initialize historical data for the new day
+        await self.initialize_data()
+        
+        self.log("Daily data reset complete.")
+    
+    
     def is_market_open(self, check_time=None):
         if check_time is None:
             check_time = datetime.now(self.ny_tz)
@@ -73,7 +95,7 @@ class LiveTrader:
             check_time = check_time.astimezone(self.ny_tz)
         
         return (check_time.weekday() < 5 and 
-                time(4, 0) <= check_time.time() <= time(20, 0))
+                time(0, 0) <= check_time.time() <= time(20, 0))
 
     def get_current_trading_day_start(self):
         now = datetime.now(self.ny_tz)
@@ -96,6 +118,8 @@ class LiveTrader:
             adjustment=Adjustment.ALL,
         )
         df = self.historical_client.get_stock_bars(request_params).df
+        if df.empty:
+            return pd.DataFrame()
         df.index = df.index.set_levels(
             df.index.get_level_values('timestamp').tz_convert(self.ny_tz),
             level='timestamp'
@@ -134,18 +158,20 @@ class LiveTrader:
         try:
             end = datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=1)
             start = self.last_historical_timestamp + timedelta(minutes=1)
-            
-            new_data = self.get_historical_bars(start, end)
-            
-            if not new_data.empty:
-                self.data = pd.concat([self.data, new_data])
-                debug_print('update_historical_data')
-                debug_print('before remove dups',len(self.data))
-                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index() # probably not necessary, but test to make sure
-                debug_print('after remove dups ',len(self.data))
-                self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
-                self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
-
+            print('---')
+            if end > start:
+                new_data = self.get_historical_bars(start, end)
+                print('---')
+                if not new_data.empty and new_data.index.get_level_values('timestamp').max() > self.last_historical_timestamp:
+                    print('---')
+                    self.data = pd.concat([self.data, new_data])
+                    debug_print('update_historical_data')
+                    debug_print('before remove dups',len(self.data))
+                    self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index() # needed if update_historical_data is called in less than 1 minute intervals
+                    debug_print('after remove dups ',len(self.data))
+                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
+                    self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
+        
         except Exception as e:
             self.log(f"Error updating historical data: {e}", logging.ERROR)
 
@@ -301,26 +327,43 @@ class LiveTrader:
             time_since_last_data = (datetime.now(self.ny_tz) - last_data_time).total_seconds()
             return time_since_last_data < 120  # Consider it active if data received in last 2 minutes
         return False
-    
+        
     async def run(self):
         try:
             while True:
                 await self.wait_for_market_open()
-                if self.data.empty:
-                    await self.initialize_data()
+                await self.reset_daily_data()
 
                 self.data_stream.subscribe_bars(self.on_bar, self.symbol)
                 
                 async def update_historical_periodically():
                     while not self.is_ready:
-                        await asyncio.sleep(59)  # Wait for 1 minute
+                        await asyncio.sleep(60)  # Wait for 1 minute
+                        if not self.is_market_open():
+                            break
                         await self.update_historical_data()
 
                 update_task = asyncio.create_task(update_historical_periodically())
-                await self.data_stream._run_forever()
-                update_task.cancel()  # Cancel the update task when the stream stops
+                stream_task = asyncio.create_task(self.data_stream._run_forever())
                 
-                await asyncio.sleep(1)
+                while self.is_market_open():
+                    await asyncio.sleep(60)
+                
+                self.log("Market closed. Stopping data stream.")
+                await self.close()  # This will stop the stream
+                self.data_stream.unsubscribe_bars(self.symbol)
+                
+                update_task.cancel()
+                stream_task.cancel()
+                try:
+                    await update_task
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+                
+                self.log("Waiting for next trading day...")
+                await asyncio.sleep(60)  # Wait a minute before checking market open status again
+
         except Exception as e:
             self.log(f"Error in run: {e}", logging.ERROR)
 
@@ -338,36 +381,39 @@ async def main():
     initial_balance = 10000
     trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance)
     
-    run_task = asyncio.create_task(trader.run())
-    
     try:
-        start_time = asyncio.get_event_loop().time()
         while True:
-            if trader.is_receiving_data():
-                print("Receiving data successfully.")
-                break
+            start_time = asyncio.get_event_loop().time()
+            data_received = False
             
-            if asyncio.get_event_loop().time() - start_time > 240:
-                raise TimeoutError("No data received within 240 seconds.")
+            run_task = asyncio.create_task(trader.run())
             
-            await asyncio.sleep(10)  # Check every 10 seconds
-        
-        # If we've reached here, we're receiving data. Let the trader run indefinitely.
-        print("Trader is now running indefinitely.")
-        await run_task
-        
-    except TimeoutError as e:
-        print(f"{e} This is normal outside of market hours for IEX feed.")
+            while asyncio.get_event_loop().time() - start_time < 240:
+                if trader.is_receiving_data():
+                    data_received = True
+                    break
+                await asyncio.sleep(10)  # Check every 10 seconds
+            
+            if not data_received:
+                print("No data received within 240 seconds. This is normal outside of market hours for IEX feed.")
+                await trader.close()  # Ensure we close the connection if no data is received
+            else:
+                print("Receiving data successfully. Trader is now running.")
+                await run_task
+            
+            await asyncio.sleep(60)  # Wait a minute before starting the next cycle
+            
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received. Stopping trader.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        run_task.cancel()
-        try:
-            await run_task
-        except asyncio.CancelledError:
-            pass
         await trader.close()
         print("Trader stopped.")
+        
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())

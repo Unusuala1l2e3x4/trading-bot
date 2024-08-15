@@ -569,11 +569,34 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     initial_investment (float): Initial investment balance for normalization
     filename (str): Name of the image file to be created
     """
+    
+    symbol = df.index.get_level_values('symbol')[0]
+    
+    timestamps = df.index.get_level_values('timestamp')
+    # Filter df to include only intraday data
+    df['time'] = timestamps.time
+    df['date'] = timestamps.date
+    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))].copy()
+    timestamps = df_intraday.index.get_level_values('timestamp')
+    
+    # Create a continuous index
+    unique_dates = sorted(df_intraday['date'].unique())
+    continuous_index = []
+    cumulative_minutes = 0
+    
+    for date in unique_dates:
+        day_data = df_intraday[df_intraday['date'] == date]
+        day_minutes = day_data['time'].apply(time_to_minutes)
+        continuous_index.extend(cumulative_minutes + day_minutes)
+        cumulative_minutes += 390  # 6.5 hours of trading
+    
+    df_intraday['continuous_index'] = continuous_index
+    
     # Prepare data for plotting
-    exit_times = []
-    cumulative_pnl = []
-    cumulative_pnl_longs = []
-    cumulative_pnl_shorts = []
+    exit_times = [trades[0].entry_time]
+    cumulative_pnl = [0]
+    cumulative_pnl_longs = [0]
+    cumulative_pnl_shorts = [0]
     running_pnl = 0
     running_pnl_longs = 0
     running_pnl_shorts = 0
@@ -592,26 +615,6 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
             cumulative_pnl_longs.append(running_pnl_longs)
             cumulative_pnl_shorts.append(running_pnl_shorts)
 
-    symbol = df.index.get_level_values('symbol')[0]
-    
-    # Filter df to include only intraday data
-    df['time'] = df.index.get_level_values('timestamp').time
-    df['date'] = df.index.get_level_values('timestamp').date
-    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))].copy()
-    
-    # Create a continuous index
-    unique_dates = sorted(df_intraday['date'].unique())
-    continuous_index = []
-    cumulative_minutes = 0
-    
-    for date in unique_dates:
-        day_data = df_intraday[df_intraday['date'] == date]
-        day_minutes = day_data['time'].apply(time_to_minutes)
-        continuous_index.extend(cumulative_minutes + day_minutes)
-        cumulative_minutes += 390  # 6.5 hours of trading
-    
-    df_intraday['continuous_index'] = continuous_index
-    
     # Create figure and primary y-axis
     fig, ax1 = plt.subplots(figsize=(12, 6))
     
@@ -665,6 +668,7 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     # Set x-axis ticks to show dates
     all_days = [date.strftime('%Y-%m-%d') for date in unique_dates]
     week_starts = []
+    
     for i, date in enumerate(unique_dates):
         if i == 0 or date.weekday() < unique_dates[i-1].weekday():
             week_starts.append(i)

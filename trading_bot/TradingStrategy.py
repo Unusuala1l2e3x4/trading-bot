@@ -150,7 +150,7 @@ class TradingStrategy:
         self.count_entry_skip = 0
         self.count_exit_skip = 0
         
-        if export_trades_path:
+        if export_trades_path: # in case different
             self.export_trades_path = export_trades_path
         
         print(f'{self.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
@@ -597,10 +597,8 @@ class TradingStrategy:
                 
                 if not soft_end_triggered:
                     self.process_active_areas(current_time, data, prev_close)
-            elif current_time >= day_end_time:
-                self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
-                                         self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
-            elif i >= len(self.df) - 1: # only for testing. not in live environment
+                    
+            elif self.should_close_all_positions(current_time, day_end_time, i):
                 self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
                                          self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
             daily_index += 1
@@ -619,10 +617,12 @@ class TradingStrategy:
     #     # Check if we should enter a position for this area
     #     pass
 
-    # def should_close_all_positions(self, current_time: datetime) -> bool:
-    #     # Check if we should close all positions (e.g., end of day)
-    #     pass
-    
+    def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int) -> bool:
+        # Check if we should close all positions (e.g., end of day)
+        return (
+            current_time >= day_end_time 
+            or df_index >= len(self.df) - 1 # condition after OR is only for testing. not in live environment
+        )
     
     def handle_new_trading_day(self, current_time, timestamps):
         self.current_id = 0
@@ -654,8 +654,10 @@ class TradingStrategy:
         return day_start_time, day_end_time, day_soft_start_time
 
     def is_trading_time(self, current_time, day_soft_start_time, day_end_time, daily_index, daily_data, i):
-        return (day_soft_start_time <= current_time < day_end_time and 
-                daily_index < len(daily_data) - 1 and i < len(self.df) - 1) # LAST PART is only for testing. not in live environment
+        return (day_soft_start_time <= current_time < day_end_time
+                and daily_index < len(daily_data) - 1
+                and i < len(self.df) - 1 # condition after AND is only for testing. not in live environment
+                )
 
     def check_soft_end_time(self, current_time, current_date):
         if current_time >= pd.Timestamp.combine(current_date, self.params.soft_end_time).tz_localize(ny_tz):
@@ -698,12 +700,6 @@ class TradingStrategy:
         win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0])
         lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss < 0])
         
-        long_win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss > 0])
-        long_lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss < 0])
-        
-        short_win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss > 0])
-        short_lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss < 0])
-        
         win_trades = sum(1 for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0)
         lose_trades = sum(1 for trade in self.trades if not trade.is_simulated and trade.profit_loss < 0)
         win_longs = sum(1 for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss > 0)
@@ -736,13 +732,48 @@ class TradingStrategy:
         print(f"Total Transaction Costs: ${total_transaction_costs:.4f}")
         print(f"\nBorrow Fees: ${total_stock_borrow_costs:.4f}")
         print(f"Average Profit/Loss per Trade (including fees): ${mean_profit_loss:.4f}")
-        print(f"Average Profit/Loss Percentage (ROE) per Trade (including fees): {mean_profit_loss_pct:.4f}%")
-        print(f"  for winning trades: {win_mean_profit_loss_pct:.4f}%")
-        print(f"    longs:  {long_win_mean_profit_loss_pct:.4f}%")
-        print(f"    shorts: {short_win_mean_profit_loss_pct:.4f}%")
-        print(f"  for losing trades:  {lose_mean_profit_loss_pct:.4f}%")
-        print(f"    longs:  {long_lose_mean_profit_loss_pct:.4f}%")
-        print(f"    shorts: {short_lose_mean_profit_loss_pct:.4f}%")
+        
+
+        # Create Series for different trade categories
+        trade_categories = {
+            'All': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated],
+            # 'Long': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long],
+            # 'Short': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long],
+            'Win': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0],
+            'Lose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss <= 0],
+            'Lwin': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss > 0],
+            'Swin': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss > 0],
+            'Llose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss <= 0],
+            'Slose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss <= 0]
+        }
+
+        describe_results = pd.DataFrame({category: pd.Series(data).describe() for category, data in trade_categories.items()})
+        describe_results = describe_results.transpose()
+        describe_results.index.name = 'Trade Category'
+        describe_results.columns.name = 'Statistic'
+        describe_results = describe_results.round(4)
+        describe_results['count'] = describe_results['count'].astype(int)
+
+        # Print the full statistics table
+        print("\nDetailed Trade Statistics:")
+        print(describe_results)
+
+        # Extract key statistics
+        key_stats = {}
+        for category in trade_categories.keys():
+            if category.endswith('win'):
+                key_stats[f'{category}Avg'] = describe_results.loc[category, 'mean']
+                # key_stats[f'{category}Med'] = describe_results.loc[category, '50%']
+                key_stats[f'{category}Max'] = describe_results.loc[category, 'max']
+            elif category.endswith('lose'):
+                key_stats[f'{category}Avg'] = describe_results.loc[category, 'mean']
+                # key_stats[f'{category}Med'] = describe_results.loc[category, '50%']
+                key_stats[f'{category}Min'] = describe_results.loc[category, 'min']
+            else:
+                key_stats[f'{category}Avg'] = describe_results.loc[category, 'mean']
+                # key_stats[f'{category}Med'] = describe_results.loc[category, '50%']
+                # key_stats[f'{category}Std'] = describe_results.loc[category, 'std']
+        
         print(f"Number of Winning Trades: {win_trades} ({win_longs} long, {win_shorts} short)")
         print(f"Number of Losing Trades:  {lose_trades} ({lose_longs} long, {lose_shorts} short)")
         
@@ -761,10 +792,11 @@ class TradingStrategy:
 
         plot_cumulative_pnl_and_price(self.trades, self.bars, self.params.initial_investment)
 
+        # return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
+        #     win_trades / len(self.trades) * 100,  \
+        #     total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
         return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
-            win_trades / len(self.trades) * 100,  \
-            total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
-
+            win_trades / len(self.trades) * 100, total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
 
 
         

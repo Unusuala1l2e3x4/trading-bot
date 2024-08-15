@@ -7,7 +7,6 @@ dependencies:
   - pandas
   - numpy
   - pip
-  - nest-asyncio
   - pip:
     - python-dotenv
     - ipykernel
