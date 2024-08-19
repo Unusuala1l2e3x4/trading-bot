@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, time
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
+import os
 import pandas as pd
 from datetime import datetime, date
 import numpy as np
@@ -550,6 +551,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         }
         data.append(row)
     df = pd.DataFrame(data)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     df.to_csv(filename, index=False)
     debug_print(f"Trade summary has been exported to {filename}")
 
@@ -697,12 +699,13 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     # Use a tight layout
     plt.tight_layout()
     
-    plt.show()
-    
     if filename:
         # Save the figure
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         plt.savefig(filename)
         debug_print(f"Graph has been saved as {filename}")
+    else:
+        plt.show()
         
     plt.close()
     

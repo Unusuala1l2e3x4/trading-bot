@@ -114,10 +114,11 @@ class StrategyParameters:
 
     
 class TradingStrategy:
-    def __init__(self, touch_detection_areas: TouchDetectionAreas, params: StrategyParameters, export_trades_path: Optional[str]=None):
+    def __init__(self, touch_detection_areas: TouchDetectionAreas, params: StrategyParameters, export_trades_path: Optional[str]=None, export_graph_path: Optional[str]=None):
         self.touch_detection_areas = touch_detection_areas
         self.params = params        
         self.export_trades_path = export_trades_path
+        self.export_graph_path = export_graph_path
         
         self.symbol = self.touch_detection_areas.symbol
         self.long_touch_area = self.touch_detection_areas.long_touch_area
@@ -134,7 +135,7 @@ class TradingStrategy:
         
         self.initialize_strategy()
 
-    def initialize_strategy(self, export_trades_path: Optional[str]=None):
+    def initialize_strategy(self):
         self.balance = self.params.initial_investment
         self.total_account_value = self.params.initial_investment
         self.open_positions = {}
@@ -149,9 +150,6 @@ class TradingStrategy:
         self.count_exit_adjust = 0
         self.count_entry_skip = 0
         self.count_exit_skip = 0
-        
-        if export_trades_path: # in case different
-            self.export_trades_path = export_trades_path
         
         print(f'{self.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
@@ -621,7 +619,7 @@ class TradingStrategy:
         # Check if we should close all positions (e.g., end of day)
         return (
             current_time >= day_end_time 
-            or df_index >= len(self.df) - 1 # condition after OR is only for testing. not in live environment
+            or df_index >= len(self.df) - 1 # condition after OR is only for testing. not for live trading.
         )
     
     def handle_new_trading_day(self, current_time, timestamps):
@@ -656,7 +654,7 @@ class TradingStrategy:
     def is_trading_time(self, current_time, day_soft_start_time, day_end_time, daily_index, daily_data, i):
         return (day_soft_start_time <= current_time < day_end_time
                 and daily_index < len(daily_data) - 1
-                and i < len(self.df) - 1 # condition after AND is only for testing. not in live environment
+                and i < len(self.df) - 1 # condition after AND is only for testing. not for live trading.
                 )
 
     def check_soft_end_time(self, current_time, current_date):
@@ -790,7 +788,7 @@ class TradingStrategy:
         if self.export_trades_path:
             export_trades_to_csv(self.trades, self.export_trades_path)
 
-        plot_cumulative_pnl_and_price(self.trades, self.bars, self.params.initial_investment)
+        plot_cumulative_pnl_and_price(self.trades, self.bars, self.params.initial_investment, filename=self.export_graph_path)
 
         # return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
         #     win_trades / len(self.trades) * 100,  \

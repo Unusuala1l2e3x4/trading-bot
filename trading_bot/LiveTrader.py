@@ -1,5 +1,6 @@
 import asyncio
 import pandas as pd
+import numpy as np
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
@@ -11,6 +12,14 @@ from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
+from types import SimpleNamespace
+
+from TradePosition import TradePosition
+from TouchArea import TouchArea
+from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy 
+
+from TouchDetection import TouchDetectionParameters, calculate_touch_detection_area
+
 
 import logging
 
@@ -31,14 +40,14 @@ API_SECRET = config[livepaper]['secret']
 
 
 
-debug = True
+debug = False
 def debug_print(*args, **kwargs):
     if debug:
         print(*args, **kwargs)
 
 
 class LiveTrader:
-    def __init__(self, api_key, secret_key, symbol, initial_balance):
+    def __init__(self, api_key, secret_key, symbol, initial_balance, simulation_mode=False):
         self.trading_client = TradingClient(api_key, secret_key, paper=True)
         self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX, websocket_params={"ping_interval": 1,"ping_timeout": 180,"max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(api_key, secret_key)
@@ -53,7 +62,8 @@ class LiveTrader:
         self.open_positions = {}
         self.ny_tz = ZoneInfo("America/New_York")
         self.logger = self.setup_logger()
-
+        self.simulation_mode = simulation_mode
+        
     def setup_logger(self):
         logger = logging.getLogger('LiveTrader')
         logger.setLevel(logging.DEBUG)
@@ -95,7 +105,7 @@ class LiveTrader:
             check_time = check_time.astimezone(self.ny_tz)
         
         return (check_time.weekday() < 5 and 
-                time(0, 0) <= check_time.time() <= time(20, 0))
+                time(4, 0) <= check_time.time() <= time(20, 0))
 
     def get_current_trading_day_start(self):
         now = datetime.now(self.ny_tz)
@@ -127,10 +137,12 @@ class LiveTrader:
         df.sort_index(inplace=True)
         return df
 
+    def get_lagged_time(self):
+        return datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=30)
 
     async def initialize_data(self):
         try:
-            end = datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=1)
+            end = self.get_lagged_time()
             start = self.get_current_trading_day_start()
             
             self.log(f"Fetching historical data from {start} to {end}")
@@ -156,14 +168,14 @@ class LiveTrader:
 
     async def update_historical_data(self):
         try:
-            end = datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=1)
+            end = self.get_lagged_time()
             start = self.last_historical_timestamp + timedelta(minutes=1)
-            print('---')
+            debug_print('---')
             if end > start:
                 new_data = self.get_historical_bars(start, end)
-                print('---')
+                debug_print('---')
                 if not new_data.empty and new_data.index.get_level_values('timestamp').max() > self.last_historical_timestamp:
-                    print('---')
+                    debug_print('---')
                     self.data = pd.concat([self.data, new_data])
                     debug_print('update_historical_data')
                     debug_print('before remove dups',len(self.data))
@@ -174,22 +186,47 @@ class LiveTrader:
         
         except Exception as e:
             self.log(f"Error updating historical data: {e}", logging.ERROR)
-
-    async def on_bar(self, bar):
+                
+    async def simulate_bar(self):
+        if self.simulation_mode and not self.data.empty:
+            latest_data = self.data.iloc[-1]
+            bar = SimpleNamespace(
+                symbol=latest_data.name[0],
+                timestamp=latest_data.name[1],  # Assuming multi-index with (symbol, timestamp)
+                open=latest_data['open'],
+                high=latest_data['high'],
+                low=latest_data['low'],
+                close=latest_data['close'],
+                volume=latest_data['volume'],
+                trade_count=latest_data['trade_count'],
+                vwap=latest_data['vwap'],
+                simulate_bar=True
+            )
+            await self.on_bar(bar)
         
+    async def on_bar(self, bar):
+        debug_print(bar)
         try:
             if not self.is_market_open():
                 self.log("Received bar outside market hours. Ignoring.")
                 return
-
+            
+            if hasattr(bar, 'simulate_bar'):
+                simulate_bar = bar.simulate_bar
+            else:
+                simulate_bar = False
+                
             bar_time = pd.to_datetime(bar.timestamp).tz_convert(self.ny_tz)
             now = datetime.now(self.ny_tz)
             time_diff = (now - bar_time).total_seconds() / 60
 
-            if time_diff >= 16:
+            if time_diff >= 16 and not simulate_bar:
                 self.log(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}", logging.WARNING)
                 return
-
+            
+            if self.first_streamed_timestamp is None:
+                self.first_streamed_timestamp = bar_time
+                
             bar_data = {
                 'symbol': self.symbol,
                 'timestamp': bar_time,
@@ -204,29 +241,31 @@ class LiveTrader:
             new_row = pd.DataFrame([bar_data])
             new_row.set_index(['symbol','timestamp'], inplace=True)
             debug_print(new_row)
-            self.streamed_data = pd.concat([self.streamed_data, new_row])
-            debug_print('on_bar streamed_data')
-            debug_print('before remove dups',len(self.streamed_data))
-            self.streamed_data = self.streamed_data.loc[~self.streamed_data.index.duplicated(keep='last')].sort_index()
-            debug_print('after remove dups ',len(self.streamed_data))
-            self.log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
-
-            if self.first_streamed_timestamp is None:
-                self.first_streamed_timestamp = bar_time
             
+            if not simulate_bar:
+                self.streamed_data = pd.concat([self.streamed_data, new_row])
+                debug_print('on_bar streamed_data')
+                debug_print('before remove dups',len(self.streamed_data))
+                self.streamed_data = self.streamed_data.loc[~self.streamed_data.index.duplicated(keep='last')].sort_index()
+                debug_print('after remove dups ',len(self.streamed_data))
+                self.log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
+
             # Check if we've filled the gap
             if not self.is_ready:
                 await self.check_gap_filled()
             else:
-                self.data = pd.concat([self.data, new_row])
-                debug_print('on_bar data')
-                debug_print('before remove dups',len(self.streamed_data))
-                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
-                debug_print('after remove dups ',len(self.streamed_data))
-                
-                debug_print('data final:',self.data)
-                
+                if not self.simulation_mode:
+                    self.data = pd.concat([self.data, new_row])
+                    debug_print('on_bar data')
+                    debug_print('before remove dups',len(self.data))
+                    self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
+                    debug_print('after remove dups ',len(self.data))
+
                 await self.execute_trading_logic()
+                
+            if self.is_ready:
+                debug_print('final data:\n',self.data)
+                debug_print('final streamed_data:\n',self.streamed_data)
 
         except Exception as e:
             self.log(f"Error in on_bar: {e}", logging.ERROR)
@@ -235,19 +274,21 @@ class LiveTrader:
         # if len(self.streamed_data) >= 15:  # We have at least 15 minutes of streamed data
         time_diff = (self.first_streamed_timestamp - self.last_historical_timestamp).total_seconds() / 60
         # if abs(time_diff - 1) <= 0.1 or time_diff <= 0:  # Allow for a small tolerance due to potential timing issues
-        if time_diff <= 1:
+        if time_diff <= 1 or self.simulation_mode:
             self.is_ready = True
-            
             # debug_print('data:')
             # debug_print(self.data)
             # debug_print('streamed_data:')
             # debug_print(self.streamed_data)
             
-            self.data = pd.concat([self.data, self.streamed_data])
-            debug_print('check_gap_filled')
-            debug_print('before remove dups',len(self.data))
-            self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
-            debug_print('after remove dups ',len(self.data))
+            debug_print('self.is_ready = True',time_diff)
+            
+            if not self.simulation_mode: # do not use streamed_data if in simulation mode
+                self.data = pd.concat([self.data, self.streamed_data])
+                debug_print('check_gap_filled')
+                debug_print('before remove dups',len(self.data))
+                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
+                debug_print('after remove dups ',len(self.data))
             self.log("Gap filled. Data is now ready for trading.")
             self.log(f"Continuous data range: {self.data.index.get_level_values('timestamp').min()} to {self.data.index.get_level_values('timestamp').max()}")
         else:
@@ -327,7 +368,7 @@ class LiveTrader:
             time_since_last_data = (datetime.now(self.ny_tz) - last_data_time).total_seconds()
             return time_since_last_data < 120  # Consider it active if data received in last 2 minutes
         return False
-        
+            
     async def run(self):
         try:
             while True:
@@ -337,26 +378,33 @@ class LiveTrader:
                 self.data_stream.subscribe_bars(self.on_bar, self.symbol)
                 
                 async def update_historical_periodically():
-                    while not self.is_ready:
+                    while not self.is_ready or self.simulation_mode:
                         await asyncio.sleep(60)  # Wait for 1 minute
                         if not self.is_market_open():
                             break
-                        await self.update_historical_data()
+                        if not self.is_ready or self.simulation_mode:
+                            await self.update_historical_data()
+                        if self.simulation_mode:
+                            await self.simulate_bar()
 
                 update_task = asyncio.create_task(update_historical_periodically())
+                
+                # if not self.simulation_mode:
                 stream_task = asyncio.create_task(self.data_stream._run_forever())
                 
                 while self.is_market_open():
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(1)
                 
                 self.log("Market closed. Stopping data stream.")
-                await self.close()  # This will stop the stream
+                await self.close()
                 self.data_stream.unsubscribe_bars(self.symbol)
                 
                 update_task.cancel()
+                # if not self.simulation_mode:
                 stream_task.cancel()
                 try:
                     await update_task
+                    # if not self.simulation_mode:
                     await stream_task
                 except asyncio.CancelledError:
                     pass
@@ -375,34 +423,33 @@ class LiveTrader:
 import tracemalloc
 tracemalloc.start()
 
+# touch_params = TouchDetectionParameters(
+#     symbol=symbol,
+#     start_date=start_date,
+#     end_date=end_date,
+#     atr_period=15,
+#     level1_period=15,
+#     multiplier=1.4,
+#     min_touches=3,
+#     start_time=None,
+#     end_time='16:00',
+#     use_median=True,
+#     touch_area_width_agg=np.median,
+#     use_saved_bars=True,
+#     rolling_avg_decay_rate=0.85
+#     # export_bars_path=f'bars/bars_{symbol}_{start_date.split()[0]}_{end_date.split()[0]}.csv'
+# )
+
+
 
 async def main():
     symbol = "AAPL"
     initial_balance = 10000
-    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance)
+    simulation_mode = True  # Set this to True for simulation, False for live trading
+    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, simulation_mode)
     
     try:
-        while True:
-            start_time = asyncio.get_event_loop().time()
-            data_received = False
-            
-            run_task = asyncio.create_task(trader.run())
-            
-            while asyncio.get_event_loop().time() - start_time < 240:
-                if trader.is_receiving_data():
-                    data_received = True
-                    break
-                await asyncio.sleep(10)  # Check every 10 seconds
-            
-            if not data_received:
-                print("No data received within 240 seconds. This is normal outside of market hours for IEX feed.")
-                await trader.close()  # Ensure we close the connection if no data is received
-            else:
-                print("Receiving data successfully. Trader is now running.")
-                await run_task
-            
-            await asyncio.sleep(60)  # Wait a minute before starting the next cycle
-            
+        await trader.run()
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Stopping trader.")
     except Exception as e:
@@ -410,10 +457,6 @@ async def main():
     finally:
         await trader.close()
         print("Trader stopped.")
-        
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
