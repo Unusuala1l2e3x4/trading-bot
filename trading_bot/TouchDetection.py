@@ -8,7 +8,7 @@ from alpaca.trading.requests import GetCalendarRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 
 import matplotlib.pyplot as plt
 from collections import defaultdict
@@ -17,7 +17,7 @@ import toml
 import os
 import zipfile
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from tqdm import tqdm
 
@@ -307,31 +307,55 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
 
     return touch_areas, widths
 
-
+    
+    
+# @dataclass
+# class TouchDetectionParameters:
+#     symbol: str
+#     start_date: str
+#     end_date: str
+#     atr_period: int = 15
+#     level1_period: int = 15
+#     multiplier: float = 2.0
+#     min_touches: int = 3
+#     bid_buffer_pct: float = 0.005
+#     start_time: Optional[str] = None
+#     end_time: Optional[str] = None
+#     use_median: bool = False
+#     rolling_avg_decay_rate: float = 0.85
+#     touch_area_width_agg: Callable = np.median
+#     use_saved_bars: bool = False
+#     export_bars_path: Optional[str] = None
 
 @dataclass
-class TouchDetectionParameters:
-    symbol: str
-    start_date: str
-    end_date: str
+class BaseTouchDetectionParameters:
     atr_period: int = 15
     level1_period: int = 15
-    multiplier: float = 2.0
+    multiplier: float = 1.4
     min_touches: int = 3
     bid_buffer_pct: float = 0.005
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
     use_median: bool = False
     rolling_avg_decay_rate: float = 0.85
     touch_area_width_agg: Callable = np.median
+
+@dataclass
+class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
+    symbol: str
+    start_date: datetime
+    end_date: datetime
     use_saved_bars: bool = False
     export_bars_path: Optional[str] = None
 
+@dataclass
+class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
+    pass  # This class doesn't need any additional parameters
 
 
 
-
-def calculate_touch_detection_area(params: TouchDetectionParameters):
+def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None):
+# def calculate_touch_detection_area(params: TouchDetectionParameters):
     """
     Calculates touch detection areas for a given stock symbol based on historical price data and volatility.
 
@@ -357,56 +381,64 @@ def calculate_touch_detection_area(params: TouchDetectionParameters):
     customization of the analysis parameters. The resulting touch areas can be used for trading strategies
     or further market analysis.
     """
-    assert params.end_date > params.start_date
-    
-    # Convert datetime strings to datetime objects if they're strings
-    if isinstance(params.start_date, str):
-        params.start_date = pd.to_datetime(params.start_date).tz_localize(ny_tz)
-    if isinstance(params.end_date, str):
-        params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
-
-    # Alpaca API setup
-    client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
-
-    # Define the path to the zip file
-    if params.export_bars_path:
-        zip_file_path = params.export_bars_path.replace('.csv', '.zip')
-        os.makedirs(os.path.dirname(params.export_bars_path), exist_ok=True)
-
-    # Check if the ZIP file exists and read from it
-    if params.use_saved_bars and params.export_bars_path and os.path.isfile(zip_file_path):
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_file:
-            with zip_file.open(os.path.basename(params.export_bars_path)) as csv_file:
-                df = pd.read_csv(csv_file)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(ny_tz)
-                df.set_index(['symbol', 'timestamp'], inplace=True)
-                print(f'Retrieved bars from {zip_file_path}')
-    else:
-        # Request historical data
-        request_params = StockBarsRequest(
-            symbol_or_symbols=params.symbol,
-            timeframe=TimeFrame.Minute,
-            start=params.start_date.tz_convert('UTC'),
-            end=params.end_date.tz_convert('UTC'),
-            adjustment=Adjustment.ALL,
-        )
-        bars = client.get_stock_bars(request_params)
-        df = bars.df
-        df.index = df.index.set_levels(
-            df.index.get_level_values('timestamp').tz_convert(ny_tz),
-            level='timestamp'
-        )
-        df = fill_missing_data(df)
-        df.sort_index(inplace=True)
+    if isinstance(params, BacktestTouchDetectionParameters):
+        assert params.end_date > params.start_date
         
-        # Save the DataFrame to a CSV file inside a ZIP file
+        # Convert datetime strings to datetime objects if they're strings
+        if isinstance(params.start_date, str):
+            params.start_date = pd.to_datetime(params.start_date).tz_localize(ny_tz)
+        if isinstance(params.end_date, str):
+            params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
+
+        # Alpaca API setup
+        client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+
+        # Define the path to the zip file
         if params.export_bars_path:
-            with zipfile.ZipFile(zip_file_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-                with zip_file.open(os.path.basename(params.export_bars_path), 'w') as csv_file:
-                    df.reset_index().to_csv(csv_file, index=False)
-            print(f'Saved bars to {zip_file_path}')
-    # return None        
+            zip_file_path = params.export_bars_path.replace('.csv', '.zip')
+            os.makedirs(os.path.dirname(params.export_bars_path), exist_ok=True)
+
+        # Check if the ZIP file exists and read from it
+        if params.use_saved_bars and params.export_bars_path and os.path.isfile(zip_file_path):
+            with zipfile.ZipFile(zip_file_path, 'r') as zip_file:
+                with zip_file.open(os.path.basename(params.export_bars_path)) as csv_file:
+                    df = pd.read_csv(csv_file)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(ny_tz)
+                    df.set_index(['symbol', 'timestamp'], inplace=True)
+                    print(f'Retrieved bars from {zip_file_path}')
+        else:
+            # Request historical data
+            request_params = StockBarsRequest(
+                symbol_or_symbols=params.symbol,
+                timeframe=TimeFrame.Minute,
+                start=params.start_date.tz_convert('UTC'),
+                end=params.end_date.tz_convert('UTC'),
+                adjustment=Adjustment.ALL,
+            )
+            bars = client.get_stock_bars(request_params)
+            df = bars.df
+            df.index = df.index.set_levels(
+                df.index.get_level_values('timestamp').tz_convert(ny_tz),
+                level='timestamp'
+            )
+            df = fill_missing_data(df)
+            df.sort_index(inplace=True)
             
+            # Save the DataFrame to a CSV file inside a ZIP file
+            if params.export_bars_path:
+                with zipfile.ZipFile(zip_file_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+                    with zip_file.open(os.path.basename(params.export_bars_path), 'w') as csv_file:
+                        df.reset_index().to_csv(csv_file, index=False)
+                print(f'Saved bars to {zip_file_path}')
+        # return None        
+    elif isinstance(params, LiveTouchDetectionParameters):
+        if data is None:
+            raise ValueError("Data must be provided for live trading parameters")
+        df = data
+    else:
+        raise ValueError("Invalid parameter type")
+    
+    
     timestamps = df.index.get_level_values('timestamp')
     # print(timestamps)
     # print(df.columns)
@@ -549,7 +581,7 @@ def calculate_touch_detection_area(params: TouchDetectionParameters):
     df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
 
     return {
-        'symbol': params.symbol,
+        'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
         'long_touch_area': long_touch_area,
         'short_touch_area': short_touch_area,
         'market_hours': market_hours,
@@ -564,7 +596,7 @@ def calculate_touch_detection_area(params: TouchDetectionParameters):
 
 
 
-def plot_touch_detection_areas(touch_detection_areas, zoom_start_date, zoom_end_date, save_path=None):
+def plot_touch_detection_areas(touch_detection_areas, zoom_start_date=None, zoom_end_date=None, save_path=None):
     """
     Visualizes touch detection areas and price data on a chart.
 
@@ -698,11 +730,18 @@ def plot_touch_detection_areas(touch_detection_areas, zoom_start_date, zoom_end_
     # plt.legend(['Close Price', 'Long Touch Area', 'Short Touch Area'])
     plt.legend().remove()
     plt.grid(True)
+
+    if zoom_start_date:
+        zstart = pd.to_datetime(zoom_start_date)
+        zstart = zstart.tz_localize(ny_tz) if zstart.tz is None else zstart.tz_convert(ny_tz)
+    else:
+        zstart = timestamps[0]
     
-    zstart = pd.to_datetime(zoom_start_date)
-    zstart = zstart.tz_localize(ny_tz) if zstart.tz is None else zstart.tz_convert(ny_tz)
-    zend = pd.to_datetime(zoom_end_date)
-    zend = zend.tz_localize(ny_tz) if zend.tz is None else zend.tz_convert(ny_tz)
+    if zoom_end_date:
+        zend = pd.to_datetime(zoom_end_date)
+        zend = zend.tz_localize(ny_tz) if zend.tz is None else zend.tz_convert(ny_tz)
+    else:
+        zend = timestamps[-1]
         
     print(zstart, zend)
 

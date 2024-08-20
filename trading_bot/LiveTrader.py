@@ -13,16 +13,17 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
+from typing import List, Tuple, Optional, Dict
+
+from alpaca.data.models import Bar
 
 from TradePosition import TradePosition
 from TouchArea import TouchArea
-from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy 
-
-from TouchDetection import TouchDetectionParameters, calculate_touch_detection_area
+from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy
+from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters
 
 
 import logging
-
 
 import os, toml
 from dotenv import load_dotenv
@@ -39,7 +40,6 @@ API_KEY = config[livepaper]['key']
 API_SECRET = config[livepaper]['secret']
 
 
-
 debug = False
 def debug_print(*args, **kwargs):
     if debug:
@@ -47,10 +47,12 @@ def debug_print(*args, **kwargs):
 
 
 class LiveTrader:
-    def __init__(self, api_key, secret_key, symbol, initial_balance, simulation_mode=False):
+    def __init__(self, api_key, secret_key, symbol, initial_balance, touch_detection_params: LiveTouchDetectionParameters, strategy_params: StrategyParameters, simulation_mode=False):
         self.trading_client = TradingClient(api_key, secret_key, paper=True)
         self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX, websocket_params={"ping_interval": 1,"ping_timeout": 180,"max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(api_key, secret_key)
+        self.touch_detection_params = touch_detection_params
+        self.strategy_params = strategy_params
         self.symbol = symbol
         self.balance = initial_balance
         self.data = pd.DataFrame()
@@ -97,8 +99,7 @@ class LiveTrader:
         
         self.log("Daily data reset complete.")
     
-    
-    def is_market_open(self, check_time=None):
+    def is_market_open(self, check_time: Optional[datetime] = None):
         if check_time is None:
             check_time = datetime.now(self.ny_tz)
         else:
@@ -204,7 +205,7 @@ class LiveTrader:
             )
             await self.on_bar(bar)
         
-    async def on_bar(self, bar):
+    async def on_bar(self, bar:Bar):
         debug_print(bar)
         try:
             if not self.is_market_open():
@@ -276,16 +277,9 @@ class LiveTrader:
         # if abs(time_diff - 1) <= 0.1 or time_diff <= 0:  # Allow for a small tolerance due to potential timing issues
         if time_diff <= 1 or self.simulation_mode:
             self.is_ready = True
-            # debug_print('data:')
-            # debug_print(self.data)
-            # debug_print('streamed_data:')
-            # debug_print(self.streamed_data)
-            
-            debug_print('self.is_ready = True',time_diff)
-            
+            debug_print('check_gap_filled: self.is_ready = True',time_diff)
             if not self.simulation_mode: # do not use streamed_data if in simulation mode
                 self.data = pd.concat([self.data, self.streamed_data])
-                debug_print('check_gap_filled')
                 debug_print('before remove dups',len(self.data))
                 self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
                 debug_print('after remove dups ',len(self.data))
@@ -310,9 +304,7 @@ class LiveTrader:
             self.log(f"Error in execute_trading_logic: {e}", logging.ERROR)
 
     def calculate_touch_detection_area(self):
-        # Implement your touch detection logic here
-        # This should be adapted from your backtesting code
-        pass
+        return calculate_touch_detection_area(self.touch_detection_params, self.data)
 
     async def process_touch_areas(self, touch_areas):
         # Implement your strategy logic here
@@ -328,8 +320,8 @@ class LiveTrader:
 
             order_data = MarketOrderRequest(
                 symbol=self.symbol,
-                qty=qty,
-                side=side,
+                qty=qty, # number of shares. use int to prevent fractional orders.
+                side=side, # OrderSide.BUY, OrderSide.SELL
                 time_in_force=TimeInForce.DAY
             )
             
@@ -388,8 +380,6 @@ class LiveTrader:
                             await self.simulate_bar()
 
                 update_task = asyncio.create_task(update_historical_periodically())
-                
-                # if not self.simulation_mode:
                 stream_task = asyncio.create_task(self.data_stream._run_forever())
                 
                 while self.is_market_open():
@@ -400,17 +390,15 @@ class LiveTrader:
                 self.data_stream.unsubscribe_bars(self.symbol)
                 
                 update_task.cancel()
-                # if not self.simulation_mode:
                 stream_task.cancel()
-                try:
-                    await update_task
-                    # if not self.simulation_mode:
-                    await stream_task
-                except asyncio.CancelledError:
-                    pass
+                # try:
+                #     await update_task
+                #     await stream_task
+                # except asyncio.CancelledError:
+                #     pass
                 
                 self.log("Waiting for next trading day...")
-                await asyncio.sleep(60)  # Wait a minute before checking market open status again
+                await asyncio.sleep(2)  # Wait a minute before checking market open status again
 
         except Exception as e:
             self.log(f"Error in run: {e}", logging.ERROR)
@@ -423,31 +411,24 @@ class LiveTrader:
 import tracemalloc
 tracemalloc.start()
 
-# touch_params = TouchDetectionParameters(
-#     symbol=symbol,
-#     start_date=start_date,
-#     end_date=end_date,
-#     atr_period=15,
-#     level1_period=15,
-#     multiplier=1.4,
-#     min_touches=3,
-#     start_time=None,
-#     end_time='16:00',
-#     use_median=True,
-#     touch_area_width_agg=np.median,
-#     use_saved_bars=True,
-#     rolling_avg_decay_rate=0.85
-#     # export_bars_path=f'bars/bars_{symbol}_{start_date.split()[0]}_{end_date.split()[0]}.csv'
-# )
-
-
-
 async def main():
     symbol = "AAPL"
     initial_balance = 10000
     simulation_mode = True  # Set this to True for simulation, False for live trading
-    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, simulation_mode)
+
+    touch_detection_params = LiveTouchDetectionParameters(
+        atr_period=15,
+        level1_period=15,
+        multiplier=1.4,
+        min_touches=3,
+        bid_buffer_pct=0.005,
+        start_time=None,
+        end_time='16:00',
+        use_median=False
+    )
     
+    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, touch_detection_params, simulation_mode)
+
     try:
         await trader.run()
     except KeyboardInterrupt:

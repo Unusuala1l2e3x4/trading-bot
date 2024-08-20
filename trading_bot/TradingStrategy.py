@@ -615,12 +615,11 @@ class TradingStrategy:
     #     # Check if we should enter a position for this area
     #     pass
 
-    def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int) -> bool:
-        # Check if we should close all positions (e.g., end of day)
-        return (
-            current_time >= day_end_time 
-            or df_index >= len(self.df) - 1 # condition after OR is only for testing. not for live trading.
-        )
+    def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int, is_live_trading: bool) -> bool:
+        if is_live_trading:
+            return current_time >= day_end_time
+        else:
+            return current_time >= day_end_time or df_index >= len(self.df) - 1
     
     def handle_new_trading_day(self, current_time, timestamps):
         self.current_id = 0
@@ -651,11 +650,13 @@ class TradingStrategy:
         
         return day_start_time, day_end_time, day_soft_start_time
 
-    def is_trading_time(self, current_time, day_soft_start_time, day_end_time, daily_index, daily_data, i):
-        return (day_soft_start_time <= current_time < day_end_time
-                and daily_index < len(daily_data) - 1
-                and i < len(self.df) - 1 # condition after AND is only for testing. not for live trading.
-                )
+    def is_trading_time(self, current_time, day_soft_start_time, day_end_time, daily_index, daily_data, i, is_live_trading: bool):
+        if is_live_trading:
+            return day_soft_start_time <= current_time < day_end_time
+        else:
+            return (day_soft_start_time <= current_time < day_end_time
+                    and daily_index < len(daily_data) - 1
+                    and i < len(self.df) - 1)
 
     def check_soft_end_time(self, current_time, current_date):
         if current_time >= pd.Timestamp.combine(current_date, self.params.soft_end_time).tz_localize(ny_tz):
