@@ -30,6 +30,8 @@ importlib.reload(TouchArea)
 
 from TouchArea import TouchArea
 
+import logging
+import traceback
 
 from dotenv import load_dotenv
 
@@ -47,6 +49,21 @@ API_SECRET = config[livepaper]['secret']
 
 
 trading_client = TradingClient(API_KEY, API_SECRET)
+
+
+def setup_logger():
+    logger = logging.getLogger('TouchDetection')
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logger()
+
+def log(message, level=logging.INFO):
+    logger.log(level, message)
 
 
 from dataclasses import dataclass
@@ -190,33 +207,73 @@ def fill_missing_data(df):
     return df
 
 
-
+# @dataclass
+# class Level:
+#     x: float
+#     y: float
+#     level: float
+    
+    
+@jit(nopython=True)
+def np_median(arr):
+    return np.median(arr)
 
 @jit(nopython=True)
-def process_touches(touches, prices, touch_area_lower, touch_area_upper, level, level_lower_bound, level_upper_bound, is_long, min_touches):
+def np_mean(arr):
+    return np.mean(arr)
+
+@jit(nopython=True)
+def np_searchsorted(a,b):
+    return np.searchsorted(a,b)
+
+# touch_area_low = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
+# touch_area_high = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
+
+# touch_area_low = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
+# touch_area_high = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
+
+@jit(nopython=True)
+def calculate_touch_area_bounds(atr_values, level, is_long, touch_area_width_agg, multiplier):
+    touch_area_width = touch_area_width_agg(atr_values) * multiplier
+    if is_long:
+        touch_area_low = level - (2 * touch_area_width / 3)
+        touch_area_high = level + (1 * touch_area_width / 3)
+    else:
+        touch_area_low = level - (1 * touch_area_width / 3)
+        touch_area_high = level + (2 * touch_area_width / 3)
+    return touch_area_width, touch_area_low, touch_area_high
+
+@jit(nopython=True)
+def process_touches(touches, prices, atrs, level, level_low, level_high, is_long, min_touches, touch_area_width_agg, multiplier):
     consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
     count = 0
     prev_price = None
+    _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:min_touches], level, is_long, touch_area_width_agg, multiplier)
+    
     for i in range(len(prices)):
         price = prices[i]
         is_touch = (prev_price is not None and 
                     ((prev_price < level <= price) or (prev_price > level >= price)) or 
                     (price == level))
         
-        if level_lower_bound <= price <= level_upper_bound:
+        if level_low <= price <= level_high:
             if is_touch:
                 consecutive_touches[count] = touches[i]
                 count += 1
                 if count == min_touches:
-                    return consecutive_touches
+                    return consecutive_touches[consecutive_touches != -1], touch_area_low, touch_area_high
+                # Update bounds after each touch
+                _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
         else:
-            buy_price = touch_area_upper if is_long else touch_area_lower
+            buy_price = touch_area_high if is_long else touch_area_low
             if (is_long and price > buy_price) or (not is_long and price < buy_price):
                 consecutive_touches[:] = -1
                 count = 0
+                # Reset bounds after exiting the area
+                _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
         
         prev_price = price
-    return np.empty(0, dtype=np.int64)  # Return empty array instead of empty list
+    return np.empty(0, dtype=np.int64), touch_area_low, touch_area_high
 
 def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_touches, bid_buffer_pct, use_median, touch_area_width_agg, multiplier, start_time, end_time):
     touch_areas = []
@@ -242,72 +299,89 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
         
         day_data = df[df.index.get_level_values('timestamp').date == date]
         day_timestamps = day_data.index.get_level_values('timestamp')
-        day_timestamps_np = day_timestamps.astype(np.int64)  # Convert to nanoseconds
+        day_timestamps_np = np.array(day_timestamps.astype(np.int64))
         day_prices = day_data['close'].values
         day_atr = day_data['MTR' if use_median else 'ATR'].values
 
-        for (level_lower_bound, level_upper_bound, level), touches in levels.items():
+        for (level_low, level_high, level), touches in levels.items():
             if len(touches) < min_touches:
                 continue
             
-            touch_timestamps_np = np.array([t.timestamp() * 1e9 for t in touches], dtype=np.int64)  # Convert to nanoseconds
-            touch_indices = np.searchsorted(day_timestamps_np, touch_timestamps_np)
-            
-            touch_area_width = touch_area_width_agg(day_atr[touch_indices]) * multiplier
-
-            if touch_area_width is None or np.isnan(touch_area_width) or touch_area_width <= 0:
-                continue
-            
-            widths.append(touch_area_width)
-            
-            # SUBJECt TO CHANGE
-            touch_area_lower = level - (2 * touch_area_width / 3) if is_long else level - (1 * touch_area_width / 3)
-            touch_area_upper = level + (1 * touch_area_width / 3) if is_long else level + (2 * touch_area_width / 3)
-            
-            # touch_area_lower = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
-            # touch_area_upper = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
-            
-            # touch_area_lower = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
-            # touch_area_upper = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
-            
+            touch_timestamps_np = np.array([t.value for t in touches], dtype=np.int64)
+            touch_indices = np_searchsorted(day_timestamps_np, touch_timestamps_np)
             
             valid_mask = (day_timestamps[touch_indices] >= day_start_time) & (day_timestamps[touch_indices] < day_end_time)
-            # valid_mask = (day_timestamps[touch_indices] < day_end_time)
-            
             valid_touch_indices = touch_indices[valid_mask]
-            valid_prices = day_prices[valid_touch_indices]
             
-            consecutive_touch_indices = process_touches(
+            if valid_touch_indices.size == 0:
+                continue
+            
+            valid_prices = day_prices[valid_touch_indices]
+            valid_atr = day_atr[valid_touch_indices]
+
+            consecutive_touch_indices, touch_area_low, touch_area_high = process_touches(
                 valid_touch_indices, 
                 valid_prices,
-                touch_area_lower, 
-                touch_area_upper,  
+                valid_atr,
                 level, 
-                level_lower_bound,
-                level_upper_bound, 
+                level_low,
+                level_high, 
                 is_long, 
-                min_touches
+                min_touches,
+                touch_area_width_agg,
+                multiplier
             )
             
             if len(consecutive_touch_indices) == min_touches:
-                consecutive_touches = day_timestamps[consecutive_touch_indices[consecutive_touch_indices != -1]]
+                consecutive_touches = day_timestamps[consecutive_touch_indices]
                 touch_area = TouchArea(
                     date=date,
                     id=current_id,
                     level=level,
-                    upper_bound=touch_area_upper,
-                    lower_bound=touch_area_lower,
-                    touches=consecutive_touches,
+                    upper_bound=touch_area_high,
+                    lower_bound=touch_area_low,
+                    initial_touches=consecutive_touches,
+                    touches=day_timestamps[valid_touch_indices],
                     is_long=is_long,
                     min_touches=min_touches,
-                    bid_buffer_pct=bid_buffer_pct
+                    bid_buffer_pct=bid_buffer_pct,
+                    valid_atr=valid_atr,
+                    touch_area_width_agg=touch_area_width_agg,
+                    multiplier=multiplier,
+                    calculate_bounds=calculate_touch_area_bounds
                 )
                 touch_areas.append(touch_area)
                 current_id += 1
 
     return touch_areas, widths
 
-    
+
+@dataclass
+class TouchDetectionAreas:
+    symbol: str
+    long_touch_area: List[TouchArea]
+    short_touch_area: List[TouchArea]
+    market_hours: Dict[datetime.date, Tuple[datetime, datetime]]
+    bars: pd.DataFrame
+    mask: pd.Series
+    min_touches: int
+    start_time: Optional[time]
+    end_time: Optional[time]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'TouchDetectionAreas':
+        return cls(
+            symbol=data['symbol'],
+            long_touch_area=data['long_touch_area'],
+            short_touch_area=data['short_touch_area'],
+            market_hours=data['market_hours'],
+            bars=data['bars'],
+            mask=data['mask'],
+            min_touches=data['min_touches'],
+            start_time=data['start_time'],
+            end_time=data['end_time']
+        )
+
     
 # @dataclass
 # class TouchDetectionParameters:
@@ -329,6 +403,7 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
 
 @dataclass
 class BaseTouchDetectionParameters:
+    symbol: str
     atr_period: int = 15
     level1_period: int = 15
     multiplier: float = 1.4
@@ -338,13 +413,26 @@ class BaseTouchDetectionParameters:
     end_time: Optional[time] = None
     use_median: bool = False
     rolling_avg_decay_rate: float = 0.85
-    touch_area_width_agg: Callable = np.median
+    # touch_area_width_agg: Callable = np.median
+    touch_area_width_agg: Callable = np_median
 
 @dataclass
-class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
+# class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
+class BacktestTouchDetectionParameters():
     symbol: str
     start_date: datetime
     end_date: datetime
+    atr_period: int = 15
+    level1_period: int = 15
+    multiplier: float = 1.4
+    min_touches: int = 3
+    bid_buffer_pct: float = 0.005
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    use_median: bool = False
+    rolling_avg_decay_rate: float = 0.85
+    # touch_area_width_agg: Callable = np.median
+    touch_area_width_agg: Callable = np_median
     use_saved_bars: bool = False
     export_bars_path: Optional[str] = None
 
@@ -356,6 +444,11 @@ class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
 
 def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None):
 # def calculate_touch_detection_area(params: TouchDetectionParameters):
+
+    def log2(message, level=logging.INFO):
+        if isinstance(params, LiveTouchDetectionParameters):
+            logger.log(level, message)
+    
     """
     Calculates touch detection areas for a given stock symbol based on historical price data and volatility.
 
@@ -438,12 +531,13 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     else:
         raise ValueError("Invalid parameter type")
     
+    log2('Data retrieved')
     
     timestamps = df.index.get_level_values('timestamp')
     # print(timestamps)
     # print(df.columns)
     # print(df.dtypes)
-    print(df.head())
+    print(df)
     
     # calculate_dynamic_levels(df, ema_short=9, ema_long=30) # default
     calculate_dynamic_levels(df)
@@ -456,6 +550,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     # df['ATR'] = df['TR'].rolling(window=params.atr_period).mean()
     df['ATR'] = apply_exponential_tapering(df, 'TR', params.atr_period, params.rolling_avg_decay_rate)
     df['MTR'] = df['TR'].rolling(window=params.atr_period).median()
+    
+    log2('ATR and MTR calculated')
 
     # Mean: This is more sensitive to outliers and can be useful if you want your strategy to react more quickly to sudden changes in volume or trade count.
     # Median: This is more robust to outliers and can provide a more stable measure of the typical volume or trade count, which might be preferable if you want 
@@ -470,6 +566,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     df['avg_trade_count'] = apply_exponential_tapering(df, 'trade_count', params.atr_period, params.rolling_avg_decay_rate)
     
     # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
+    
+    log2('rolling averages calculated')
     
     # Group data by date
     grouped = df.groupby(timestamps.date)
@@ -501,22 +599,26 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             high_low_diffs.append(high-low)
             
             w = np.median(high_low_diffs) / 2
-        
+
+            # print(timestamp, w)
+            
             x = close - w
             y = close + w
+            
+            # Check if this point falls within any existing levels
+            for (level_x, level_y), touches in potential_levels.items():
+                if level_x <= close <= level_y:
+                    touches.append(timestamp)
         
             if w != 0:
                 # Add this point to its own level
                 potential_levels[(x, y)].append(timestamp)
-            
-            # Check if this point falls within any existing levels
-            for (level_x, level_y), touches in potential_levels.items():
-                if level_x <= close <= level_y and (level_x, level_y) != (x, y):
-                    touches.append(timestamp)
-
-        # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
-        # a['date'] = date
+                
+                
+        a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
+        a['date'] = date
         # high_low_diffs_list.append(a)
+        # print(a)
         
         # Filter for strong levels
         strong_levels = {level: touches for level, touches in potential_levels.items() if len(touches) >= params.min_touches}
@@ -534,7 +636,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             else:
                 all_resistance_levels[date][(level[0], level[1], initial_close)] = touches
 
-    
+    log2('Levels created')
     unique_dates = list(pd.unique(timestamps.date))
     market_hours = get_market_hours(unique_dates)
     
@@ -547,14 +649,18 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     else:
         start_time = None
     
+    # print(start_time, end_time)
+    log2('market hours retrieved')
     long_touch_area, long_widths = calculate_touch_area(
         all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
         params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time
     )
+    log2('Long touch areas calculated')
     short_touch_area, short_widths = calculate_touch_area(
         all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
         params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time
     )
+    log2('Short touch areas calculated')
         
     # widths = long_widths + short_widths
 
@@ -562,41 +668,47 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     final_mask = pd.Series(False, index=df.index)
     for date in unique_dates:
         market_open, market_close = market_hours.get(date, (None, None))
-        date = datetime.combine(date, datetime.min.time()).replace(tzinfo=ny_tz)
+        date_obj = pd.Timestamp(date).tz_localize(ny_tz)
         if market_open and market_close:
             if start_time:
-                day_start_time = date.replace(hour=start_time.hour, minute=start_time.minute)
+                day_start_time = date_obj.replace(hour=start_time.hour, minute=start_time.minute)
             else:
                 day_start_time = market_open
             if end_time:
-                day_end_time = min(date.replace(hour=end_time.hour, minute=end_time.minute), market_close - timedelta(minutes=3))
+                day_end_time = min(date_obj.replace(hour=end_time.hour, minute=end_time.minute), market_close - timedelta(minutes=3))
             else:
                 day_end_time = market_close - timedelta(minutes=3)
         else:
-            day_start_time, day_end_time = date, date
+            day_start_time, day_end_time = date_obj, date_obj
 
         mask = (timestamps >= day_start_time) & (timestamps <= day_end_time)
         final_mask |= mask
 
+    log2('Mask created')
+    
     df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
 
-    return {
+    ret = {
         'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
         'long_touch_area': long_touch_area,
         'short_touch_area': short_touch_area,
         'market_hours': market_hours,
         'bars': df,
         'mask': final_mask,
-        'bid_buffer_pct': params.bid_buffer_pct,
+        # 'bid_buffer_pct': params.bid_buffer_pct,
         'min_touches': params.min_touches,
         'start_time': start_time,
         'end_time': end_time,
-        'use_median': params.use_median
-    } # , high_low_diffs_list
+        # 'use_median': params.use_median
+    }
+    return TouchDetectionAreas.from_dict(ret)
+    
+    
+    # , high_low_diffs_list
 
 
 
-def plot_touch_detection_areas(touch_detection_areas, zoom_start_date=None, zoom_end_date=None, save_path=None):
+def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None):
     """
     Visualizes touch detection areas and price data on a chart.
 
@@ -610,17 +722,17 @@ def plot_touch_detection_areas(touch_detection_areas, zoom_start_date=None, zoom
     for both long and short positions. It highlights important points and areas on the chart,
     focusing on the specified date range. The resulting plot can be displayed and optionally saved.
     """
-    symbol = touch_detection_areas['symbol']
-    long_touch_area = touch_detection_areas['long_touch_area']
-    short_touch_area = touch_detection_areas['short_touch_area']
-    market_hours = touch_detection_areas['market_hours']
-    df = touch_detection_areas['bars']
-    mask = touch_detection_areas['mask']
-    bid_buffer_pct = touch_detection_areas['bid_buffer_pct']
-    min_touches = touch_detection_areas['min_touches']
-    start_time = touch_detection_areas['start_time']
-    end_time = touch_detection_areas['end_time']
-    use_median = touch_detection_areas['use_median']
+    symbol = touch_detection_areas.symbol
+    long_touch_area = touch_detection_areas.long_touch_area
+    short_touch_area = touch_detection_areas.short_touch_area
+    market_hours = touch_detection_areas.market_hours
+    df = touch_detection_areas.bars
+    mask = touch_detection_areas.mask
+    # bid_buffer_pct = touch_detection_areas.bid_buffer_pct
+    min_touches = touch_detection_areas.min_touches
+    start_time = touch_detection_areas.start_time
+    end_time = touch_detection_areas.end_time
+    # use_median = touch_detection_areas.use_median
 
         
     plt.figure(figsize=(14, 7))
@@ -743,19 +855,19 @@ def plot_touch_detection_areas(touch_detection_areas, zoom_start_date=None, zoom
     else:
         zend = timestamps[-1]
         
-    print(zstart, zend)
+    # print(zstart, zend)
 
     plt.xlim(max(zstart, timestamps[0]), min(zend, timestamps[-1]))
 
     ymin, ymax = 0, -1
     for i in range(len(timestamps)):
         if timestamps[i] >= zstart:
-            print(timestamps[i])
+            # print(timestamps[i])
             ymin = i-1
             break
     for i in range(len(timestamps)):
         if timestamps[i] >= zend:
-            print(timestamps[i])
+            # print(timestamps[i])
             ymax = i
             break
     ys = df['close'].iloc[max(ymin, 0):min(ymax, len(df))]

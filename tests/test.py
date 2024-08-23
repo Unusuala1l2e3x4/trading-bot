@@ -1,12 +1,6 @@
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-
-
-class TradingStrategy:
-
-        
-        
         
         
 class TradingStrategy:

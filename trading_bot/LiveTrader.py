@@ -9,7 +9,8 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce, OrderType
+from alpaca.trading.models import Order
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from alpaca.data.models import Bar
 
 from TradePosition import TradePosition
 from TouchArea import TouchArea
-from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy
+from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable
 from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters
 
 
@@ -52,9 +53,11 @@ class LiveTrader:
         self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX, websocket_params={"ping_interval": 1,"ping_timeout": 180,"max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(api_key, secret_key)
         self.touch_detection_params = touch_detection_params
+        self.touch_detection_areas = None
         self.strategy_params = strategy_params
+        self.trading_strategy = None # not initialized until execute_trading_logic
         self.symbol = symbol
-        self.balance = initial_balance
+        self.balance = initial_balance # self.strategy_params.initial_investment
         self.data = pd.DataFrame()
         self.is_ready = False
         self.gap_filled = False
@@ -96,6 +99,19 @@ class LiveTrader:
         
         # Re-initialize historical data for the new day
         await self.initialize_data()
+
+        # Calculate touch detection areas
+        self.touch_detection_areas = self.calculate_touch_detection_area()
+
+        # Initialize or update TradingStrategy
+        if self.trading_strategy is None:
+            self.trading_strategy = TradingStrategy(self.touch_detection_areas, self.strategy_params, is_live_trading=True)
+        else:
+            self.trading_strategy.touch_detection_areas = self.touch_detection_areas
+
+        # Update daily parameters in TradingStrategy
+        current_date = datetime.now(self.ny_tz).date()
+        self.trading_strategy.update_daily_parameters(current_date)
         
         self.log("Daily data reset complete.")
     
@@ -154,7 +170,7 @@ class LiveTrader:
                 self.log("No historical data available. Waiting for data.", logging.WARNING)
                 return
             
-            self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
+            self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
             time_diff = (end - self.last_historical_timestamp).total_seconds() / 60
 
             if time_diff >= 16:
@@ -162,7 +178,7 @@ class LiveTrader:
                 return
 
             self.log(f"Initialized historical data: {len(self.data)} bars")
-            self.log(f"Data range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
+            self.log(f"Data range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
 
         except Exception as e:
             self.log(f"Error initializing data: {e}", logging.ERROR)
@@ -182,8 +198,8 @@ class LiveTrader:
                     debug_print('before remove dups',len(self.data))
                     self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index() # needed if update_historical_data is called in less than 1 minute intervals
                     debug_print('after remove dups ',len(self.data))
-                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp').max()
-                    self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp').min()} to {self.last_historical_timestamp}")
+                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
+                    self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
         
         except Exception as e:
             self.log(f"Error updating historical data: {e}", logging.ERROR)
@@ -254,27 +270,23 @@ class LiveTrader:
             # Check if we've filled the gap
             if not self.is_ready:
                 await self.check_gap_filled()
-            else:
+                
+            if self.is_ready:
                 if not self.simulation_mode:
                     self.data = pd.concat([self.data, new_row])
                     debug_print('on_bar data')
                     debug_print('before remove dups',len(self.data))
                     self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
                     debug_print('after remove dups ',len(self.data))
-
+                    debug_print('final data:\n',self.data)
+                    # debug_print('final streamed_data:\n',self.streamed_data)
                 await self.execute_trading_logic()
                 
-            if self.is_ready:
-                debug_print('final data:\n',self.data)
-                debug_print('final streamed_data:\n',self.streamed_data)
-
         except Exception as e:
             self.log(f"Error in on_bar: {e}", logging.ERROR)
 
     async def check_gap_filled(self):
-        # if len(self.streamed_data) >= 15:  # We have at least 15 minutes of streamed data
         time_diff = (self.first_streamed_timestamp - self.last_historical_timestamp).total_seconds() / 60
-        # if abs(time_diff - 1) <= 0.1 or time_diff <= 0:  # Allow for a small tolerance due to potential timing issues
         if time_diff <= 1 or self.simulation_mode:
             self.is_ready = True
             debug_print('check_gap_filled: self.is_ready = True',time_diff)
@@ -284,7 +296,7 @@ class LiveTrader:
                 self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
                 debug_print('after remove dups ',len(self.data))
             self.log("Gap filled. Data is now ready for trading.")
-            self.log(f"Continuous data range: {self.data.index.get_level_values('timestamp').min()} to {self.data.index.get_level_values('timestamp').max()}")
+            self.log(f"Continuous data range: {self.data.index.get_level_values('timestamp')[0]} to {self.data.index.get_level_values('timestamp')[-1]}")
         else:
             self.log(f"Gap not properly filled. Time difference: {time_diff} minutes", logging.WARNING)
 
@@ -295,50 +307,149 @@ class LiveTrader:
                 self.log("Data not ready for trading")
                 return
 
-            self.log("Data READY for trading. Creating touch detection areas...")
-            # Implement your trading logic here
-            touch_areas = self.calculate_touch_detection_area()
-            if touch_areas:
-                await self.process_touch_areas(touch_areas)
+            # Calculate touch detection areas every minute
+            self.touch_detection_areas = self.calculate_touch_detection_area()
+            self.trading_strategy.touch_detection_areas = self.touch_detection_areas
+
+            # Update TradingStrategy balance
+            self.trading_strategy.update_balance(self.balance)
+
+            current_timestamp = self.data.index.get_level_values('timestamp')[-1]
+            
+            # Update daily parameters if it's a new day
+            if current_timestamp.date() != getattr(self.trading_strategy, 'current_date', None):
+                self.trading_strategy.update_daily_parameters(current_timestamp.date())
+            
+            print(self.touch_detection_areas.symbol)
+            print(len(self.touch_detection_areas.long_touch_area), len(self.touch_detection_areas.short_touch_area))
+            print(self.touch_detection_areas.bars[self.touch_detection_areas.mask])
+            
+            orders = self.trading_strategy.process_live_data(current_timestamp)
+            
+            if not self.simulation_mode:
+                # Place all orders concurrently
+                await asyncio.gather(*[self.place_order(order) for order in orders])
+            else:
+                # In simulation mode, just log the orders
+                for order in orders:
+                    self.log(f"Simulated order: {order}")
+            
         except Exception as e:
             self.log(f"Error in execute_trading_logic: {e}", logging.ERROR)
 
     def calculate_touch_detection_area(self):
         return calculate_touch_detection_area(self.touch_detection_params, self.data)
 
-    async def process_touch_areas(self, touch_areas):
-        # Implement your strategy logic here
-        # This should be adapted from your backtesting code
-        # Use self.place_order() to execute trades
-        pass
-
-    async def place_order(self, side, qty, order_type=OrderType.MARKET, limit_price=None):
+    async def place_order(self, order):
+        assert isinstance(order['qty'], int)
+        assert isinstance(order['order_side'], OrderSide)
         try:
-            if not self.is_market_open():
-                self.log("Market is closed. Cannot place order.")
-                return
-
-            order_data = MarketOrderRequest(
-                symbol=self.symbol,
-                qty=qty, # number of shares. use int to prevent fractional orders.
-                side=side, # OrderSide.BUY, OrderSide.SELL
+            order_request = MarketOrderRequest(
+                symbol=order['symbol'],
+                qty=order['qty'],
+                side=order['order_side'],
                 time_in_force=TimeInForce.DAY
             )
+            # placed_order = self.trading_client.submit_order(order_request)
+            self.log(f"Placed {order['order_side']} order for {order['qty']} shares of {order['symbol']} - {order['action']}")
             
-            # if order_type == OrderType.LIMIT and limit_price is not None:
-            #     order_data.type = "limit"
-            #     order_data.limit_price = limit_price
-
-            if self.validate_order(order_data):
-                order = self.trading_client.submit_order(order_data)
-                self.log(f"Placed {side} order for {qty} shares of {self.symbol}")
-                return order
-            else:
-                self.log("Order validation failed", logging.WARNING)
-                return None
-
+            # await self.process_placed_order(placed_order, order)
+            
+            # return placed_order
         except Exception as e:
             self.log(f"Error placing order: {e}", logging.ERROR)
+
+    async def process_placed_order(self, placed_order: Order, original_order: dict):
+        # Log order details
+        self.log(f"Order ID: {placed_order.id}")
+        self.log(f"Order Status: {placed_order.status}")
+        self.log(f"Filled Qty: {placed_order.filled_qty}")
+        self.log(f"Filled Avg Price: {placed_order.filled_avg_price}")
+
+        # Update internal state based on order status
+        if placed_order.status == OrderStatus.FILLED:
+            await self.update_position_after_fill(placed_order, original_order)
+        elif placed_order.status == OrderStatus.PARTIALLY_FILLED:
+            await self.handle_partial_fill(placed_order, original_order)
+        elif placed_order.status in [OrderStatus.REJECTED, OrderStatus.CANCELED]:
+            await self.handle_failed_order(placed_order, original_order)
+        else:
+            # For other statuses like NEW, ACCEPTED, etc.
+            self.log(f"Order {placed_order.id} is in {placed_order.status} status. Waiting for fill.")
+
+    async def update_position_after_fill(self, placed_order: Order, original_order: dict):
+        position = original_order['position']
+        action = original_order['action']
+        
+        if action == 'open':
+            # Update the position with actual filled quantity and price
+            position.shares = int(placed_order.filled_qty)
+            position.entry_price = float(placed_order.filled_avg_price)
+        elif action in ['partial_entry', 'partial_exit']:
+            # Update the position for partial fills
+            if original_order['order_side'] == OrderSide.BUY:
+                position.shares += int(placed_order.filled_qty)
+            else:
+                position.shares -= int(placed_order.filled_qty)
+        # elif action == 'close':
+        #     # Remove the position from open positions -> already done in TradingStrategy
+        #     del self.trading_strategy.open_positions[position.area.id]
+
+        # Recalculate account balance
+        self.recalculate_balance(placed_order, original_order)
+
+    async def handle_partial_fill(self, placed_order: Order, original_order: dict):
+        self.log(f"Order {placed_order.id} partially filled. Filled {placed_order.filled_qty} out of {placed_order.qty}")
+        # Update position with partially filled amount
+        await self.update_position_after_fill(placed_order, original_order)
+        # You might want to create a new order for the remaining quantity
+        remaining_qty = float(placed_order.qty) - float(placed_order.filled_qty)
+        if remaining_qty > 0:
+            new_order = original_order.copy()
+            new_order['qty'] = remaining_qty
+            await self.place_order(new_order)
+
+    async def handle_failed_order(self, placed_order: Order, original_order: dict):
+        self.log(f"Order {placed_order.id} failed with status {placed_order.status}")
+        # Implement logic to handle failed orders (e.g., retry, adjust strategy, etc.)
+
+    def recalculate_balance(self, placed_order: Order, original_order: dict):
+        # Recalculate balance based on the filled order
+        filled_value = float(placed_order.filled_qty) * float(placed_order.filled_avg_price)
+        if original_order['order_side'] == OrderSide.BUY:
+            self.balance -= filled_value
+        else:
+            self.balance += filled_value
+        self.log(f"Updated balance: {self.balance}")
+        
+        
+    # async def place_order(self, side, qty, order_type=OrderType.MARKET, limit_price=None):
+    #     try:
+    #         if not self.is_market_open():
+    #             self.log("Market is closed. Cannot place order.")
+    #             return
+
+    #         order_data = MarketOrderRequest(
+    #             symbol=self.symbol,
+    #             qty=qty, # number of shares. use int to prevent fractional orders.
+    #             side=side, # OrderSide.BUY, OrderSide.SELL
+    #             time_in_force=TimeInForce.DAY
+    #         )
+            
+    #         # if order_type == OrderType.LIMIT and limit_price is not None:
+    #         #     order_data.type = "limit"
+    #         #     order_data.limit_price = limit_price
+
+    #         if self.validate_order(order_data):
+    #             order = self.trading_client.submit_order(order_data)
+    #             self.log(f"Placed {side} order for {qty} shares of {self.symbol}")
+    #             return order
+    #         else:
+    #             self.log("Order validation failed", logging.WARNING)
+    #             return None
+
+    #     except Exception as e:
+    #         self.log(f"Error placing order: {e}", logging.ERROR)
 
     def validate_order(self, order_data):
         # Implement order validation logic
@@ -360,7 +471,18 @@ class LiveTrader:
             time_since_last_data = (datetime.now(self.ny_tz) - last_data_time).total_seconds()
             return time_since_last_data < 120  # Consider it active if data received in last 2 minutes
         return False
-            
+                
+    async def update_historical_periodically(self):
+        while not self.is_ready or self.simulation_mode:
+            await asyncio.sleep(60)  # Wait for 1 minute
+            if not self.is_market_open():
+                break
+            if not self.is_ready or self.simulation_mode:
+                await self.update_historical_data()
+            if self.simulation_mode:
+                await self.simulate_bar()
+            # await asyncio.sleep(60)  # Wait for 1 minute
+                            
     async def run(self):
         try:
             while True:
@@ -368,18 +490,9 @@ class LiveTrader:
                 await self.reset_daily_data()
 
                 self.data_stream.subscribe_bars(self.on_bar, self.symbol)
-                
-                async def update_historical_periodically():
-                    while not self.is_ready or self.simulation_mode:
-                        await asyncio.sleep(60)  # Wait for 1 minute
-                        if not self.is_market_open():
-                            break
-                        if not self.is_ready or self.simulation_mode:
-                            await self.update_historical_data()
-                        if self.simulation_mode:
-                            await self.simulate_bar()
 
-                update_task = asyncio.create_task(update_historical_periodically())
+
+                update_task = asyncio.create_task(self.update_historical_periodically())
                 stream_task = asyncio.create_task(self.data_stream._run_forever())
                 
                 while self.is_market_open():
@@ -417,6 +530,7 @@ async def main():
     simulation_mode = True  # Set this to True for simulation, False for live trading
 
     touch_detection_params = LiveTouchDetectionParameters(
+        symbol=symbol,
         atr_period=15,
         level1_period=15,
         multiplier=1.4,
@@ -424,10 +538,25 @@ async def main():
         bid_buffer_pct=0.005,
         start_time=None,
         end_time='16:00',
-        use_median=False
+        use_median=True
     )
-    
-    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, touch_detection_params, simulation_mode)
+
+    strategy_params = StrategyParameters(
+        initial_investment=10_000,
+        do_longs=True,
+        do_shorts=True,
+        sim_longs=True,
+        sim_shorts=True,
+        
+        use_margin=True,
+        
+        times_buying_power=1,
+        
+        soft_start_time = None, 
+        soft_end_time = '15:50',
+    )
+
+    trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, touch_detection_params, strategy_params, simulation_mode)
 
     try:
         await trader.run()

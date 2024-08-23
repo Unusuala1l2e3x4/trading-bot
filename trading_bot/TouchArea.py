@@ -4,26 +4,39 @@ from bisect import bisect_right, bisect_left
 from collections import defaultdict
 from itertools import takewhile
 from numba import jit
+import numpy as np
+from typing import List, Dict, Optional, Tuple, Callable
 
 @dataclass
 class TouchArea:
-    def __init__(self, date, id, level, upper_bound, lower_bound, touches, is_long, min_touches, bid_buffer_pct):
-        assert lower_bound < level < upper_bound
-        self.date = date
-        self.id = id
-        self.level = level
-        self.upper_bound = upper_bound
-        self.lower_bound = lower_bound
-        self.touches = touches
-        self.is_long = is_long
-        self.min_touches = min_touches
-        self.bid_buffer_pct = bid_buffer_pct # currently unused
-        self.entries_exits = []
-        self.min_touches_time = touches[min_touches - 1] if len(touches) >= min_touches else None # New attribute
+    date: datetime.date
+    id: int
+    level: float
+    upper_bound: float
+    lower_bound: float
+    initial_touches: List[datetime]
+    touches: List[datetime]
+    is_long: bool
+    min_touches: int
+    bid_buffer_pct: float
+    valid_atr: np.ndarray
+    touch_area_width_agg: Callable
+    multiplier: float
+    calculate_bounds: Callable
+    min_touches_time: datetime = field(init=False)
+    entries_exits: List[tuple] = field(default_factory=list)
+    # fresh: bool = field(init=False)
         
+    def __post_init__(self):
+        assert self.min_touches > 1
+        assert self.lower_bound < self.level < self.upper_bound
+        assert len(self.valid_atr) == len(self.touches)
+        self.min_touches_time = self.initial_touches[self.min_touches - 1] if len(self.initial_touches) >= self.min_touches else None
+        # self.fresh = True
+
     def __eq__(self, other):
         if isinstance(other, TouchArea):
-            return self.id == other.id
+            return self.id == other.id and self.date == other.date
         return NotImplemented
     
     
@@ -36,15 +49,16 @@ class TouchArea:
 
     @property
     def is_active(self) -> bool:
-        return len(self.touches) >= self.min_touches
+        return len(self.initial_touches) >= self.min_touches
 
     @property
     def get_min_touch_time(self) -> datetime:
-        return self.touches[self.min_touches-1] if self.touches is not None else None
+        # return self.initial_touches[self.min_touches-1] if self.initial_touches is None else None
+        return self.min_touches_time
     
     @property
     def get_last_touch(self) -> datetime:
-        return self.touches[-1] if self.touches is not None else None
+        return self.touches[-1] if self.touches else None
     
     @property
     def get_buy_price(self) -> float:
@@ -66,14 +80,32 @@ class TouchArea:
         return self.upper_bound - self.lower_bound
     
     def terminate(self, touch_area_collection):
+        # print(self.id,'end range  ',self.get_range)
         touch_area_collection.terminate_area(self)
-    
+        
+    def update_bounds(self, current_timestamp: datetime):
+        # if self.fresh:
+        #     print(self.id,'start range',self.get_range)
+        #     self.fresh = False
+        current_touches = [touch for touch in self.touches if touch <= current_timestamp]
+        current_atr = self.valid_atr[:len(current_touches)]
+        
+        _, new_lower_bound, new_upper_bound = self.calculate_bounds(
+            current_atr, 
+            self.level, 
+            self.is_long, 
+            self.touch_area_width_agg, 
+            self.multiplier
+        )
+        
+        self.lower_bound = new_lower_bound
+        self.upper_bound = new_upper_bound
+        
     @property
     def __str__(self):
         return (f"{'Long ' if self.is_long else 'Short'} TouchArea {self.id}: Level={self.level:.4f}, "
                 f"Bounds={self.lower_bound:.4f}-{self.upper_bound:.4f}, {self.touches[0].time()}-{self.touches[-1].time()}, "
                 f"Num Touches={len(self.touches)}, "
-                # f"Buy Price={self.get_buy_price}, "
                 f"Profit={self.calculate_profit:.4f}")
 
 @dataclass
@@ -82,7 +114,7 @@ class TouchAreaCollection:
         self.areas_by_date = defaultdict(list)
         
         for area in touch_areas:
-            if len(area.touches) >= min_touches:
+            if len(area.touches) >= min_touches:  #
                 area_date = area.min_touches_time.date()
                 self.areas_by_date[area_date].append(area)
         

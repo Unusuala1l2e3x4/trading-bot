@@ -424,8 +424,11 @@ class TradePosition:
 
         return transaction_cost
 
-  
-    def update_stop_price(self, current_price: float):
+    
+    def update_stop_price(self, current_price: float, current_timestamp: datetime):
+        # Update the bounds of the TouchArea
+        self.area.update_bounds(current_timestamp)
+        
         if self.is_long:
             self.max_price = max(self.max_price or self.entry_price, current_price)
             self.current_stop_price = self.max_price - self.area.get_range
@@ -533,6 +536,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         row = {
             'date': trade.date,
             'ID': trade.id,
+
             'Type': 'Long' if trade.is_long else 'Short',
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
@@ -551,7 +555,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         }
         data.append(row)
     df = pd.DataFrame(data)
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    if len(os.path.dirname(filename)) > 0:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
     df.to_csv(filename, index=False)
     debug_print(f"Trade summary has been exported to {filename}")
 
