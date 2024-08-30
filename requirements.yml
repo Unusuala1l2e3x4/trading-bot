@@ -15,6 +15,7 @@ dependencies:
     - toml
     - matplotlib
     - tqdm
+    - scipy
     - numba
     - line_profiler
     - snakeviz

@@ -151,37 +151,7 @@ def calculate_dynamic_levels(df:pd.DataFrame, ema_short=9, ema_long=20):
         adjust=True
     ).mean()
     df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
-
-
-def apply_exponential_tapering(df: pd.DataFrame, column: str, window_size: int, decay_rate: float) -> pd.Series:
-    """
-    Apply an exponential tapering weighted rolling average to a specified column in a DataFrame.
-
-    Parameters:
-    df (pd.DataFrame): The DataFrame containing the data.
-    column (str): The name of the column to apply the tapering to.
-    window_size (int): The size of the rolling window.
-    decay_rate (float): The decay rate for the exponential tapering (0 < decay_rate < 1).
-
-    Returns:
-    pd.Series: The series with the exponential tapering applied.
-    """
-    # Create exponential weights
-    weights = np.array([decay_rate**i for i in range(window_size)][::-1], dtype=np.float64)
-
-    # Normalize the weights so they sum to 1
-    weights /= weights.sum()
-
-    # Apply the exponential tapering weighted average to the specified column
-    tapered_series = df[column].rolling(window=window_size).apply(
-        lambda x: np.dot(x, weights), raw=True)
-
-    return tapered_series
-# Example usage:
-# Assuming df is your DataFrame and you want to apply to the 'TR' column
-# window_size = 20
-# decay_rate = 0.9
-# df['ATR_exponential'] = apply_exponential_tapering(df, 'TR', window_size, decay_rate)
+    df['is_res'] = df['close'] > df['central_value']
 
 
 def fill_missing_data(df):
@@ -207,11 +177,13 @@ def fill_missing_data(df):
     return df
 
 
-# @dataclass
-# class Level:
-#     x: float
-#     y: float
-#     level: float
+@dataclass
+class Level:
+    x: float
+    y: float
+    level: float
+    is_res: bool
+    touches: List[datetime]
     
     
 @jit(nopython=True)
@@ -223,18 +195,38 @@ def np_mean(arr):
     return np.mean(arr)
 
 @jit(nopython=True)
-def np_searchsorted(a,b):
+def np_searchsorted(a,b): # only used in calculate_touch_area function
     return np.searchsorted(a,b)
 
-# touch_area_low = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
-# touch_area_high = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
 
-# touch_area_low = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
-# touch_area_high = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
+
+# Create exponential weights function
+def create_weights(window_size, decay_rate):
+    weights = np.array([decay_rate**i for i in range(window_size)][::-1], dtype=np.float64)
+    return weights / weights.sum()
+
+# Define the rolling weighted mean function
+weighted_mean = lambda x, weights: np.dot(x, weights)
+
+# Define the rolling weighted median function
+def weighted_median(values, weights):
+    sorted_indices = np.argsort(values)
+    sorted_values = values[sorted_indices]
+    sorted_weights = weights[sorted_indices]
+    cumulative_weights = np.cumsum(sorted_weights)
+    return sorted_values[np.searchsorted(cumulative_weights, 0.5)]
+
 
 @jit(nopython=True)
 def calculate_touch_area_bounds(atr_values, level, is_long, touch_area_width_agg, multiplier):
     touch_area_width = touch_area_width_agg(atr_values) * multiplier
+    
+    # touch_area_low = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
+    # touch_area_high = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
+
+    # touch_area_low = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
+    # touch_area_high = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
+    
     if is_long:
         touch_area_low = level - (2 * touch_area_width / 3)
         touch_area_high = level + (1 * touch_area_width / 3)
@@ -246,9 +238,8 @@ def calculate_touch_area_bounds(atr_values, level, is_long, touch_area_width_agg
 @jit(nopython=True)
 def process_touches(touches, prices, atrs, level, level_low, level_high, is_long, min_touches, touch_area_width_agg, multiplier):
     consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
-    count = 0
+    count, width = 0, 0
     prev_price = None
-    width = 0
     
     for i in range(len(prices)):
         price = prices[i]
@@ -469,7 +460,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
         - 'min_touches': The minimum number of touches used
         - 'start_time': The start time used for analysis
         - 'end_time': The end time used for analysis
-        - 'use_median': Whether median was used instead of mean
+        - 'use_median': Whether median or mean was used for touch area width calculation (True -> use rolling MTR, False -> using rolling+tapered ATR)
 
     This function analyzes historical price data to identify significant price levels (support and resistance)
     based on the frequency of price touches. It considers market volatility using ATR and allows for 
@@ -549,9 +540,15 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     df['H-PC'] = np.abs(df['high'] - df['close'].shift(1))
     df['L-PC'] = np.abs(df['low'] - df['close'].shift(1))
     df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-    # df['ATR'] = df['TR'].rolling(window=params.atr_period).mean()
-    df['ATR'] = apply_exponential_tapering(df, 'TR', params.atr_period, params.rolling_avg_decay_rate)
-    df['MTR'] = df['TR'].rolling(window=params.atr_period).median()
+    
+    # apply time decay for certain aggregations
+    weights = create_weights(window_size=params.atr_period, decay_rate=params.rolling_avg_decay_rate)
+    
+    # df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+    df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # seems better
+
+    df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True) # seems better
+    # df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_median(x, weights), raw=True)
     
     log2('ATR and MTR calculated')
 
@@ -562,10 +559,14 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     # Calculate rolling average volume and trade count
     df['shares_per_trade'] = df['volume'] / df['trade_count']
     
-    # df['avg_volume'] = df['volume'].rolling(window=params.level1_period).mean()
-    df['avg_volume'] = apply_exponential_tapering(df, 'volume', params.atr_period, params.rolling_avg_decay_rate)
-    # df['avg_trade_count'] = df['trade_count'].rolling(window=params.level1_period).mean()
-    df['avg_trade_count'] = apply_exponential_tapering(df, 'trade_count', params.atr_period, params.rolling_avg_decay_rate)
+    
+    df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
+    # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
+    # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+
+    df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
+    # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
+    # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
     
     # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
     
@@ -577,8 +578,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     all_support_levels = defaultdict(dict)
     all_resistance_levels = defaultdict(dict)
 
-    def classify_level(level_items, index, day_df):
-        return 'resistance' if level_items > day_df.loc[index, 'central_value'] else 'support'
+    # def is_res_area(index, day_df):
+    #     return day_df.loc[index, 'close'] > day_df.loc[index, 'central_value']
     
     # high_low_diffs_list = []
     
@@ -598,6 +599,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             close = day_df['close'].iloc[i]
             timestamp = day_timestamps[i]
             
+            is_res = day_df['is_res'].iloc[i]
+            
             high_low_diffs.append(high-low)
             
             w = np.median(high_low_diffs) / 2
@@ -609,7 +612,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             
             # Check if this point falls within any existing levels
             for (level_x, level_y), touches in potential_levels.items():
-                if level_x <= close <= level_y:
+                initial_is_res = day_df.loc[(params.symbol,touches[0]), 'is_res']
+                if level_x <= close <= level_y and initial_is_res == is_res:
                     touches.append(timestamp)
         
             if w != 0:
@@ -631,12 +635,13 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             # print(day_df)
             initial_close = day_df.loc[(params.symbol, initial_timestamp), 'close']
 
-            classification = classify_level(day_df.loc[(params.symbol, initial_timestamp), 'close'], (params.symbol, initial_timestamp), day_df)
+            # classification = is_res_area((params.symbol, initial_timestamp), day_df)
+            classification = day_df.loc[(params.symbol, initial_timestamp), 'is_res']
 
-            if classification == 'support':
-                all_support_levels[date][(level[0], level[1], initial_close)] = touches
-            else:
+            if classification: # resistance
                 all_resistance_levels[date][(level[0], level[1], initial_close)] = touches
+            else: # support
+                all_support_levels[date][(level[0], level[1], initial_close)] = touches
 
     log2('Levels created')
     unique_dates = list(pd.unique(timestamps.date))
