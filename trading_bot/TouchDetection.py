@@ -295,12 +295,12 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
         day_timestamps_np = np.array(day_timestamps.astype(np.int64))
         day_prices = day_data['close'].values
         day_atr = day_data['MTR' if use_median else 'ATR'].values
-
-        for (level_low, level_high, level), touches in levels.items():
-            if len(touches) < min_touches:
+        
+        for level in levels:
+            if len(level.touches) < min_touches:
                 continue
             
-            touch_timestamps_np = np.array([t.value for t in touches], dtype=np.int64)
+            touch_timestamps_np = np.array([t.value for t in level.touches], dtype=np.int64)
             touch_indices = np_searchsorted(day_timestamps_np, touch_timestamps_np)
             
             valid_mask = (day_timestamps[touch_indices] >= day_start_time) & (day_timestamps[touch_indices] < day_end_time)
@@ -316,9 +316,9 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                 valid_touch_indices, 
                 valid_prices,
                 valid_atr,
-                level, 
-                level_low,
-                level_high, 
+                level.level, 
+                level.x,
+                level.y, 
                 is_long, 
                 min_touches,
                 touch_area_width_agg,
@@ -330,7 +330,7 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                 touch_area = TouchArea(
                     date=date,
                     id=current_id,
-                    level=level,
+                    level=level.level,
                     upper_bound=touch_area_high,
                     lower_bound=touch_area_low,
                     initial_touches=consecutive_touches,
@@ -575,8 +575,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     # Group data by date
     grouped = df.groupby(timestamps.date)
     
-    all_support_levels = defaultdict(dict)
-    all_resistance_levels = defaultdict(dict)
+    all_support_levels = defaultdict(list)
+    all_resistance_levels = defaultdict(list)
 
     # def is_res_area(index, day_df):
     #     return day_df.loc[index, 'close'] > day_df.loc[index, 'central_value']
@@ -586,62 +586,48 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     for date, day_df in tqdm(grouped):
         day_timestamps = day_df.index.get_level_values('timestamp')
         
-        potential_levels = defaultdict(list)
+        potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
         
         high_low_diffs = [] # only consider the diffs in the current day
         
         for i in range(len(day_df)):
-            if day_df['volume'].iloc[i] <= 0 or day_df['trade_count'].iloc[i] <= 0:
+            row = day_df.iloc[i]
+            if row['volume'] <= 0 or row['trade_count'] <= 0:
                 continue
             
-            high = day_df['high'].iloc[i]
-            low = day_df['low'].iloc[i]
-            close = day_df['close'].iloc[i]
+            high, low, close = row['high'], row['low'], row['close']
             timestamp = day_timestamps[i]
+            is_res = row['is_res']
             
-            is_res = day_df['is_res'].iloc[i]
-            
-            high_low_diffs.append(high-low)
+            high_low_diffs.append(high - low)
             
             w = np.median(high_low_diffs) / 2
-
-            # print(timestamp, w)
-            
-            x = close - w
-            y = close + w
+            x, y = close - w, close + w
             
             # Check if this point falls within any existing levels
-            for (level_x, level_y), touches in potential_levels.items():
-                initial_is_res = day_df.loc[(params.symbol,touches[0]), 'is_res']
-                if level_x <= close <= level_y and initial_is_res == is_res:
-                    touches.append(timestamp)
-        
+            for level in potential_levels.values():
+                if level.x <= close <= level.y and level.is_res == is_res:
+                    level.touches.append(timestamp)
+
             if w != 0:
                 # Add this point to its own level
-                potential_levels[(x, y)].append(timestamp)
+                if (x,y) not in potential_levels:
+                    potential_levels[(x, y)] = Level(x, y, close, is_res, [timestamp])
                 
-                
-        a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
-        a['date'] = date
+        # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
+        # a['date'] = date
         # high_low_diffs_list.append(a)
         # print(a)
         
         # Filter for strong levels
-        strong_levels = {level: touches for level, touches in potential_levels.items() if len(touches) >= params.min_touches}
-
+        strong_levels = [level for level in potential_levels.values() if len(level.touches) >= params.min_touches]
+        
         # Classify levels as support or resistance
-        for level, touches in strong_levels.items():
-            initial_timestamp = touches[0]
-            # print(day_df)
-            initial_close = day_df.loc[(params.symbol, initial_timestamp), 'close']
-
-            # classification = is_res_area((params.symbol, initial_timestamp), day_df)
-            classification = day_df.loc[(params.symbol, initial_timestamp), 'is_res']
-
-            if classification: # resistance
-                all_resistance_levels[date][(level[0], level[1], initial_close)] = touches
-            else: # support
-                all_support_levels[date][(level[0], level[1], initial_close)] = touches
+        for level in strong_levels:
+            if level.is_res:
+                all_resistance_levels[date].append(level)
+            else:
+                all_support_levels[date].append(level)
 
     log2('Levels created')
     unique_dates = list(pd.unique(timestamps.date))
