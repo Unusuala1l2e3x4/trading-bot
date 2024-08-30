@@ -12,6 +12,7 @@ We’re excited to announce some enhancements that went into effect April 26, 20
 
 ## A little bit about the REG/TAF Fee
 Every time you sell your stocks, the SEC and FINRA charge fees on the sale. The SEC charges \$8  for every \$1,000,000 (or \$0.000008 per dollar), and FINRA charges \$166 for every 1,000,000 shares (or \$0.000166 per share) sold up to a maximum of \$8.30 per trade. We denote the former as REG fee, and the latter as TAF fee. These fees are used by regulators to help offset the costs associated with regulating the equities market.
+- check **Alpaca Securities Brokerage Fee Schedule** in [Alpaca Documents Library](https://alpaca.markets/disclosures) for most up-to-date rates
 
 Regulators assess these fees on broker-dealers who report transactions. Broker-dealers, in turn, are allowed to pass these fees on to customers. Alpaca currently passes these fees on to customers who effect a sale transaction on a daily basis at the end of each trading day.
 

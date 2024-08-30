@@ -248,7 +248,7 @@ def process_touches(touches, prices, atrs, level, level_low, level_high, is_long
     consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
     count = 0
     prev_price = None
-    _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:min_touches], level, is_long, touch_area_width_agg, multiplier)
+    width = 0
     
     for i in range(len(prices)):
         price = prices[i]
@@ -258,19 +258,21 @@ def process_touches(touches, prices, atrs, level, level_low, level_high, is_long
         
         if level_low <= price <= level_high:
             if is_touch:
-                consecutive_touches[count] = touches[i]
-                count += 1
-                if count == min_touches:
-                    return consecutive_touches[consecutive_touches != -1], touch_area_low, touch_area_high
                 # Update bounds after each touch
-                _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
-        else:
+                width, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
+                if width > 0:
+                    consecutive_touches[count] = touches[i]
+                    count += 1
+                
+                    if count == min_touches:
+                        return consecutive_touches[consecutive_touches != -1], touch_area_low, touch_area_high
+                
+        elif width > 0:
+            assert touch_area_high is not None and touch_area_low is not None
             buy_price = touch_area_high if is_long else touch_area_low
             if (is_long and price > buy_price) or (not is_long and price < buy_price):
                 consecutive_touches[:] = -1
                 count = 0
-                # Reset bounds after exiting the area
-                _, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
         
         prev_price = price
     return np.empty(0, dtype=np.int64), touch_area_low, touch_area_high

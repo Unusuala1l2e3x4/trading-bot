@@ -7,7 +7,7 @@ import math
 import os
 import pandas as pd
 from datetime import datetime, date
-import numpy as np
+import numpy as np 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from numba import jit
@@ -19,7 +19,9 @@ def debug_print(*args, **kwargs):
 
     
 # https://alpaca.markets/blog/reg-taf-fees/
-SEC_FEE_RATE = 0.000008  # $8 per $1,000,000
+# check **Alpaca Securities Brokerage Fee Schedule** in [Alpaca Documents Library](https://alpaca.markets/disclosures) for most up-to-date rates
+# SEC_FEE_RATE = 0.000008  # $8 per $1,000,000
+SEC_FEE_RATE = 0.0000278  # $27.80 per $1,000,000
 FINRA_TAF_RATE = 0.000166  # $166 per 1,000,000 shares
 FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
 

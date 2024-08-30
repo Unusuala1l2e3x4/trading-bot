@@ -28,9 +28,9 @@ class TouchArea:
     # fresh: bool = field(init=False)
         
     def __post_init__(self):
-        assert self.min_touches > 1
-        assert self.lower_bound < self.level < self.upper_bound
-        assert len(self.valid_atr) == len(self.touches)
+        assert self.min_touches > 1, f'{self.min_touches} > 1'
+        assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
+        assert len(self.valid_atr) == len(self.touches), f'{len(self.valid_atr)} == {len(self.touches)}'
         self.min_touches_time = self.initial_touches[self.min_touches - 1] if len(self.initial_touches) >= self.min_touches else None
         # self.fresh = True
 
@@ -80,14 +80,15 @@ class TouchArea:
         return self.upper_bound - self.lower_bound
     
     def terminate(self, touch_area_collection):
-        # print(self.id,'end range  ',self.get_range)
+        # print(self.id,self.entries_exits[0][2],len([touch for touch in self.touches if touch <= self.entries_exits[0][2]]),self.get_range,'\n')
         touch_area_collection.terminate_area(self)
         
     def update_bounds(self, current_timestamp: datetime):
-        # if self.fresh:
-        #     print(self.id,'start range',self.get_range)
-        #     self.fresh = False
         current_touches = [touch for touch in self.touches if touch <= current_timestamp]
+        # if self.fresh:
+        #     print(self.id,current_timestamp,len(current_touches),self.get_range)
+        #     self.fresh = False
+            
         current_atr = self.valid_atr[:len(current_touches)]
         
         _, new_lower_bound, new_upper_bound = self.calculate_bounds(
@@ -98,8 +99,11 @@ class TouchArea:
             self.multiplier
         )
         
-        self.lower_bound = new_lower_bound
-        self.upper_bound = new_upper_bound
+        if self.lower_bound != new_lower_bound or self.upper_bound != new_upper_bound:
+            self.lower_bound = new_lower_bound
+            self.upper_bound = new_upper_bound
+            # print(self.id,current_timestamp,len(current_touches),self.get_range)
+
         
     @property
     def __str__(self):
