@@ -398,16 +398,14 @@ class TradingStrategy:
 
 
     def calculate_exit_details(self, times_buying_power: float, shares_to_sell: int, volume: float, avg_volume: float, avg_trade_count: float, max_volume_percentage: float, min_trade_count: int):
-        # Logic for calculating exit details (similar to your original function)
-        
         # Calculate the adjustment factor
-        adjustment = min(max(shares_to_sell / avg_volume, 0), 1)
+        # adjustment = min(max(shares_to_sell / avg_volume, 0), 1)
         
         # Adjust min_trade_count, with a lower bound of 10% of the original value
-        adjusted_min_trade_count = max(min_trade_count * (1 - adjustment), min_trade_count * 0.1)
+        # adjusted_min_trade_count = max(min_trade_count * (1 - adjustment), min_trade_count * 0.1)
         
         # Check if trading is allowed
-        if not is_trading_allowed(avg_trade_count, adjusted_min_trade_count, avg_volume):
+        if not is_trading_allowed(avg_trade_count, min_trade_count, avg_volume):
             return 0  # No trading allowed, return 0 shares to sell
         
         # when live, need to call is_security_marginable
@@ -417,9 +415,9 @@ class TradingStrategy:
             overall_margin_multiplier = min(times_buying_power, 1.0)
 
         # Adjust max_volume_percentage, with an upper bound of 3 times the original value
-        adjusted_max_volume_percentage = min(max_volume_percentage * (1 + adjustment), max_volume_percentage * 3)
+        # adjusted_max_volume_percentage = min(max_volume_percentage * (1 + adjustment), max_volume_percentage * 3)
         
-        max_volume_shares = calculate_max_trade_size(avg_volume, adjusted_max_volume_percentage)
+        max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
 
         # Ensure we don't sell more than the available shares or the calculated max_volume_shares
         shares_to_sell = min(shares_to_sell, max_volume_shares)
@@ -511,6 +509,11 @@ class TradingStrategy:
                 target_shares = calculate_target_shares(position, close_price)
                 if should_exit or target_shares == 0:
                     price_at_action = close_price
+                    # price_at_action = position.current_stop_price # if using stop market order set to the stop price (modified every minute)
+                    
+                    # may add a buffer distance, i.e. a 2nd stop price with larger distance, to the TradePosition class.
+                    # this would only be fore
+                    
                 
             if price_at_action:
                 assert target_shares == 0
@@ -583,6 +586,9 @@ class TradingStrategy:
                     )
                     
                     shares_to_buy = min(shares_to_adjust, max_additional_shares)
+                    
+                    if self.soft_end_triggered: # extra safeguard
+                        shares_to_buy = 0
                     
                     if shares_to_buy > 0:
                         cash_needed, fees = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
