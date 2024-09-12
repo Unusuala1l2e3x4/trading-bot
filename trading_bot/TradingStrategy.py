@@ -507,7 +507,7 @@ class TradingStrategy:
             if not price_at_action:
                 should_exit, should_exit_2 = position.update_stop_price(close_price, timestamp)
                 target_shares = calculate_target_shares(position, close_price)
-                print(target_shares, position.max_shares, should_exit)
+                # print(target_shares, position.max_shares, should_exit)
                 if should_exit or target_shares == 0:
                     price_at_action = close_price
                     
@@ -613,6 +613,7 @@ class TradingStrategy:
                             
                         else:
                             position.max_shares = max(position.max_shares, position.shares + shares_to_buy)
+                            assert position.shares + shares_to_buy == max_shares
       
                     else:
                         self.count_entry_skip += 1
@@ -801,6 +802,8 @@ class TradingStrategy:
         return None
 
     def generate_backtest_results(self):
+        trades = [a for a in self.trades if not a.is_simulated]
+        
         # Calculate and return backtest results
         balance_change = ((self.balance - self.params.initial_investment) / self.params.initial_investment) * 100
 
@@ -809,29 +812,29 @@ class TradingStrategy:
         end_price = self.df['close'].iloc[-1]
         baseline_change = ((end_price - start_price) / start_price) * 100
         
-        total_profit_loss = sum(trade.profit_loss for trade in self.trades if not trade.is_simulated)
+        total_profit_loss = sum(trade.profit_loss for trade in trades)
         
-        total_profit = sum(trade.profit_loss for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0)
-        total_loss = sum(trade.profit_loss for trade in self.trades if not trade.is_simulated and trade.profit_loss < 0)
+        total_profit = sum(trade.profit_loss for trade in trades if trade.profit_loss > 0)
+        total_loss = sum(trade.profit_loss for trade in trades if trade.profit_loss < 0)
         
-        total_transaction_costs = sum(trade.total_transaction_costs for trade in self.trades if not trade.is_simulated)
-        total_stock_borrow_costs = sum(trade.total_stock_borrow_cost for trade in self.trades if not trade.is_simulated)
+        total_transaction_costs = sum(trade.total_transaction_costs for trade in trades)
+        total_stock_borrow_costs = sum(trade.total_stock_borrow_cost for trade in trades)
 
-        mean_profit_loss = np.mean([trade.profit_loss for trade in self.trades if not trade.is_simulated])
-        mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated])
+        mean_profit_loss = np.mean([trade.profit_loss for trade in trades])
+        mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades])
 
-        win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0])
-        lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss < 0])
+        win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades if trade.profit_loss > 0])
+        lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades if trade.profit_loss < 0])
         
-        win_trades = sum(1 for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0)
-        lose_trades = sum(1 for trade in self.trades if not trade.is_simulated and trade.profit_loss < 0)
-        win_longs = sum(1 for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss > 0)
-        lose_longs = sum(1 for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss < 0)
-        win_shorts = sum(1 for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss > 0)
-        lose_shorts = sum(1 for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss < 0)
+        win_trades = sum(1 for trade in trades if trade.profit_loss > 0)
+        lose_trades = sum(1 for trade in trades if trade.profit_loss < 0)
+        win_longs = sum(1 for trade in trades if trade.is_long and trade.profit_loss > 0)
+        lose_longs = sum(1 for trade in trades if trade.is_long and trade.profit_loss < 0)
+        win_shorts = sum(1 for trade in trades if not trade.is_long and trade.profit_loss > 0)
+        lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.profit_loss < 0)
         
-        avg_sub_pos = np.mean([len(trade.sub_positions) for trade in self.trades if not trade.is_simulated])
-        avg_transact = np.mean([len(trade.transactions) for trade in self.trades if not trade.is_simulated])
+        avg_sub_pos = np.mean([len(trade.sub_positions) for trade in trades])
+        avg_transact = np.mean([len(trade.transactions) for trade in trades])
         
         assert self.trades_executed == len(self.trades)
 
@@ -859,15 +862,15 @@ class TradingStrategy:
 
         # Create Series for different trade categories
         trade_categories = {
-            'All': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated],
-            # 'Long': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long],
-            # 'Short': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long],
-            'Win': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss > 0],
-            'Lose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.profit_loss <= 0],
-            'Lwin': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss > 0],
-            'Swin': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss > 0],
-            'Llose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and trade.is_long and trade.profit_loss <= 0],
-            'Slose': [trade.profit_loss_pct for trade in self.trades if not trade.is_simulated and not trade.is_long and trade.profit_loss <= 0]
+            'All': [trade.profit_loss_pct for trade in trades],
+            # 'Long': [trade.profit_loss_pct for trade in trades if trade.is_long],
+            # 'Short': [trade.profit_loss_pct for trade in trades if not trade.is_long],
+            'Win': [trade.profit_loss_pct for trade in trades if trade.profit_loss > 0],
+            'Lose': [trade.profit_loss_pct for trade in trades if trade.profit_loss <= 0],
+            'Lwin': [trade.profit_loss_pct for trade in trades if trade.is_long and trade.profit_loss > 0],
+            'Swin': [trade.profit_loss_pct for trade in trades if not trade.is_long and trade.profit_loss > 0],
+            'Llose': [trade.profit_loss_pct for trade in trades if trade.is_long and trade.profit_loss <= 0],
+            'Slose': [trade.profit_loss_pct for trade in trades if not trade.is_long and trade.profit_loss <= 0]
         }
 
         describe_results = pd.DataFrame({category: pd.Series(data).describe() for category, data in trade_categories.items()})
@@ -905,7 +908,7 @@ class TradingStrategy:
         print(f"\nMargin Usage:")
         print(f"Margin Enabled: {'Yes' if self.params.use_margin else 'No'}")
         print(f"Max Buying Power: {self.params.times_buying_power}x")
-        print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in self.trades) / len(self.trades):.4f}x")
+        print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in trades) / len(self.trades):.4f}x")
         print(f"Average Sub Positions per Position: {avg_sub_pos:.4f}")
         print(f"Average Transactions per Position: {avg_transact:.4f}")
         
@@ -915,10 +918,10 @@ class TradingStrategy:
 
         plot_cumulative_pnl_and_price(self.trades, self.bars, self.params.initial_investment, filename=self.export_graph_path)
 
-        # return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
+        # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
         #     win_trades / len(self.trades) * 100,  \
         #     total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
-        return self.balance, sum(1 for trade in self.trades if trade.is_long), sum(1 for trade in self.trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
+        return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
             win_trades / len(self.trades) * 100, total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
 
 
