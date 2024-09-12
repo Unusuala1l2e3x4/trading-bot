@@ -378,6 +378,8 @@ class LiveTrader:
             self.log(f"Order {placed_order.id} is in {placed_order.status} status. Waiting for fill.")
 
     async def update_position_after_fill(self, placed_order: Order, original_order: dict):
+        self.log(f"Order {placed_order.id} filled completely - {placed_order.filled_qty} out of {placed_order.qty}")
+        
         position = original_order['position']
         action = original_order['action']
         
@@ -385,7 +387,7 @@ class LiveTrader:
             # Update the position with actual filled quantity and price
             position.shares = int(placed_order.filled_qty)
             position.entry_price = float(placed_order.filled_avg_price)
-        elif action in ['partial_entry', 'partial_exit']:
+        elif action in ['partial_entry', 'partial_exit', 'close']:
             # Update the position for partial fills
             if original_order['order_side'] == OrderSide.BUY:
                 position.shares += int(placed_order.filled_qty)
@@ -537,7 +539,7 @@ async def main():
         min_touches=3,
         bid_buffer_pct=0.005,
         start_time=None,
-        end_time='16:00',
+        end_time='15:55',
         use_median=True
     )
 

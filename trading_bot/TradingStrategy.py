@@ -507,6 +507,7 @@ class TradingStrategy:
             if not price_at_action:
                 should_exit, should_exit_2 = position.update_stop_price(close_price, timestamp)
                 target_shares = calculate_target_shares(position, close_price)
+                print(target_shares, position.max_shares, should_exit)
                 if should_exit or target_shares == 0:
                     price_at_action = close_price
                     
@@ -591,31 +592,31 @@ class TradingStrategy:
                     
                     shares_to_buy = min(shares_to_adjust, max_additional_shares)
                     
-                    if self.soft_end_triggered: # extra safeguard
-                        shares_to_buy = 0
-                    
                     if shares_to_buy > 0:
-                        cash_needed, fees = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
-                        self.rebalance(position.is_simulated, -cash_needed - fees, price_at_action)
-                        
-                        orders.append({
-                            'action': 'partial_entry',
-                            'order_side': OrderSide.BUY if position.is_long else OrderSide.SELL,
-                            'symbol': self.symbol,
-                            'qty': shares_to_buy,
-                            'position': position
-                        })
-
-                        # Update max_shares after successful partial entry
-                        position.max_shares = max(position.max_shares, position.shares)
-                        assert position.shares == max_shares
-
                         if shares_to_buy < shares_to_adjust:
                             self.count_entry_adjust += 1
+                            
+                        if not self.soft_end_triggered:
+                            cash_needed, fees = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
+                            self.rebalance(position.is_simulated, -cash_needed - fees, price_at_action)
+                            
+                            orders.append({
+                                'action': 'partial_entry',
+                                'order_side': OrderSide.BUY if position.is_long else OrderSide.SELL,
+                                'symbol': self.symbol,
+                                'qty': shares_to_buy,
+                                'position': position
+                            })
+
+                            position.max_shares = max(position.max_shares, position.shares) # Update max_shares after successful partial entry
+                            assert position.shares == max_shares
+                            
+                        else:
+                            position.max_shares = max(position.max_shares, position.shares + shares_to_buy)
+      
                     else:
-                        # Update max_shares when entry is skipped
-                        position.max_shares = min(position.max_shares, position.shares)
                         self.count_entry_skip += 1
+                        position.max_shares = min(position.max_shares, position.shares) # Update max_shares when entry is skipped                       
 
         temp = {}
         for area_id in positions_to_remove:
@@ -721,6 +722,9 @@ class TradingStrategy:
             # self.daily_index = len(self.daily_data) - 1  # Update daily_index for live trading
 
             return all_orders
+            # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
+            # remember to Limit consecutive stop order modifications to ~80 minutes (stop changing when close price has been monotonic in favorable direction for 80 or more minutes)
+            
 
         except Exception as e:
             self.log(f"Error in process_live_data: {e}", logging.ERROR)
