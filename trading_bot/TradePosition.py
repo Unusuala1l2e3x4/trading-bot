@@ -136,6 +136,7 @@ class TradePosition:
     sub_positions: List[SubPosition] = field(default_factory=list)
     transactions: List[Transaction] = field(default_factory=list)
     current_stop_price: Optional[float] = None
+    current_stop_price_2: Optional[float] = None
     max_price: Optional[float] = None
     min_price: Optional[float] = None
     last_price: float = field(default=0.0)
@@ -434,17 +435,23 @@ class TradePosition:
         if self.is_long:
             self.max_price = max(self.max_price or self.entry_price, current_price)
             self.current_stop_price = self.max_price - self.area.get_range
+            self.current_stop_price_2 = self.max_price - self.area.get_range*3 # simple logic for now
         else:
             self.min_price = min(self.min_price or self.entry_price, current_price)
             self.current_stop_price = self.min_price + self.area.get_range
+            self.current_stop_price_2 = self.min_price + self.area.get_range*3 # simple logic for nowe
         
         self.update_market_value(current_price)
         
-        return self.should_exit(current_price)
+        return self.should_exit(current_price), self.should_exit_2(current_price)
 
     def should_exit(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \
                (not self.is_long and current_price >= self.current_stop_price)
+
+    def should_exit_2(self, current_price: float) -> bool:
+        return (self.is_long and current_price <= self.current_stop_price_2) or \
+               (not self.is_long and current_price >= self.current_stop_price_2),
 
     def close(self, exit_time: datetime, exit_price: float):
         self.exit_time = exit_time

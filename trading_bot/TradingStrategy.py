@@ -505,14 +505,18 @@ class TradingStrategy:
             
             
             if not price_at_action:
-                should_exit = position.update_stop_price(close_price, timestamp)
+                should_exit, should_exit_2 = position.update_stop_price(close_price, timestamp)
                 target_shares = calculate_target_shares(position, close_price)
                 if should_exit or target_shares == 0:
                     price_at_action = close_price
-                    # price_at_action = position.current_stop_price # if using stop market order set to the stop price (modified every minute)
                     
-                    # may add a buffer distance, i.e. a 2nd stop price with larger distance, to the TradePosition class.
-                    # this would only be fore
+                    # if using stop market order safeguard, use this:
+                    # price_at_action = position.current_stop_price_2 if should_exit_2 else close_price
+                    
+                    # current_stop_price_2 is the stop market order price
+                    # stop market order would have executed before the minute is up, if should_exit_2 is True
+                    # worry about this in LiveTrader later, after close price logic is implemented
+                    # must use TradingStream that pings frequently.
                     
                 
             if price_at_action:
