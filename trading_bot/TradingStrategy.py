@@ -662,7 +662,7 @@ class TradingStrategy:
         for i in tqdm(range(1, len(timestamps))):
             current_time = timestamps[i].tz_convert(ny_tz)
             
-            if current_time.date() != self.current_date:
+            if self.current_date is None or current_time.date() != self.current_date:
                 self.handle_new_trading_day(current_time)
             
             if not self.market_open or not self.market_close:
@@ -690,31 +690,31 @@ class TradingStrategy:
 
         return self.generate_backtest_results()
 
-    def process_live_data(self, current_timestamp: datetime):
+    def process_live_data(self, current_time: datetime):
         try:
-            if current_timestamp.date() != self.current_date:
-                self.handle_new_trading_day(current_timestamp)
+            if self.current_date is None or current_time.date() != self.current_date:
+                self.handle_new_trading_day(current_time)
             
             if not self.market_open or not self.market_close:
                 return []
 
             latest_data = self.df.iloc[-1]
             prev_data = self.df.iloc[-2]
-            assert current_timestamp == self.df.index.get_level_values('timestamp')[-1]
+            assert current_time == self.df.index.get_level_values('timestamp')[-1]
 
-            if self.is_trading_time(current_timestamp, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, self.daily_index):
+            if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, self.daily_index):
                 if self.params.soft_end_time and not self.soft_end_triggered:
-                    self.soft_end_triggered = self.check_soft_end_time(current_timestamp, self.current_date)
+                    self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
 
-                update_orders = self.update_positions(current_timestamp, latest_data)
+                update_orders = self.update_positions(current_time, latest_data)
 
                 new_position_order = None
                 if not self.soft_end_triggered:
-                    new_position_order = self.process_active_areas(current_timestamp, latest_data, prev_data['close'])
+                    new_position_order = self.process_active_areas(current_time, latest_data, prev_data['close'])
 
                 all_orders = update_orders + ([new_position_order] if new_position_order else [])
-            elif self.should_close_all_positions(current_timestamp, self.day_end_time, self.daily_index):
-                all_orders = self.close_all_positions(current_timestamp, latest_data['close'], latest_data['vwap'], 
+            elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
+                all_orders = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
                                                     latest_data['volume'], latest_data['avg_volume'])
             else:
                 all_orders = []

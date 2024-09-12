@@ -314,22 +314,23 @@ class LiveTrader:
             # Update TradingStrategy balance
             self.trading_strategy.update_balance(self.balance)
 
-            current_timestamp = self.data.index.get_level_values('timestamp')[-1]
+            current_time = self.data.index.get_level_values('timestamp')[-1]
             
-            # Update daily parameters if it's a new day
-            if current_timestamp.date() != getattr(self.trading_strategy, 'current_date', None):
-                self.trading_strategy.update_daily_parameters(current_timestamp.date())
+            # Update daily parameters if it's a new day (already handled in process_live_data)
+            # if current_time.date() != getattr(self.trading_strategy, 'current_date', None):
+                # self.trading_strategy.update_daily_parameters(current_time.date())
+                # self.trading_strategy.handle_new_trading_day(current_time)
             
             print(self.touch_detection_areas.symbol)
             print(len(self.touch_detection_areas.long_touch_area), len(self.touch_detection_areas.short_touch_area))
             print(self.touch_detection_areas.bars[self.touch_detection_areas.mask])
             
-            orders = self.trading_strategy.process_live_data(current_timestamp)
+            orders = self.trading_strategy.process_live_data(current_time)
             
-            if not self.simulation_mode:
+            if not self.simulation_mode and orders:
                 # Place all orders concurrently
                 await asyncio.gather(*[self.place_order(order) for order in orders])
-            else:
+            elif orders:
                 # In simulation mode, just log the orders
                 for order in orders:
                     self.log(f"Simulated order: {order}")
