@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from numba import jit
 
+import logging
+
 debug = False
 def debug_print(*args, **kwargs):
     if debug:
@@ -144,6 +146,7 @@ class TradePosition:
     is_simulated: float = field(init=False)
     unrealized_pnl: float = field(default=0.0)
     realized_pnl: float = 0.0
+    log_level: Optional[int] = logging.INFO
     # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
     stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
     
@@ -173,7 +176,25 @@ class TradePosition:
     
     See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#margin-interest-rate
     """
+    
+    def setup_logger(self, log_level=logging.INFO):
+        logger = logging.getLogger('TradePosition')
+        logger.setLevel(log_level)
 
+        # Clear existing handlers
+        if logger.hasHandlers():
+            logger.handlers.clear()
+
+        # Add a new handler
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+        return logger
+
+    def log(self, message, level=logging.INFO):
+        self.logger.log(level, message)
     
     def __post_init__(self):
         # self.market_value = self.initial_shares * self.entry_price
@@ -183,6 +204,8 @@ class TradePosition:
         self.cash_committed = 0
         self.max_shares = self.initial_shares
         assert self.times_buying_power <= 4
+        
+        self.logger = self.setup_logger(logging.WARNING)
         
         debug_print(f'initial_shares {self.initial_shares}')
 
@@ -243,6 +266,7 @@ class TradePosition:
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
         total_shares = sum(sp.shares for sp in active_sub_positions)
+        shares_sold_per_position = []
 
         for sp in active_sub_positions:
             assert sp.shares == int(float(total_shares)/float(num_subs)), (sp.shares, total_shares, num_subs)
@@ -265,6 +289,8 @@ class TradePosition:
                 debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
                     f"Realized PnL: {sp_realized_pnl:.4f}, Cash released: {sub_cash_released:.4f}, "
                     f"Old shares: {old_shares}, New shares: {sp.shares}")
+                
+                shares_sold_per_position.append(shares_sold)
 
         self.shares -= shares_to_sell
         self.cash_committed -= cash_released
@@ -283,7 +309,7 @@ class TradePosition:
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
-        return realized_pnl, cash_released, fees
+        return realized_pnl, cash_released, fees, shares_sold_per_position
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         debug_print(f"DEBUG: partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
@@ -299,6 +325,7 @@ class TradePosition:
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
         target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
+        shares_bought_per_position = []
 
         fees = 0
         shares_added = 0
@@ -320,6 +347,8 @@ class TradePosition:
                     shares_added += shares_to_add
                     debug_print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
                         f"Cash committed: {sub_cash_committed:.4f}, Old shares: {old_shares}, New shares: {sp.shares}")
+                    
+                    shares_bought_per_position.append(shares_to_add)
             else:
                 # New sub-position
                 sub_cash_committed = (target * entry_price) / self.times_buying_power
@@ -329,6 +358,8 @@ class TradePosition:
                 shares_added += target
                 debug_print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
                     f"Cash committed: {sub_cash_committed:.4f}")
+                
+                shares_bought_per_position.append(target)
 
         self.shares += shares_added
         self.cash_committed += additional_cash_committed
@@ -350,7 +381,7 @@ class TradePosition:
         # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.4f}, "
         #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
         
-        return additional_cash_committed, fees
+        return additional_cash_committed, fees, shares_bought_per_position
 
     @staticmethod
     def calculate_num_sub_positions(times_buying_power: float) -> int:
@@ -427,10 +458,10 @@ class TradePosition:
 
         return transaction_cost
 
-    
+    # customized to specific strategy
     def update_stop_price(self, current_price: float, current_timestamp: datetime):
         # Update the bounds of the TouchArea
-        self.area.update_bounds(current_timestamp)
+        # self.area.update_bounds(current_timestamp)
         
         if self.is_long:
             self.max_price = max(self.max_price or self.entry_price, current_price)
@@ -442,7 +473,9 @@ class TradePosition:
             self.current_stop_price_2 = self.min_price + self.area.get_range*3 # simple logic for nowe
         
         self.update_market_value(current_price)
-        
+
+        self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}")
+
         return self.should_exit(current_price), self.should_exit_2(current_price)
 
     def should_exit(self, current_price: float) -> bool:
@@ -545,7 +578,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         row = {
             'date': trade.date,
             'ID': trade.id,
-
+            'AreaID': trade.area.id,
             'Type': 'Long' if trade.is_long else 'Short',
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,

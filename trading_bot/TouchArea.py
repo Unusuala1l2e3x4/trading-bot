@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from dataclasses import dataclass, field
 from bisect import bisect_right, bisect_left
 from collections import defaultdict
@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Tuple, Callable
 
 @dataclass
 class TouchArea:
-    date: datetime.date
+    date: date
     id: int
     level: float
     upper_bound: float
@@ -25,14 +25,12 @@ class TouchArea:
     calculate_bounds: Callable
     min_touches_time: datetime = field(init=False)
     entries_exits: List[tuple] = field(default_factory=list)
-    # fresh: bool = field(init=False)
         
     def __post_init__(self):
         assert self.min_touches > 1, f'{self.min_touches} > 1'
         assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
         assert len(self.valid_atr) == len(self.touches), f'{len(self.valid_atr)} == {len(self.touches)}'
         self.min_touches_time = self.initial_touches[self.min_touches - 1] if len(self.initial_touches) >= self.min_touches else None
-        # self.fresh = True
 
     def __eq__(self, other):
         if isinstance(other, TouchArea):
@@ -85,10 +83,6 @@ class TouchArea:
         
     def update_bounds(self, current_timestamp: datetime):
         current_touches = [touch for touch in self.touches if touch <= current_timestamp]
-        # if self.fresh:
-        #     print(self.id,current_timestamp,len(current_touches),self.get_range)
-        #     self.fresh = False
-            
         current_atr = self.valid_atr[:len(current_touches)]
         
         _, new_lower_bound, new_upper_bound = self.calculate_bounds(
@@ -116,14 +110,15 @@ class TouchArea:
 class TouchAreaCollection:
     def __init__(self, touch_areas, min_touches):
         self.areas_by_date = defaultdict(list)
+        self.min_touches = min_touches
         
         for area in touch_areas:
-            if len(area.touches) >= min_touches:  #
-                area_date = area.min_touches_time.date()
-                self.areas_by_date[area_date].append(area)
+            if len(area.touches) >= min_touches:
+                self.areas_by_date[area.date].append(area)
         
         for date in self.areas_by_date:
-            # Sort areas for each date by their min_touches_time, then by id
+            # Areas with earlier min_touches_time's have PRIORITY.
+            # Sort areas by min_touches_time, then by id
             self.areas_by_date[date].sort(key=lambda x: (x.min_touches_time, x.id))
 
     def get_active_areas(self, current_time: datetime):
@@ -133,11 +128,12 @@ class TouchAreaCollection:
         
         return list(takewhile(lambda area: area.min_touches_time <= current_time, 
                               self.areas_by_date[current_date]))
+        
+    # def
 
     def terminate_area(self, area: TouchArea):
-        area_date = area.min_touches_time.date()
-        if area_date in self.areas_by_date:
-            areas = self.areas_by_date[area_date]
+        if area.date in self.areas_by_date:
+            areas = self.areas_by_date[area.date]
             
             # Find the exact position of the area to remove
             index = bisect_left(areas, (area.min_touches_time, area.id), 
@@ -147,7 +143,7 @@ class TouchAreaCollection:
                 del areas[index]
             
             if not areas:
-                del self.areas_by_date[area_date]
+                del self.areas_by_date[area.date]
                     
                 
                 

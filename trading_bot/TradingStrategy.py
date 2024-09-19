@@ -110,32 +110,39 @@ class TradingStrategy:
         self.export_trades_path = export_trades_path
         self.export_graph_path = export_graph_path
         
-        self.symbol = self.touch_detection_areas.symbol
-        self.long_touch_area = self.touch_detection_areas.long_touch_area
-        self.short_touch_area = self.touch_detection_areas.short_touch_area
-        self.market_hours = self.touch_detection_areas.market_hours
-        self.bars = self.touch_detection_areas.bars
-        self.mask = self.touch_detection_areas.mask
-        self.min_touches = self.touch_detection_areas.min_touches
-        self.start_time = self.touch_detection_areas.start_time
-        self.end_time = self.touch_detection_areas.end_time
+        self.symbol = self.touch_detection_areas.symbol # not updated?
+        # self.long_touch_area = self.touch_detection_areas.long_touch_area # GETS UPDATED
+        # self.short_touch_area = self.touch_detection_areas.short_touch_area # GETS UPDATED
+        self.market_hours = self.touch_detection_areas.market_hours # not updated?
+        # self.bars = self.touch_detection_areas.bars # GETS UPDATED
+        # self.mask = self.touch_detection_areas.mask # GETS UPDATED
+        self.min_touches = self.touch_detection_areas.min_touches # not updated?
+        self.start_time = self.touch_detection_areas.start_time # not updated
+        self.end_time = self.touch_detection_areas.end_time # not updated
 
-        self.df = self.bars[self.mask].sort_index(level='timestamp')
+        self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         self.timestamps = self.df.index.get_level_values('timestamp')
         
         self.is_live_trading = is_live_trading
         
-        self.logger = self.setup_logger()
+        self.logger = self.setup_logger(logging.WARNING)
         
         self.initialize_strategy()
 
-    def setup_logger(self):
+    def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('TradingStrategy')
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(log_level)
+
+        # Clear existing handlers
+        if logger.hasHandlers():
+            logger.handlers.clear()
+
+        # Add a new handler
         handler = logging.StreamHandler()
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+
         return logger
 
     def log(self, message, level=logging.INFO):
@@ -151,7 +158,7 @@ class TradingStrategy:
         self.is_marginable = is_security_marginable(self.symbol) 
         self.is_etb = is_security_shortable_and_etb(self.symbol)
         
-        self.current_id = 0
+        self.next_position_id = 0
         self.count_entry_adjust = 0
         self.count_exit_adjust = 0
         self.count_entry_skip = 0
@@ -163,9 +170,10 @@ class TradingStrategy:
         self.day_start_time = None
         self.day_end_time = None
         self.day_soft_start_time = None
-        self.daily_data = None
-        self.daily_index = None
+        self.daily_data = None # does not affect live trading?
+        self.daily_index = None # does not affect live trading?
         self.soft_end_triggered = False
+        self.active_areas = None
         
         print(f'{self.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
@@ -175,11 +183,18 @@ class TradingStrategy:
     def initialize_touch_areas(self):
         all_touch_areas = []
         if self.params.do_longs or self.params.sim_longs:
-            all_touch_areas.extend(self.long_touch_area)
+            all_touch_areas.extend(self.touch_detection_areas.long_touch_area)
         if self.params.do_shorts or self.params.sim_shorts:
-            all_touch_areas.extend(self.short_touch_area)
-        # print(f'{len(all_touch_areas)} touch areas in TouchAreaCollection ({len(self.long_touch_area)} long, {len(self.short_touch_area)} short)')
+            all_touch_areas.extend(self.touch_detection_areas.short_touch_area)
+        # print(f'{len(all_touch_areas)} touch areas in TouchAreaCollection ({len(self.touch_detection_areas.long_touch_area)} long, {len(self.touch_detection_areas.short_touch_area)} short)')
         self.touch_area_collection = TouchAreaCollection(all_touch_areas, self.min_touches)
+
+    def update_strategy(self, touch_detection_areas: TouchDetectionAreas):
+        self.touch_detection_areas = touch_detection_areas
+        self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
+        if self.df is not None and not self.df.empty:
+            self.timestamps = self.df.index.get_level_values('timestamp')
+        self.initialize_touch_areas()
 
     def update_total_account_value(self, current_price: float, name: str):
         for position in self.open_positions.values():
@@ -213,7 +228,9 @@ class TradingStrategy:
         positions_to_remove = []
 
         for area_id, position in list(self.open_positions.items()):
-            realized_pnl, cash_released, fees = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
+            remaining_shares = position.shares
+            realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
+            assert sum(shares_per_position) == remaining_shares, (shares_per_position, remaining_shares)
             self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, exit_price)
             position.close(timestamp, exit_price)
             self.trades_executed += 1
@@ -221,14 +238,16 @@ class TradingStrategy:
                                             timestamp, exit_price)
             position.area.terminate(self.touch_area_collection)
             
-            orders.append({
-                'action': 'close',
-                'order_side': OrderSide.SELL if position.is_long else OrderSide.BUY,
-                'symbol': self.symbol,
-                'qty': position.shares,
-                'position': position
-            })
-            
+            for shares in shares_per_position:
+                orders.append({
+                    'action': 'close',
+                    'order_side': OrderSide.SELL if position.is_long else OrderSide.BUY,
+                    'symbol': self.symbol,
+                    'qty': shares,
+                    'price': exit_price,
+                    'position': position
+                })
+
             positions_to_remove.append(area_id)
 
         temp = {}
@@ -314,6 +333,8 @@ class TradingStrategy:
 
         # debug_print(f"Attempting order: {'Long' if area.is_long else 'Short'} at {area.get_buy_price:.4f}")
         # debug_print(f"  Balance: {balance:.4f}, Total Account Value: {total_account_value:.4f}")
+        
+        # area.update_bounds(timestamp)
 
         # Check if the stop buy would have executed based on high/low.
         if area.is_long:
@@ -354,7 +375,7 @@ class TradingStrategy:
         # Create the position
         position = TradePosition(
             date=timestamp.date(),
-            id=self.current_id,
+            id=self.next_position_id,
             area=area,
             is_long=area.is_long,
             entry_time=timestamp,
@@ -375,11 +396,12 @@ class TradingStrategy:
         else:
             position.is_simulated = True
 
-        cash_needed, fees = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
+        cash_needed, fees, shares_per_position = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
 
         assert estimated_entry_cost >= fees
+        assert sum(shares_per_position) == position.shares, (shares_per_position, position.shares)
         
-        self.current_id += 1
+        self.next_position_id += 1
         
         # Add to open positions (regardless if real or simulated)
         self.open_positions[area.id] = position
@@ -387,14 +409,17 @@ class TradingStrategy:
         self.rebalance(position.is_simulated, -cash_needed - fees, close_price)
             
         # return POSITION_OPENED
-        return {
-            'action': 'open',
-            'order_side': OrderSide.BUY if area.is_long else OrderSide.SELL,
-            'symbol': self.symbol,
-            'qty': position.shares,
-            'position': position
-        }
-
+        orders = []
+        for shares in shares_per_position:
+            orders.append({
+                'action': 'open',
+                'order_side': OrderSide.BUY if area.is_long else OrderSide.SELL,
+                'symbol': self.symbol,
+                'qty': shares,
+                'price': position.entry_price,
+                'position': position
+            })
+        return orders
 
 
     def calculate_exit_details(self, times_buying_power: float, shares_to_sell: int, volume: float, avg_volume: float, avg_trade_count: float, max_volume_percentage: float, min_trade_count: int):
@@ -559,16 +584,19 @@ class TradingStrategy:
                     )
                     
                     if shares_to_sell > 0:
-                        realized_pnl, cash_released, fees = position.partial_exit(timestamp, price_at_action, shares_to_sell, vwap, volume, avg_volume, self.params.slippage_factor)
+                        realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, price_at_action, shares_to_sell, vwap, volume, avg_volume, self.params.slippage_factor)
+                        assert sum(shares_per_position) == shares_to_sell, (shares_per_position, shares_to_sell)
                         self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, price_at_action)
                         
-                        orders.append({
-                            'action': 'partial_exit',
-                            'order_side': OrderSide.SELL if position.is_long else OrderSide.BUY,
-                            'symbol': self.symbol,
-                            'qty': shares_to_sell,
-                            'position': position
-                        })
+                        for shares in shares_per_position:
+                            orders.append({
+                                'action': 'close' if position.shares == 0 else 'partial_exit',
+                                'order_side': OrderSide.SELL if position.is_long else OrderSide.BUY,
+                                'symbol': self.symbol,
+                                'qty': shares,
+                                'price': price_at_action,
+                                'position': position
+                            })
                         
                         if position.shares == 0:
                             perform_exit(area_id, position, price_at_action)
@@ -597,16 +625,19 @@ class TradingStrategy:
                             self.count_entry_adjust += 1
                             
                         if not self.soft_end_triggered:
-                            cash_needed, fees = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
+                            cash_needed, fees, shares_per_position = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
+                            assert sum(shares_per_position) == shares_to_buy, (shares_per_position, shares_to_buy)
                             self.rebalance(position.is_simulated, -cash_needed - fees, price_at_action)
                             
-                            orders.append({
-                                'action': 'partial_entry',
-                                'order_side': OrderSide.BUY if position.is_long else OrderSide.SELL,
-                                'symbol': self.symbol,
-                                'qty': shares_to_buy,
-                                'position': position
-                            })
+                            for shares in shares_per_position:
+                                orders.append({
+                                    'action': 'partial_entry',
+                                    'order_side': OrderSide.BUY if position.is_long else OrderSide.SELL,
+                                    'symbol': self.symbol,
+                                    'qty': shares,
+                                    'price': price_at_action,
+                                    'position': position
+                                })
 
                             position.max_shares = max(position.max_shares, position.shares) # Update max_shares after successful partial entry
                             assert position.shares == max_shares
@@ -637,14 +668,15 @@ class TradingStrategy:
             self.day_start_time = self.day_end_time = self.day_soft_start_time = None
 
     def update_balance(self, new_balance):
-        if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent
+        if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
+        # if self.balance != new_balance:
             self.log(f"Updating balance from {self.balance:.2f} to {new_balance:.2f}")
         self.balance = new_balance
     
     def handle_new_trading_day(self, current_time):
         self.current_date = current_time.date()
         self.update_daily_parameters(self.current_date)
-        self.current_id = 0
+        self.next_position_id = 0
         self.soft_end_triggered = False
         
         if self.is_live_trading:
@@ -675,14 +707,24 @@ class TradingStrategy:
                 prev_close = self.daily_data['close'].iloc[self.daily_index - 1]
                 data = self.daily_data.iloc[self.daily_index]
                 
-                self.update_positions(current_time, data)
+                self.active_areas = self.touch_area_collection.get_active_areas(current_time)
+                update_orders = self.update_positions(current_time, data)
                 
+                new_position_order = []
                 if not self.soft_end_triggered:
-                    self.process_active_areas(current_time, data, prev_close)
-                    
+                    new_position_order = self.process_active_areas(current_time, data, prev_close)
+                
+                all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, i):
-                self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
+                all_orders = self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
                                         self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
+            else:
+                all_orders = []
+                
+            if all_orders:
+                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED")  
+                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}")
+                
             self.daily_index += 1
         
         if current_time >= self.day_end_time:
@@ -692,34 +734,57 @@ class TradingStrategy:
 
     def process_live_data(self, current_time: datetime):
         try:
+            # self.log('TEST1')
             if self.current_date is None or current_time.date() != self.current_date:
                 self.handle_new_trading_day(current_time)
             
             if not self.market_open or not self.market_close:
                 return []
-
+            
+            
+            # self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp') # done in self.update_strategy
+            # self.timestamps = self.df.index.get_level_values('timestamp') # done in self.update_strategy
+            # self.log('TEST2')
+            if self.df.empty or len(self.df) < 2: 
+                return []
+            
             latest_data = self.df.iloc[-1]
             prev_data = self.df.iloc[-2]
-            assert current_time == self.df.index.get_level_values('timestamp')[-1]
-
+            # self.daily_data = self.df
+            # self.log('TEST3')
             if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, self.daily_index):
+                assert current_time == self.df.index.get_level_values('timestamp')[-1], (current_time, self.df.index.get_level_values('timestamp')[-1])
+                
                 if self.params.soft_end_time and not self.soft_end_triggered:
                     self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
 
+                self.active_areas = self.touch_area_collection.get_active_areas(current_time)
+                area_dict = {area.id: area for area in self.active_areas}
+                
+                for area_id, position in self.open_positions.items():
+                    if area_id in area_dict:
+                        position.area = area_dict[area_id]
+                    else:
+                        self.log(f"Warning: Area {area_id} not found in active areas.")
+                        
                 update_orders = self.update_positions(current_time, latest_data)
-
-                new_position_order = None
+                
+                new_position_order = []
                 if not self.soft_end_triggered:
                     new_position_order = self.process_active_areas(current_time, latest_data, prev_data['close'])
-
-                all_orders = update_orders + ([new_position_order] if new_position_order else [])
+                
+                all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
                 all_orders = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
                                                     latest_data['volume'], latest_data['avg_volume'])
             else:
                 all_orders = []
-
-            assert self.daily_index == len(self.daily_data) - 1
+                
+            if all_orders:
+                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED")  
+                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}")
+            
+            # assert self.daily_index == len(self.daily_data) - 1
             # self.daily_index = len(self.daily_data) - 1  # Update daily_index for live trading
 
             return all_orders
@@ -728,16 +793,9 @@ class TradingStrategy:
             
 
         except Exception as e:
-            self.log(f"Error in process_live_data: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} in process_live_data: {e}", logging.ERROR)
             return []
             
-    # def can_open_new_position(self, current_time: datetime) -> bool:
-    #     # Check if we can open a new position based on time and existing positions
-    #     pass
-
-    # def should_enter_position(self, area: TouchArea) -> bool:
-    #     # Check if we should enter a position for this area
-    #     pass
 
     def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int) -> bool:
         if self.is_live_trading:
@@ -746,15 +804,6 @@ class TradingStrategy:
             return current_time >= day_end_time \
                 or df_index >= len(self.df) - 1
 
-    def get_daily_data(self, current_date):
-        daily_data = self.df[self.df.index.get_level_values('timestamp').date == current_date]
-        market_open, market_close = self.market_hours.get(current_date, (None, None))
-        if market_open and market_close:
-            day_start_time, day_end_time, day_soft_start_time = self.calculate_day_times(current_date, market_open, market_close)
-        else:
-            day_start_time = day_end_time = day_soft_start_time = None
-
-        return daily_data, market_open, market_close, day_start_time, day_end_time, day_soft_start_time
 
     def calculate_day_times(self, current_date, market_open, market_close):
         date_obj = pd.Timestamp(current_date).tz_localize(ny_tz)
@@ -786,10 +835,9 @@ class TradingStrategy:
         return False
 
     def process_active_areas(self, current_time, data, prev_close):
-        active_areas = self.touch_area_collection.get_active_areas(current_time)
         # if len(active_areas) > 0:
         #     print(current_time, len(active_areas))
-        for area in active_areas:
+        for area in self.active_areas:
             if self.balance <= 0:
                 break
             if self.open_positions:  # ensure only 1 live position at a time
@@ -799,7 +847,7 @@ class TradingStrategy:
                 new_position_order = self.place_stop_market_buy(area, current_time, data, prev_close)
                 if new_position_order:
                     return new_position_order
-        return None
+        return []
 
     def generate_backtest_results(self):
         trades = [a for a in self.trades if not a.is_simulated]
@@ -916,7 +964,7 @@ class TradingStrategy:
         if self.export_trades_path:
             export_trades_to_csv(self.trades, self.export_trades_path)
 
-        plot_cumulative_pnl_and_price(self.trades, self.bars, self.params.initial_investment, filename=self.export_graph_path)
+        plot_cumulative_pnl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
 
         # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
         #     win_trades / len(self.trades) * 100,  \
