@@ -110,13 +110,13 @@ class TradingStrategy:
         self.export_trades_path = export_trades_path
         self.export_graph_path = export_graph_path
         
-        self.symbol = self.touch_detection_areas.symbol # not updated?
+        self.symbol = self.touch_detection_areas.symbol # not updated
         # self.long_touch_area = self.touch_detection_areas.long_touch_area # GETS UPDATED
         # self.short_touch_area = self.touch_detection_areas.short_touch_area # GETS UPDATED
-        self.market_hours = self.touch_detection_areas.market_hours # not updated?
+        self.market_hours = self.touch_detection_areas.market_hours # not updated
         # self.bars = self.touch_detection_areas.bars # GETS UPDATED
         # self.mask = self.touch_detection_areas.mask # GETS UPDATED
-        self.min_touches = self.touch_detection_areas.min_touches # not updated?
+        self.min_touches = self.touch_detection_areas.min_touches # not updated
         self.start_time = self.touch_detection_areas.start_time # not updated
         self.end_time = self.touch_detection_areas.end_time # not updated
 
@@ -334,7 +334,7 @@ class TradingStrategy:
         # debug_print(f"Attempting order: {'Long' if area.is_long else 'Short'} at {area.get_buy_price:.4f}")
         # debug_print(f"  Balance: {balance:.4f}, Total Account Value: {total_account_value:.4f}")
         
-        # area.update_bounds(timestamp)
+        area.update_bounds(timestamp)
 
         # Check if the stop buy would have executed based on high/low.
         if area.is_long:
@@ -691,7 +691,7 @@ class TradingStrategy:
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
         
-        for i in tqdm(range(1, len(timestamps))):
+        for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
             current_time = timestamps[i].tz_convert(ny_tz)
             
             if self.current_date is None or current_time.date() != self.current_date:
@@ -722,8 +722,9 @@ class TradingStrategy:
                 all_orders = []
                 
             if all_orders:
-                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED")  
-                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}")
+                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED", level=logging.WARNING)  
+                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}", 
+                         level=logging.WARNING)
                 
             self.daily_index += 1
         
@@ -759,11 +760,13 @@ class TradingStrategy:
                     self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
 
                 self.active_areas = self.touch_area_collection.get_active_areas(current_time)
-                area_dict = {area.id: area for area in self.active_areas}
                 
+                # replace with recent data
+                area_dict = {area.id: area for area in self.active_areas}
                 for area_id, position in self.open_positions.items():
                     if area_id in area_dict:
                         position.area = area_dict[area_id]
+                        position.area.update_bounds(current_time)
                     else:
                         self.log(f"Warning: Area {area_id} not found in active areas.")
                         

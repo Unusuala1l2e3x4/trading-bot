@@ -461,7 +461,7 @@ class TradePosition:
     # customized to specific strategy
     def update_stop_price(self, current_price: float, current_timestamp: datetime):
         # Update the bounds of the TouchArea
-        # self.area.update_bounds(current_timestamp)
+        self.area.update_bounds(current_timestamp)
         
         if self.is_long:
             self.max_price = max(self.max_price or self.entry_price, current_price)

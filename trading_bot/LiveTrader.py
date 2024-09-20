@@ -67,7 +67,7 @@ class LiveTrader:
         self.first_streamed_timestamp = None
         self.open_positions = {}
         self.ny_tz = ZoneInfo("America/New_York")
-        self.logger = self.setup_logger(logging.WARNING)
+        self.logger = self.setup_logger(logging.INFO)
         self.simulation_mode = simulation_mode
         
     def setup_logger(self, log_level=logging.INFO):
@@ -333,19 +333,20 @@ class LiveTrader:
             orders = self.trading_strategy.process_live_data(current_time)
 
             if orders:
-                self.log(f"{len(orders)} ORDERS CREATED")  
-                
-                
+                self.log(f"{current_time}: {len(orders)} ORDERS CREATED")  
                 
                 if not self.simulation_mode:
                     # Place all orders concurrently
                     await asyncio.gather(*[self.place_order(order) for order in orders])
-                # else:
-                #     # In simulation mode, just log the orders
-                #     for order in orders:
-                #         self.log(f"Simulated order:")
-                #         self.log({k:order[k] for k in order if k != 'position'})
-            
+                else:
+                    # In simulation mode, just log the orders
+                    # for order in orders:
+                    #     self.log({k:order[k] for k in order if k != 'position'})
+
+                    self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
+                    # self.balance not updated yet
+                    
+                    
                 # if orders[0]['action'] == 'open':
                     # self.log(self.trading_strategy.df)
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing

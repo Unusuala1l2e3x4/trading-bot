@@ -282,7 +282,7 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
     touch_areas = []
     widths = []
 
-    for date, levels in tqdm(levels_by_date.items()):
+    for date, levels in tqdm(levels_by_date.items(), desc='calculate_touch_area'):
         market_open, market_close = market_hours.get(date, (None, None))
         if market_open and market_close:
             date_obj = pd.Timestamp(date).tz_localize(ny_tz)
@@ -354,9 +354,9 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                     calculate_bounds=calculate_touch_area_bounds
                 )
                 log(f"CALC   area {touch_area.id} ({touch_area.min_touches_time.time()}): get_range {touch_area.get_range:.4f}")
-                if current_timestamp is not None:
-                    touch_area.update_bounds(current_timestamp)
-                    log(f"updated to {touch_area.get_range:.4f}")
+                # if current_timestamp is not None:
+                #     touch_area.update_bounds(current_timestamp)
+                #     log(f"updated to {touch_area.get_range:.4f}")
                 touch_areas.append(touch_area)
 
     return touch_areas, widths
@@ -451,9 +451,7 @@ class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
 def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
                                    current_timestamp: Optional[datetime] = None):
-# def calculate_touch_detection_area(params: TouchDetectionParameters):
-
-    def log2(message, level=logging.INFO):
+    def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
             logger.log(level, message)
     
@@ -539,7 +537,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     else:
         raise ValueError("Invalid parameter type")
     
-    log2('Data retrieved')
+    log_live('Data retrieved')
     
     timestamps = df.index.get_level_values('timestamp')
     # print(timestamps)
@@ -565,7 +563,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True) # seems better
     # df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_median(x, weights), raw=True)
     
-    log2('ATR and MTR calculated')
+    log_live('ATR and MTR calculated')
 
     # Mean: This is more sensitive to outliers and can be useful if you want your strategy to react more quickly to sudden changes in volume or trade count.
     # Median: This is more robust to outliers and can provide a more stable measure of the typical volume or trade count, which might be preferable if you want 
@@ -585,7 +583,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     
     # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
     
-    log2('rolling averages calculated')
+    log_live('rolling averages calculated')
     
     # Group data by date
     grouped = df.groupby(timestamps.date)
@@ -598,7 +596,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     
     # high_low_diffs_list = []
     
-    for date, day_df in tqdm(grouped):
+    for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
         day_timestamps = day_df.index.get_level_values('timestamp')
         
         potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
@@ -647,11 +645,11 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             else:
                 all_support_levels[date].append(level)
 
-    log2('Levels created')
+    log_live('Levels created')
     unique_dates = list(pd.unique(timestamps.date))
     if market_hours is None:
         market_hours = get_market_hours(unique_dates)
-        log2('market hours retrieved')
+        log_live('market hours retrieved')
     
     if params.end_time:
         end_time = pd.to_datetime(params.end_time, format='%H:%M').time()
@@ -668,12 +666,12 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
         all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
         params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
     )
-    log2(f'{len(long_touch_area)} Long touch areas calculated')
+    log_live(f'{len(long_touch_area)} Long touch areas calculated')
     short_touch_area, short_widths = calculate_touch_area(
         all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
         params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
     )
-    log2(f'{len(short_touch_area)} Short touch areas calculated')
+    log_live(f'{len(short_touch_area)} Short touch areas calculated')
         
     # widths = long_widths + short_widths
 
@@ -697,7 +695,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
         mask = (timestamps >= day_start_time) & (timestamps <= day_end_time)
         final_mask |= mask
 
-    log2('Mask created')
+    log_live('Mask created')
     
     df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
 
@@ -830,7 +828,7 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                     line_data['blue_alpha'].append((x1, [area.level] * 2))
                     line_data['blue'].append((x2, [area.level] * 2))
 
-    for area in tqdm(long_touch_area + short_touch_area):
+    for area in tqdm(long_touch_area + short_touch_area, desc='plotting areas'):
         process_area(area)
 
     # Plot combined data
