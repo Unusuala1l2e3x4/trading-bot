@@ -225,7 +225,7 @@ class TradingStrategy:
     def close_all_positions(self, timestamp: datetime, exit_price: float, vwap: float, volume: float, avg_volume: float):
         # Logic for closing all positions (similar to your original function)
         orders = []
-        positions_to_remove = []
+        areas_to_remove = set()
 
         for area_id, position in list(self.open_positions.items()):
             remaining_shares = position.shares
@@ -248,16 +248,16 @@ class TradingStrategy:
                     'position': position
                 })
 
-            positions_to_remove.append(area_id)
+            areas_to_remove.add(area_id)
 
         temp = {}
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             temp[area_id] = self.open_positions[area_id]
             del self.open_positions[area_id]
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             self.exit_action(area_id, temp[area_id])
         assert not self.open_positions
-        return orders
+        return orders, areas_to_remove
 
     def calculate_position_details(self, current_price: float, times_buying_power: float, avg_volume: float, avg_trade_count: float, volume: float,
                                 max_volume_percentage: float, min_trade_count: int,
@@ -463,7 +463,7 @@ class TradingStrategy:
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
-        positions_to_remove = []
+        areas_to_remove = set()
 
         # if using trailing stops, exit_price = None
         def perform_exit(area_id, position, exit_price=None):
@@ -473,7 +473,7 @@ class TradingStrategy:
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
                                             timestamp, price)
             position.area.terminate(self.touch_area_collection)
-            positions_to_remove.append(area_id)
+            areas_to_remove.add(area_id)
             
 
         def calculate_target_shares(position: TradePosition, current_price):
@@ -651,14 +651,14 @@ class TradingStrategy:
                         position.max_shares = min(position.max_shares, position.shares) # Update max_shares when entry is skipped                       
 
         temp = {}
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             temp[area_id] = self.open_positions[area_id]
             del self.open_positions[area_id]
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             self.exit_action(area_id, temp[area_id])
         
         self.update_total_account_value(close_price, 'AFTER removing exited positions')
-        return orders
+        return orders, areas_to_remove
 
     def update_daily_parameters(self, current_date):
         self.market_open, self.market_close = self.market_hours.get(current_date, (None, None))
@@ -708,7 +708,7 @@ class TradingStrategy:
                 data = self.daily_data.iloc[self.daily_index]
                 
                 self.active_areas = self.touch_area_collection.get_active_areas(current_time)
-                update_orders = self.update_positions(current_time, data)
+                update_orders, _ = self.update_positions(current_time, data)
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
@@ -716,14 +716,15 @@ class TradingStrategy:
                 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, i):
-                all_orders = self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
+                all_orders, _ = self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
                                         self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
             else:
                 all_orders = []
                 
             if all_orders:
-                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED", level=logging.WARNING)  
-                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}", 
+                self.log(f"{current_time.strftime("%H:%M")}: Balance ${self.balance:.4f} after {len(all_orders)} orders.", level=logging.WARNING)
+                for a in all_orders:
+                    self.log(f"       {a['position'].id} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, {a['position'].area}", 
                          level=logging.WARNING)
                 
             self.daily_index += 1
@@ -753,6 +754,8 @@ class TradingStrategy:
             prev_data = self.df.iloc[-2]
             # self.daily_data = self.df
             # self.log('TEST3')
+            areas_to_remove1, areas_to_remove2 = set(), set()
+            
             if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, self.daily_index):
                 assert current_time == self.df.index.get_level_values('timestamp')[-1], (current_time, self.df.index.get_level_values('timestamp')[-1])
                 
@@ -766,11 +769,11 @@ class TradingStrategy:
                 for area_id, position in self.open_positions.items():
                     if area_id in area_dict:
                         position.area = area_dict[area_id]
-                        position.area.update_bounds(current_time)
+                        # position.area.update_bounds(current_time) # unnecessary?
                     else:
                         self.log(f"Warning: Area {area_id} not found in active areas.")
-                        
-                update_orders = self.update_positions(current_time, latest_data)
+                
+                update_orders, areas_to_remove1 = self.update_positions(current_time, latest_data)
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
@@ -778,19 +781,21 @@ class TradingStrategy:
                 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
-                all_orders = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
+                all_orders, areas_to_remove2 = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
                                                     latest_data['volume'], latest_data['avg_volume'])
             else:
                 all_orders = []
                 
             if all_orders:
-                self.log(f"{current_time}: {len(all_orders)} ORDERS CREATED")  
-                self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in all_orders]} {self.balance:.4f}")
+                self.log(f"{current_time.strftime("%H:%M")}: Balance ${self.balance:.4f} after {len(all_orders)} orders.", level=logging.WARNING)
+                for a in all_orders:
+                    self.log(f"       {a['position'].id} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, {a['position'].area}", 
+                         level=logging.WARNING)
             
             # assert self.daily_index == len(self.daily_data) - 1
             # self.daily_index = len(self.daily_data) - 1  # Update daily_index for live trading
 
-            return all_orders
+            return all_orders, areas_to_remove1 | areas_to_remove2
             # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
             # remember to Limit consecutive stop order modifications to ~80 minutes (stop changing when close price has been monotonic in favorable direction for 80 or more minutes)
             

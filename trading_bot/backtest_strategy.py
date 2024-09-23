@@ -172,7 +172,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
                 
     def close_all_positions(timestamp, exit_price, vwap, volume, avg_volume, slippage_factor):
         nonlocal trades_executed
-        positions_to_remove = []
+        areas_to_remove = []
         
         debug2_print('CLOSING ALL POSITIONS...')
 
@@ -188,13 +188,13 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
                                             timestamp, exit_price)
             position.area.terminate(touch_area_collection)
-            positions_to_remove.append(area_id)
+            areas_to_remove.append(area_id)
 
         temp = {}
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             temp[area_id] = open_positions[area_id]
             del open_positions[area_id]
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             exit_action(area_id, temp[area_id])
 
         assert not open_positions
@@ -404,7 +404,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
-        positions_to_remove = []
+        areas_to_remove = []
         # debug_print(f"\nDEBUG: Updating positions at {timestamp}, Close price: {close_price:.4f}")
 
         # if using trailing stops, exit_price = None
@@ -416,7 +416,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
                                             timestamp, price)
             position.area.terminate(touch_area_collection)
-            positions_to_remove.append(area_id)
+            areas_to_remove.append(area_id)
             
 
         def calculate_target_shares(position: TradePosition, current_price):
@@ -594,14 +594,14 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
                         count_entry_skip += 1
 
         temp = {}
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             temp[area_id] = open_positions[area_id]
             del open_positions[area_id]
-        for area_id in positions_to_remove:
+        for area_id in areas_to_remove:
             exit_action(area_id, temp[area_id])
         
         update_total_account_value(close_price, 'AFTER removing exited positions')
-        if positions_to_remove:
+        if areas_to_remove:
             debug_print(f"  Updated Total Account Value: {total_account_value:.4f}")
 
     debug_print(f"Strategy: {'Long' if do_longs else ''}{'&' if do_longs and do_shorts else ''}{'Short' if do_shorts else ''}")
@@ -675,9 +675,9 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
             if soft_end_time and not soft_end_triggered:
                 if current_time >= pd.Timestamp.combine(current_date, soft_end_time).tz_localize(ny_tz):
                     soft_end_triggered = True
-                    debug_print(f"Soft end time reached: {current_time}")
+                    debug_print(f"Soft end time reached: {current_time.strftime("%H:%M")}")
 
-            # debug_print(f"\n{current_time} - Market Open")
+            # debug_print(f"\n{current_time.strftime("%H:%M")} - Market Open")
             
             prev_close = daily_data['close'].iloc[daily_index - 1]
             data = daily_data.iloc[daily_index]
@@ -696,10 +696,10 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
                         if place_stop_market_buy(area, current_time, data, prev_close):
                             break  # Exit the loop after placing a position
         elif current_time >= day_end_time:
-            debug_print(f"\n{current_time} - Market Close")
+            debug_print(f"\n{current_time.strftime("%H:%M")} - Market Close")
             close_all_positions(current_time, df['close'].iloc[i], df['vwap'].iloc[i], df['volume'].iloc[i], df['avg_volume'].iloc[i], slippage_factor)
         elif i >= len(df)-1:
-            debug_print(f"\n{current_time} - Reached last timestamp")
+            debug_print(f"\n{current_time.strftime("%H:%M")} - Reached last timestamp")
             close_all_positions(current_time, df['close'].iloc[i], df['vwap'].iloc[i], df['volume'].iloc[i], df['avg_volume'].iloc[i], slippage_factor) # only for testing. not in live environment
             
         daily_index += 1

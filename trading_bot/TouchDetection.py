@@ -282,7 +282,8 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
     touch_areas = []
     widths = []
 
-    for date, levels in tqdm(levels_by_date.items(), desc='calculate_touch_area'):
+    # for date, levels in tqdm(levels_by_date.items(), desc='calculate_touch_area'):
+    for date, levels in levels_by_date.items():
         market_open, market_close = market_hours.get(date, (None, None))
         if market_open and market_close:
             date_obj = pd.Timestamp(date).tz_localize(ny_tz)
@@ -355,7 +356,7 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                 )
                 log(f"CALC   area {touch_area.id} ({touch_area.min_touches_time.time()}): get_range {touch_area.get_range:.4f}")
                 # if current_timestamp is not None:
-                #     touch_area.update_bounds(current_timestamp)
+                #     touch_area.update_bounds(current_timestamp)  # unnecessary?
                 #     log(f"updated to {touch_area.get_range:.4f}")
                 touch_areas.append(touch_area)
 
@@ -450,7 +451,7 @@ class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
 
 def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
-                                   current_timestamp: Optional[datetime] = None):
+                                   current_timestamp: Optional[datetime] = None, areas_to_remove: Optional[set] = {}):
     def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
             logger.log(level, message)
@@ -596,7 +597,8 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     
     # high_low_diffs_list = []
     
-    for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
+    # for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
+    for date, day_df in grouped:
         day_timestamps = day_df.index.get_level_values('timestamp')
         
         potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
@@ -624,7 +626,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
 
             if w != 0:
                 # Add this point to its own level (match by x,y in case the same x,y is already used)
-                if (x,y) not in potential_levels:
+                if (x,y) not in potential_levels and i not in areas_to_remove:
                     potential_levels[(x, y)] = Level(i, x, y, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
                 
         # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
@@ -828,7 +830,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                     line_data['blue_alpha'].append((x1, [area.level] * 2))
                     line_data['blue'].append((x2, [area.level] * 2))
 
-    for area in tqdm(long_touch_area + short_touch_area, desc='plotting areas'):
+    # for area in tqdm(long_touch_area + short_touch_area, desc='plotting areas'):
+    for area in long_touch_area + short_touch_area:
         process_area(area)
 
     # Plot combined data

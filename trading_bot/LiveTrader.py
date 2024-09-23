@@ -66,6 +66,7 @@ class LiveTrader:
         self.last_historical_timestamp = None
         self.first_streamed_timestamp = None
         self.open_positions = {}
+        self.areas_to_remove = set()
         self.ny_tz = ZoneInfo("America/New_York")
         self.logger = self.setup_logger(logging.INFO)
         self.simulation_mode = simulation_mode
@@ -104,6 +105,7 @@ class LiveTrader:
         self.gap_filled = False
         self.last_historical_timestamp = None
         self.first_streamed_timestamp = None
+        self.areas_to_remove = set()
         
         # Re-initialize historical data for the new day
         await self.initialize_data()
@@ -330,32 +332,35 @@ class LiveTrader:
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
             #     self.log(f'after mask:\n{self.trading_strategy.df}')
 
-            orders = self.trading_strategy.process_live_data(current_time)
+            orders, areas_to_remove = self.trading_strategy.process_live_data(current_time)
+            
+            self.areas_to_remove = self.areas_to_remove | areas_to_remove
 
             if orders:
-                self.log(f"{current_time}: {len(orders)} ORDERS CREATED")  
+                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
                 
-                if not self.simulation_mode:
-                    # Place all orders concurrently
-                    await asyncio.gather(*[self.place_order(order) for order in orders])
-                else:
-                    # In simulation mode, just log the orders
-                    # for order in orders:
-                    #     self.log({k:order[k] for k in order if k != 'position'})
+                # if not self.simulation_mode:
+                #     # Place all orders concurrently
+                #     await asyncio.gather(*[self.place_order(order) for order in orders])
+                # else:
+                #     # In simulation mode, just log the orders
+                #     # for order in orders:
+                #     #     self.log({k:order[k] for k in order if k != 'position'})
 
-                    self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
-                    # self.balance not updated yet
+                #     self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
+                #     # self.balance not updated yet
                     
                     
                 # if orders[0]['action'] == 'open':
                     # self.log(self.trading_strategy.df)
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
+                pass
             
         except Exception as e:
             self.log(f"Error in execute_trading_logic: {e}", logging.ERROR)
 
     def calculate_touch_detection_area(self, market_hours=None, current_timestamp=None):
-        return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp)
+        return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp, self.areas_to_remove)
 
     async def place_order(self, order):
         assert isinstance(order['qty'], int)
@@ -570,7 +575,7 @@ class LiveTrader:
         
         # Simulate each minute of the day
         for timestamp in day_data.index.get_level_values('timestamp')[2:]:
-            self.log(timestamp)
+            # self.log(timestamp)
             # Update self.data with all rows up to and including the current timestamp
             self.data = day_data.loc[day_data.index.get_level_values('timestamp') <= timestamp]
             self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
@@ -583,7 +588,7 @@ class LiveTrader:
                 sleep_interval = 0
             else:
                 sys.stdout = sys.__stdout__
-                sleep_interval = 1
+                sleep_interval = 0.3
             await asyncio.sleep(sleep_interval)
         
         self.log(f"Completed simulation for {current_date}")
