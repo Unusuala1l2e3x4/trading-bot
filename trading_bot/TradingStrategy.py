@@ -56,7 +56,9 @@ def is_security_marginable(symbol: str) -> bool:
 
 
 @jit(nopython=True)
-def is_trading_allowed(avg_trade_count, min_trade_count, avg_volume) -> bool:
+def is_trading_allowed(total_account_value, avg_trade_count, min_trade_count, avg_volume) -> bool:
+    # if total_account_value < 25000: # pdt_threshold
+    #     return False
     return avg_trade_count >= min_trade_count and avg_volume >= min_trade_count # at least 1 share per trade
 
 @jit(nopython=True)
@@ -218,9 +220,10 @@ class TradingStrategy:
         
         # Assert and debug printing logic here (similar to your original function)
 
-    def exit_action(self, area_id: int, position: TradePosition):
+    def exit_action(self, area_id: int):
         # Logic for handling position exit (similar to your original function)
-        self.trades.append(position)
+        self.trades.append(self.open_positions[area_id])
+        del self.open_positions[area_id]
         
     def close_all_positions(self, timestamp: datetime, exit_price: float, vwap: float, volume: float, avg_volume: float):
         # Logic for closing all positions (similar to your original function)
@@ -250,12 +253,8 @@ class TradingStrategy:
 
             areas_to_remove.add(area_id)
 
-        temp = {}
         for area_id in areas_to_remove:
-            temp[area_id] = self.open_positions[area_id]
-            del self.open_positions[area_id]
-        for area_id in areas_to_remove:
-            self.exit_action(area_id, temp[area_id])
+            self.exit_action(area_id)
         assert not self.open_positions
         return orders, areas_to_remove
 
@@ -263,20 +262,25 @@ class TradingStrategy:
                                 max_volume_percentage: float, min_trade_count: int,
                                 existing_sub_positions: Optional[np.ndarray] = np.array([]), target_shares: Optional[int]=None):
         # Logic for calculating position details (similar to your original function)
-        if not is_trading_allowed(avg_trade_count, min_trade_count, avg_volume):
+        if not is_trading_allowed(self.total_account_value, avg_trade_count, min_trade_count, avg_volume):
             return 0, 0, 0, 0, 0, 0, 0
         
         # when live, need to call is_security_marginable
+        # Determine initial margin requirement and calculate max leverage
         if self.params.use_margin and self.is_marginable:
-            initial_margin_requirement = 0.5
-            overall_margin_multiplier = min(times_buying_power, 4.0)
+            # Use 25% initial margin requirement for marginable securities (intraday)
+            initial_margin_requirement = 0.25  # Intraday margin requirement
+            # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
         else:
+            # Use 100% initial margin requirement for non-marginable securities or cash accounts
             initial_margin_requirement = 1.0
-            overall_margin_multiplier = min(times_buying_power, 1.0)
-            
-        actual_margin_multiplier = min(overall_margin_multiplier, 1.0/initial_margin_requirement)
+
+        # Calculate max leverage based on initial margin requirement
+        max_leverage = 1.0 / initial_margin_requirement
+        # Apply the times_buying_power constraint
+        actual_margin_multiplier = min(times_buying_power, max_leverage)
         
-        available_balance = min(self.balance, self.params.max_investment) * overall_margin_multiplier
+        available_balance = min(self.balance, self.params.max_investment) * actual_margin_multiplier
         
         current_shares = np.sum(existing_sub_positions) if existing_sub_positions is not None else 0
         if target_shares is not None:
@@ -294,8 +298,8 @@ class TradingStrategy:
             mid = (low + high) // 2
             total_shares = current_shares + mid
             invest_amount = mid * current_price
-            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, overall_margin_multiplier, existing_sub_positions)
-            if invest_amount + estimated_entry_cost * overall_margin_multiplier <= available_balance:
+            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, actual_margin_multiplier, existing_sub_positions)
+            if invest_amount + estimated_entry_cost * actual_margin_multiplier <= available_balance:
                 low = mid + 1
             else:
                 high = mid - 1
@@ -304,7 +308,7 @@ class TradingStrategy:
         max_shares = current_shares + max_additional_shares
         
         # Ensure max_shares is divisible when times_buying_power > 2
-        num_subs = TradePosition.calculate_num_sub_positions(overall_margin_multiplier)
+        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier) # Currently returns 1
         
         if num_subs > 1:
             assert self.is_marginable
@@ -314,10 +318,10 @@ class TradingStrategy:
                 max_additional_shares -= rem
 
         invest_amount = max_additional_shares * current_price
-        actual_cash_used = invest_amount / overall_margin_multiplier
-        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, overall_margin_multiplier, existing_sub_positions)
+        actual_cash_used = invest_amount / actual_margin_multiplier
+        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, actual_margin_multiplier, existing_sub_positions)
 
-        return max_shares, actual_margin_multiplier, overall_margin_multiplier, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
+        return max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
 
     def place_stop_market_buy(self, area: TouchArea, timestamp: datetime, data, prev_close: float):
@@ -325,7 +329,7 @@ class TradingStrategy:
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
-        if not is_trading_allowed(avg_trade_count, self.params.min_trade_count, avg_volume):
+        if not is_trading_allowed(self.total_account_value, avg_trade_count, self.params.min_trade_count, avg_volume):
             return NO_POSITION_OPENED
         
         if self.open_positions or self.balance <= 0:
@@ -363,7 +367,7 @@ class TradingStrategy:
         # debug3_print(f"Execution price: {execution_price:.4f}")
 
         # Calculate position size, etc...
-        max_shares, actual_margin_multiplier, overall_margin_multiplier, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount = self.calculate_position_details(
+        max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount = self.calculate_position_details(
             execution_price, self.params.times_buying_power, avg_volume, avg_trade_count, volume,
             self.params.max_volume_percentage, self.params.min_trade_count
         )
@@ -384,7 +388,7 @@ class TradingStrategy:
             entry_price=execution_price,
             use_margin=self.params.use_margin,
             is_marginable=self.is_marginable, # when live, need to call is_security_marginable
-            times_buying_power=overall_margin_multiplier,
+            times_buying_power=actual_margin_multiplier,
             actual_margin_multiplier=actual_margin_multiplier,
             current_stop_price=high_price - area.get_range if area.is_long else low_price + area.get_range,
             max_price=high_price if area.is_long else None,
@@ -423,37 +427,34 @@ class TradingStrategy:
 
 
     def calculate_exit_details(self, times_buying_power: float, shares_to_sell: int, volume: float, avg_volume: float, avg_trade_count: float, max_volume_percentage: float, min_trade_count: int):
-        # Calculate the adjustment factor
-        # adjustment = min(max(shares_to_sell / avg_volume, 0), 1)
-        
-        # Adjust min_trade_count, with a lower bound of 10% of the original value
-        # adjusted_min_trade_count = max(min_trade_count * (1 - adjustment), min_trade_count * 0.1)
-        
         # Check if trading is allowed
-        if not is_trading_allowed(avg_trade_count, min_trade_count, avg_volume):
+        if not is_trading_allowed(self.total_account_value, avg_trade_count, min_trade_count, avg_volume):
             return 0  # No trading allowed, return 0 shares to sell
         
-        # when live, need to call is_security_marginable
+        # Determine initial margin requirement and calculate max leverage
         if self.params.use_margin and self.is_marginable:
-            overall_margin_multiplier = min(times_buying_power, 4.0)
+            # Use 25% initial margin requirement for marginable securities (intraday)
+            initial_margin_requirement = 0.25  # Intraday margin requirement
+            # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
         else:
-            overall_margin_multiplier = min(times_buying_power, 1.0)
+            # Use 100% initial margin requirement for non-marginable securities or cash accounts
+            initial_margin_requirement = 1.0
 
-        # Adjust max_volume_percentage, with an upper bound of 3 times the original value
-        # adjusted_max_volume_percentage = min(max_volume_percentage * (1 + adjustment), max_volume_percentage * 3)
-        
+        max_leverage = 1.0 / initial_margin_requirement
+        actual_margin_multiplier = min(times_buying_power, max_leverage)
         max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
-
-        # Ensure we don't sell more than the available shares or the calculated max_volume_shares
         shares_to_sell = min(shares_to_sell, max_volume_shares)
-            
-        # Ensure target_shares is divisible
-        num_subs = TradePosition.calculate_num_sub_positions(overall_margin_multiplier)
-        if num_subs > 1:
+
+        # Adjust for sub-positions if necessary
+        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier)
+        if num_subs > 1 and shares_to_sell > 0:
             rem = shares_to_sell % num_subs
             if rem != 0:
                 shares_to_sell -= rem
-                
+
+        # Ensure shares_to_sell is not negative
+        shares_to_sell = max(shares_to_sell, 0)
+
         return shares_to_sell
 
 
@@ -491,6 +492,8 @@ class TradingStrategy:
             if num_subs > 1 and rem != 0:
                 assert self.is_marginable
                 target_shares -= rem
+                
+            self.log(f"{target_pct} {target_shares}", level=logging.WARNING)
             
             return target_shares
 
@@ -552,10 +555,10 @@ class TradingStrategy:
                 price_at_action = close_price
             
             # Partial exit and entry logic
-            assert target_shares <= position.initial_shares
+            assert target_shares <= position.max_shares
 
-            target_pct = target_shares / position.initial_shares
-            current_pct = min( 1.0, position.shares / position.initial_shares)
+            target_pct = target_shares / position.max_shares
+            current_pct = min( 1.0, position.shares / position.max_shares)
             assert 0.0 <= target_pct <= 1.0, target_pct
             assert 0.0 <= current_pct <= 1.0, current_pct
 
@@ -566,7 +569,8 @@ class TradingStrategy:
             if abs(target_pct - current_pct) < self.params.min_stop_dist_relative_change_for_partial:
                 self.update_total_account_value(price_at_action, 'skip')
                 continue
-
+            
+            self.log(f"")
             
             if target_shares < position.shares:
                 shares_to_adjust = position.shares - target_shares
@@ -650,12 +654,8 @@ class TradingStrategy:
                         self.count_entry_skip += 1
                         position.max_shares = min(position.max_shares, position.shares) # Update max_shares when entry is skipped                       
 
-        temp = {}
         for area_id in areas_to_remove:
-            temp[area_id] = self.open_positions[area_id]
-            del self.open_positions[area_id]
-        for area_id in areas_to_remove:
-            self.exit_action(area_id, temp[area_id])
+            self.exit_action(area_id)
         
         self.update_total_account_value(close_price, 'AFTER removing exited positions')
         return orders, areas_to_remove
@@ -691,7 +691,8 @@ class TradingStrategy:
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
         
-        for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
+        # for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
+        for i in range(1, len(timestamps)):
             current_time = timestamps[i].tz_convert(ny_tz)
             
             if self.current_date is None or current_time.date() != self.current_date:
@@ -764,7 +765,7 @@ class TradingStrategy:
 
                 self.active_areas = self.touch_area_collection.get_active_areas(current_time)
                 
-                # replace with recent data
+                # Update areas in open_positions
                 area_dict = {area.id: area for area in self.active_areas}
                 for area_id, position in self.open_positions.items():
                     if area_id in area_dict:
@@ -908,13 +909,13 @@ class TradingStrategy:
         print(f"Balance % change:   {balance_change:.4f}% ***")
         print(f"Baseline % change:  {baseline_change:.4f}%")
         print('Number of Trades Executed:', self.trades_executed)
-        print(f"\nTotal Profit/Loss (including fees): ${total_profit_loss:.4f}")
+        print(f"\nTotal Profit/Loss (after fees): ${total_profit_loss:.4f}")
         print(f"  Total Profit: ${total_profit:.4f}")
         print(f"  Total Loss:   ${total_loss:.4f}")
         print(f"Total Transaction Costs: ${total_transaction_costs:.4f}")
-        print(f"\nBorrow Fees: ${total_stock_borrow_costs:.4f}")
-        print(f"Average Profit/Loss per Trade (including fees): ${mean_profit_loss:.4f}")
+        print(f"  Borrow Fees: ${total_stock_borrow_costs:.4f}")
         
+        print(f"\nAverage Profit/Loss per Trade (after fees): ${mean_profit_loss:.4f}")
 
         # Create Series for different trade categories
         trade_categories = {

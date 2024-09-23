@@ -31,25 +31,20 @@ FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
 # subject to change
 @jit(nopython=True)
 def calculate_num_sub_positions(times_buying_power: float) -> int:
-    if times_buying_power <= 2:
-        return 1
-    else:
-        return 2  # Use 2 sub-positions when times_buying_power > 2
-    # If capital is much higher, more sub-positions (and distribution among multiple symbols) may be needed to reduce slippage.
+    # For now, always return 1
+    return 1
+    # In the future, you can modify this to return different numbers based on times_buying_power
 
 @jit(nopython=True)
 def calculate_shares_per_sub(total_shares: int, num_subs: int) -> np.ndarray:
     if num_subs <= 0:
         return np.empty(0, dtype=np.int32)  # Return an empty array instead of raising an exception
     
-    # Ensure divisible by num_subs
-    adjusted_total_shares = total_shares - (total_shares % num_subs)
-    shares_per_sub = adjusted_total_shares // num_subs
-    
-    # Create the shares distribution array
-    shares_distribution = np.full(num_subs, shares_per_sub, dtype=np.int32)
-    
-    return shares_distribution
+    # Distribute shares evenly among sub-positions
+    shares_per_sub = total_shares // num_subs
+    assert total_shares % num_subs == 0
+
+    return np.full(num_subs, shares_per_sub, dtype=np.int32)
 
 @jit(nopython=True)
 def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: np.ndarray = np.array([])) -> float:
@@ -58,15 +53,12 @@ def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_s
     
     total_cost = 0.0
     
-    if existing_sub_positions.size > 0:  # Check if the array is not empty
+    if existing_sub_positions.size > 0:
         for i in range(num_subs):
             target = target_shares[i]
-            if i < len(existing_sub_positions):
-                shares_to_add = max(0, target - existing_sub_positions[i])
-                finra_taf = min(FINRA_TAF_RATE * shares_to_add, FINRA_TAF_MAX)
-            else:
-                shares_to_add = target
-                finra_taf = min(FINRA_TAF_RATE * shares_to_add, FINRA_TAF_MAX)
+            existing = existing_sub_positions[i] if i < len(existing_sub_positions) else 0
+            shares_to_add = max(0, target - existing)
+            finra_taf = min(FINRA_TAF_RATE * shares_to_add, FINRA_TAF_MAX)
             total_cost += finra_taf
     else:
         for i in range(num_subs):

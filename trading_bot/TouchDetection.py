@@ -354,7 +354,7 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                     multiplier=multiplier,
                     calculate_bounds=calculate_touch_area_bounds
                 )
-                log(f"CALC   area {touch_area.id} ({touch_area.min_touches_time.time()}): get_range {touch_area.get_range:.4f}")
+                # log(f"CALC   area {touch_area.id} ({touch_area.min_touches_time.time()}): get_range {touch_area.get_range:.4f}")
                 # if current_timestamp is not None:
                 #     touch_area.update_bounds(current_timestamp)  # unnecessary?
                 #     log(f"updated to {touch_area.get_range:.4f}")
