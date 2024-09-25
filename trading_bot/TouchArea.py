@@ -7,11 +7,37 @@ from numba import jit
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Callable
 
+import logging
+def setup_logger(log_level=logging.INFO):
+    logger = logging.getLogger('TouchArea')
+    logger.setLevel(log_level)
+
+    # Clear existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Add a new handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+logger = setup_logger(logging.INFO)
+
+def log(message, level=logging.INFO):
+    logger.log(level, message)
+
+
+
 @dataclass
 class TouchArea:
     date: date
     id: int # if id is smaller, the first price in the level is earlier in the day
     level: float
+    lmin: float
+    lmax: float
     upper_bound: float
     lower_bound: float
     initial_touches: List[datetime] # should be sorted
@@ -85,9 +111,9 @@ class TouchArea:
     def get_range(self) -> float:
         return self.upper_bound - self.lower_bound
     
-    def terminate(self, touch_area_collection):
-        # print(self.id,self.entries_exits[0][2],len([touch for touch in self.touches if touch <= self.entries_exits[0][2]]),self.get_range,'\n')
-        touch_area_collection.terminate_area(self)
+    # def terminate(self, touch_area_collection):
+    #     # print(self.id,self.entries_exits[0][2],len([touch for touch in self.touches if touch <= self.entries_exits[0][2]]),self.get_range,'\n')
+    #     touch_area_collection.terminate_area(self)
     
     def current_touches(self, current_timestamp: datetime):
         return [touch for touch in self.touches if touch <= current_timestamp]
@@ -108,10 +134,20 @@ class TouchArea:
             self.upper_bound = new_upper_bound
             # print(self.id,current_timestamp,len(self.current_touches(current_timestamp)),self.get_range)
 
+    @staticmethod
+    def print_areas_list(arr):
+        k = lambda x: (x.lmin, x.level, x.lmax, x.id)
+        ret = [f'Printing list of {len(arr)} areas...']
+        for area in sorted(arr, key=k):
+            ret.append(f"{area}")
         
+        log('\n\t'.join(ret))
+        
+            
     # @property
     def __str__(self):
-        return (f"{'Long ' if self.is_long else 'Short'} TouchArea {self.id}: Level={self.level:.4f}, "
+        print('')
+        return (f"{'Long ' if self.is_long else 'Short'} TouchArea {self.id}: Level={self.level:.4f} ({self.lmin:.4f},{self.lmax:.4f}), "
                 f"Bounds={self.lower_bound:.4f}-{self.upper_bound:.4f}= {self.get_range:.4f}, initial touches [{" ".join([a.time().strftime("%H:%M") for a in self.initial_touches])}]"
                 # f"Num Touches={len(self.touches)}"
                 # f"Profit={self.calculate_profit:.4f}"
@@ -122,6 +158,9 @@ class TouchAreaCollection:
     def __init__(self, touch_areas, min_touches):
         self.areas_by_date = defaultdict(list)
         self.min_touches = min_touches
+        self.active_date = None
+        self.active_date_areas = list()
+        self.terminated_date_areas = list()
         
         for area in touch_areas:
             if area.min_touches_time is not None:
@@ -130,7 +169,9 @@ class TouchAreaCollection:
         for date in self.areas_by_date:
             self.areas_by_date[date].sort(key=self.area_sort_key)
 
-
+    def get_all_areas(self, date: date):
+        return self.areas_by_date[date]
+    
     # Areas with earlier min_touches_time's have PRIORITY.
     # Secondarily, areas that have existed for longer have priority (earlier first initial touch)
     # Lastly by id, just in case
@@ -140,26 +181,40 @@ class TouchAreaCollection:
 
     
     def get_active_areas(self, current_time: datetime):
-        current_date = current_time.date()
-        if current_date not in self.areas_by_date:
-            return []
+        try:
+            current_date = current_time.date()
+            if current_date not in self.areas_by_date:
+                # log(f"1 {current_date} {current_time}")
+                self.active_date = None
+                self.active_date_areas = list()
+                self.terminated_date_areas = list()
+                return list()
+            
+            if self.active_date is None or self.active_date != current_date: # change the date and get areas in that date
+                # log(f"2 {current_date} {current_time}")
+                self.active_date = current_date
+                self.active_date_areas = list(self.areas_by_date[self.active_date])
+                self.terminated_date_areas = list()
+            
+            return list(takewhile(lambda area: area.min_touches_time <= current_time, self.active_date_areas)) # to enable area terminations without deleting the data
+        except Exception as e:
+            log(f"{type(e).__qualname__} in get_active_areas at {current_time}: {e}", logging.ERROR)
+            raise e
         
-        return list(takewhile(lambda area: area.min_touches_time <= current_time, 
-                              self.areas_by_date[current_date]))
-
     def terminate_area(self, area: TouchArea):
-        if area.date in self.areas_by_date:
-            areas = self.areas_by_date[area.date]
+        try:
+            
+            assert self.active_date is not None, (self.active_date, area.date)
+            assert area.date == self.active_date, (area.date, self.active_date)
             
             # Find the exact position of the area to remove
-            index = bisect_left(areas, self.area_sort_key(area),
+            index = bisect_left(self.active_date_areas, self.area_sort_key(area),
                                 key=self.area_sort_key)
             
-            if index < len(areas) and areas[index].id == area.id:
-                del areas[index]
-            
-            if not areas:
-                del self.areas_by_date[area.date]
-                    
-                
-                
+            if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+                self.terminated_date_areas.append(self.active_date_areas[index])
+                del self.active_date_areas[index]
+
+        except Exception as e:
+            log(f"{type(e).__qualname__} in terminate_area: {e}", logging.ERROR)
+            raise e

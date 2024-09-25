@@ -51,7 +51,7 @@ def is_security_marginable(symbol: str) -> bool:
         asset = trading_client.get_asset(symbol)
         return asset.marginable
     except Exception as e:
-        print(f"Error checking marginability for {symbol}: {e}")
+        print(f"{type(e).__qualname__} while checking marginability for {symbol}: {e}")
         return False
 
 
@@ -175,7 +175,6 @@ class TradingStrategy:
         self.daily_data = None # does not affect live trading?
         self.daily_index = None # does not affect live trading?
         self.soft_end_triggered = False
-        self.active_areas = None
         
         print(f'{self.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
@@ -228,7 +227,7 @@ class TradingStrategy:
     def close_all_positions(self, timestamp: datetime, exit_price: float, vwap: float, volume: float, avg_volume: float):
         # Logic for closing all positions (similar to your original function)
         orders = []
-        areas_to_remove = set()
+        area_ids_to_remove = set()
 
         for area_id, position in list(self.open_positions.items()):
             remaining_shares = position.shares
@@ -239,7 +238,8 @@ class TradingStrategy:
             self.trades_executed += 1
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
                                             timestamp, exit_price)
-            position.area.terminate(self.touch_area_collection)
+            # position.area.terminate(self.touch_area_collection)
+            self.touch_area_collection.terminate_area(position.area)
             
             for shares in shares_per_position:
                 orders.append({
@@ -251,12 +251,12 @@ class TradingStrategy:
                     'position': position
                 })
 
-            areas_to_remove.add(area_id)
+            area_ids_to_remove.add(area_id)
 
-        for area_id in areas_to_remove:
+        for area_id in area_ids_to_remove:
             self.exit_action(area_id)
-        assert not self.open_positions
-        return orders, areas_to_remove
+        assert not self.open_positions, self.open_positions
+        return orders, area_ids_to_remove
 
     def calculate_position_details(self, current_price: float, times_buying_power: float, avg_volume: float, avg_trade_count: float, volume: float,
                                 max_volume_percentage: float, min_trade_count: int,
@@ -284,7 +284,7 @@ class TradingStrategy:
         
         current_shares = np.sum(existing_sub_positions) if existing_sub_positions is not None else 0
         if target_shares is not None:
-            assert target_shares > current_shares
+            assert target_shares > current_shares, (target_shares, current_shares)
         max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
             
         max_additional_shares = min(
@@ -311,7 +311,7 @@ class TradingStrategy:
         num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier) # Currently returns 1
         
         if num_subs > 1:
-            assert self.is_marginable
+            assert self.is_marginable, self.is_marginable
             rem = max_shares % num_subs
             if rem != 0:
                 max_shares -= rem
@@ -389,7 +389,7 @@ class TradingStrategy:
             use_margin=self.params.use_margin,
             is_marginable=self.is_marginable, # when live, need to call is_security_marginable
             times_buying_power=actual_margin_multiplier,
-            actual_margin_multiplier=actual_margin_multiplier,
+            # actual_margin_multiplier=actual_margin_multiplier,
             current_stop_price=high_price - area.get_range if area.is_long else low_price + area.get_range,
             max_price=high_price if area.is_long else None,
             min_price=low_price if not area.is_long else None
@@ -402,7 +402,7 @@ class TradingStrategy:
 
         cash_needed, fees, shares_per_position = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
 
-        assert estimated_entry_cost >= fees
+        assert estimated_entry_cost >= fees, (estimated_entry_cost, fees)
         assert sum(shares_per_position) == position.shares, (shares_per_position, position.shares)
         
         self.next_position_id += 1
@@ -464,7 +464,7 @@ class TradingStrategy:
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
-        areas_to_remove = set()
+        area_ids_to_remove = set()
 
         # if using trailing stops, exit_price = None
         def perform_exit(area_id, position, exit_price=None):
@@ -473,8 +473,9 @@ class TradingStrategy:
             self.trades_executed += 1
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
                                             timestamp, price)
-            position.area.terminate(self.touch_area_collection)
-            areas_to_remove.add(area_id)
+            # position.area.terminate(self.touch_area_collection)
+            self.touch_area_collection.terminate_area(position.area)
+            area_ids_to_remove.add(area_id)
             
 
         def calculate_target_shares(position: TradePosition, current_price):
@@ -490,11 +491,8 @@ class TradingStrategy:
                 
             # Ensure target_shares is divisible
             if num_subs > 1 and rem != 0:
-                assert self.is_marginable
+                assert self.is_marginable, self.is_marginable
                 target_shares -= rem
-                
-            self.log(f"{target_pct} {target_shares}", level=logging.WARNING)
-            
             return target_shares
 
         orders = []
@@ -549,13 +547,13 @@ class TradingStrategy:
                     
                 
             if price_at_action:
-                assert target_shares == 0
+                assert target_shares == 0, target_shares
             
             if not price_at_action:
                 price_at_action = close_price
             
             # Partial exit and entry logic
-            assert target_shares <= position.max_shares
+            assert target_shares <= position.max_shares, (target_shares, position.max_shares)
 
             target_pct = target_shares / position.max_shares
             current_pct = min( 1.0, position.shares / position.max_shares)
@@ -644,21 +642,21 @@ class TradingStrategy:
                                 })
 
                             position.max_shares = max(position.max_shares, position.shares) # Update max_shares after successful partial entry
-                            assert position.shares == max_shares
+                            assert position.shares == max_shares, (position.shares, max_shares)
                             
                         else:
                             position.max_shares = max(position.max_shares, position.shares + shares_to_buy)
-                            assert position.shares + shares_to_buy == max_shares
+                            assert position.shares + shares_to_buy == max_shares, (position.shares, shares_to_buy, max_shares)
       
                     else:
                         self.count_entry_skip += 1
                         position.max_shares = min(position.max_shares, position.shares) # Update max_shares when entry is skipped                       
 
-        for area_id in areas_to_remove:
+        for area_id in area_ids_to_remove:
             self.exit_action(area_id)
         
         self.update_total_account_value(close_price, 'AFTER removing exited positions')
-        return orders, areas_to_remove
+        return orders, area_ids_to_remove
 
     def update_daily_parameters(self, current_date):
         self.market_open, self.market_close = self.market_hours.get(current_date, (None, None))
@@ -686,7 +684,7 @@ class TradingStrategy:
             self.daily_data = self.df[self.df.index.get_level_values('timestamp').date == self.current_date]
             self.daily_index = 1  # Start from index 1 in backtesting
 
-        assert not self.open_positions
+        assert not self.open_positions, self.open_positions
         
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
@@ -708,7 +706,7 @@ class TradingStrategy:
                 prev_close = self.daily_data['close'].iloc[self.daily_index - 1]
                 data = self.daily_data.iloc[self.daily_index]
                 
-                self.active_areas = self.touch_area_collection.get_active_areas(current_time)
+                self.touch_area_collection.get_active_areas(current_time)
                 update_orders, _ = self.update_positions(current_time, data)
                 
                 new_position_order = []
@@ -717,6 +715,7 @@ class TradingStrategy:
                 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, i):
+                self.touch_area_collection.get_active_areas(current_time)
                 all_orders, _ = self.close_all_positions(current_time, self.df['close'].iloc[i], self.df['vwap'].iloc[i], 
                                         self.df['volume'].iloc[i], self.df['avg_volume'].iloc[i])
             else:
@@ -731,42 +730,45 @@ class TradingStrategy:
             self.daily_index += 1
         
         if current_time >= self.day_end_time:
-            assert not self.open_positions
+            assert not self.open_positions, self.open_positions
 
+        # self.log(f"Printing areas for {current_time.date()}", level=logging.WARNING)
+        # TouchArea.print_areas_list(self.touch_area_collection.active_date_areas) # print if in log level
+        # print(sorted([x.id for x in self.touch_area_collection.terminated_date_areas]))
+        # TouchArea.print_areas_list(self.touch_area_collection.terminated_date_areas) # print if in log level
+            
         return self.generate_backtest_results()
 
-    def process_live_data(self, current_time: datetime):
+    def process_live_data(self, current_time: datetime) -> Tuple[list, set]:
         try:
             # self.log('TEST1')
             if self.current_date is None or current_time.date() != self.current_date:
                 self.handle_new_trading_day(current_time)
             
             if not self.market_open or not self.market_close:
-                return []
+                return [], set()
             
             
             # self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp') # done in self.update_strategy
             # self.timestamps = self.df.index.get_level_values('timestamp') # done in self.update_strategy
             # self.log('TEST2')
             if self.df.empty or len(self.df) < 2: 
-                return []
+                return [], set()
             
             latest_data = self.df.iloc[-1]
             prev_data = self.df.iloc[-2]
             # self.daily_data = self.df
             # self.log('TEST3')
-            areas_to_remove1, areas_to_remove2 = set(), set()
-            
+            area_ids_to_remove1, area_ids_to_remove2 = set(), set()
+
             if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, self.daily_index):
                 assert current_time == self.df.index.get_level_values('timestamp')[-1], (current_time, self.df.index.get_level_values('timestamp')[-1])
                 
                 if self.params.soft_end_time and not self.soft_end_triggered:
                     self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
 
-                self.active_areas = self.touch_area_collection.get_active_areas(current_time)
-                
-                # Update areas in open_positions
-                area_dict = {area.id: area for area in self.active_areas}
+                self.touch_area_collection.get_active_areas(current_time)
+                area_dict = {area.id: area for area in self.touch_area_collection.active_date_areas}
                 for area_id, position in self.open_positions.items():
                     if area_id in area_dict:
                         position.area = area_dict[area_id]
@@ -774,7 +776,7 @@ class TradingStrategy:
                     else:
                         self.log(f"Warning: Area {area_id} not found in active areas.")
                 
-                update_orders, areas_to_remove1 = self.update_positions(current_time, latest_data)
+                update_orders, area_ids_to_remove1 = self.update_positions(current_time, latest_data)
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
@@ -782,7 +784,16 @@ class TradingStrategy:
                 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
-                all_orders, areas_to_remove2 = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
+                self.touch_area_collection.get_active_areas(current_time)
+                area_dict = {area.id: area for area in self.touch_area_collection.get_active_areas(current_time)}
+                for area_id, position in self.open_positions.items():
+                    if area_id in area_dict:
+                        position.area = area_dict[area_id]
+                        # position.area.update_bounds(current_time) # unnecessary?
+                    else:
+                        self.log(f"Warning: Area {area_id} not found in active areas.")
+                        
+                all_orders, area_ids_to_remove2 = self.close_all_positions(current_time, latest_data['close'], latest_data['vwap'], 
                                                     latest_data['volume'], latest_data['avg_volume'])
             else:
                 all_orders = []
@@ -796,14 +807,14 @@ class TradingStrategy:
             # assert self.daily_index == len(self.daily_data) - 1
             # self.daily_index = len(self.daily_data) - 1  # Update daily_index for live trading
 
-            return all_orders, areas_to_remove1 | areas_to_remove2
+            return all_orders, area_ids_to_remove1 | area_ids_to_remove2
             # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
             # remember to Limit consecutive stop order modifications to ~80 minutes (stop changing when close price has been monotonic in favorable direction for 80 or more minutes)
             
 
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in process_live_data: {e}", logging.ERROR)
-            return []
+            self.log(f"{type(e).__qualname__} in process_live_data at {current_time}: {e}", logging.ERROR)
+            raise Exception( e.args )
             
 
     def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int) -> bool:
@@ -846,7 +857,10 @@ class TradingStrategy:
     def process_active_areas(self, current_time, data, prev_close):
         # if len(active_areas) > 0:
         #     print(current_time, len(active_areas))
-        for area in self.active_areas:
+        for area in self.touch_area_collection.active_date_areas:
+            if area.min_touches_time is None or area.min_touches_time > current_time:
+                continue
+            
             if self.balance <= 0:
                 break
             if self.open_positions:  # ensure only 1 live position at a time
@@ -965,7 +979,7 @@ class TradingStrategy:
         print(f"\nMargin Usage:")
         print(f"Margin Enabled: {'Yes' if self.params.use_margin else 'No'}")
         print(f"Max Buying Power: {self.params.times_buying_power}x")
-        print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in trades) / len(self.trades):.4f}x")
+        # print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in trades) / len(self.trades):.4f}x")
         print(f"Average Sub Positions per Position: {avg_sub_pos:.4f}")
         print(f"Average Transactions per Position: {avg_transact:.4f}")
         

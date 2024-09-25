@@ -53,7 +53,7 @@ trading_client = TradingClient(API_KEY, API_SECRET)
 
 
 def setup_logger(log_level=logging.INFO):
-    logger = logging.getLogger('TradePosition')
+    logger = logging.getLogger('TouchDetection')
     logger.setLevel(log_level)
 
     # Clear existing handlers
@@ -99,7 +99,7 @@ def get_market_hours(dates: List[date]) -> Dict[date, Tuple[datetime, datetime]]
 
 
 
-def calculate_dynamic_levels(df:pd.DataFrame, ema_short=9, ema_long=20):
+def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
     """
     Calculate VWAP and EMAs for the dataframe.
     
@@ -159,7 +159,6 @@ def calculate_dynamic_levels(df:pd.DataFrame, ema_short=9, ema_long=20):
         adjust=True
     ).mean()
     df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
-    df['is_res'] = df['close'] > df['central_value']
 
 
 def fill_missing_data(df):
@@ -180,7 +179,7 @@ def fill_missing_data(df):
     df['volume'] = df['volume'].fillna(0)
     df['trade_count'] = df['trade_count'].fillna(0)
 
-    # VWAP remains NaN where missing
+    # VWAP remains NaN where missing (may need to be calculated later if new functionality requires it)
     
     return df
 
@@ -188,8 +187,8 @@ def fill_missing_data(df):
 @dataclass
 class Level:
     id: int
-    x: float
-    y: float
+    lmin: float
+    lmax: float
     level: float
     is_res: bool
     touches: List[datetime]
@@ -245,7 +244,7 @@ def calculate_touch_area_bounds(atr_values, level, is_long, touch_area_width_agg
     return touch_area_width, touch_area_low, touch_area_high
 
 @jit(nopython=True)
-def process_touches(touches, prices, atrs, level, level_low, level_high, is_long, min_touches, touch_area_width_agg, multiplier):
+def process_touches(touches, prices, atrs, level, lmin, lmax, is_long, min_touches, touch_area_width_agg, multiplier):
     consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
     count, width = 0, 0
     prev_price = None
@@ -256,7 +255,7 @@ def process_touches(touches, prices, atrs, level, level_low, level_high, is_long
                     ((prev_price < level <= price) or (prev_price > level >= price)) or 
                     (price == level))
         
-        if level_low <= price <= level_high:
+        if lmin <= price <= lmax:
             if is_touch:
                 # Update bounds after each touch
                 width, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
@@ -328,8 +327,8 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                 valid_prices,
                 valid_atr,
                 level.level, 
-                level.x,
-                level.y, 
+                level.lmin,
+                level.lmax, 
                 is_long, 
                 min_touches,
                 touch_area_width_agg,
@@ -342,6 +341,8 @@ def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_
                     date=date,
                     id=level.id, # unique since each level has unique INITIAL touch time, and at most 1 TouchArea is created per level
                     level=level.level, # use just the value
+                    lmin=level.lmin,
+                    lmax=level.lmax,
                     upper_bound=touch_area_high,
                     lower_bound=touch_area_low,
                     initial_touches=consecutive_touches,
@@ -448,6 +449,7 @@ class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
     pass  # This class doesn't need any additional parameters
 
 
+test = {538,551,421,419,664}
 
 def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
@@ -515,14 +517,13 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
                 end=params.end_date.tz_convert('UTC'),
                 adjustment=Adjustment.ALL,
             )
-            bars = client.get_stock_bars(request_params)
-            df = bars.df
+            df = client.get_stock_bars(request_params).df
             df.index = df.index.set_levels(
                 df.index.get_level_values('timestamp').tz_convert(ny_tz),
                 level='timestamp'
             )
-            df = fill_missing_data(df)
             df.sort_index(inplace=True)
+            df = fill_missing_data(df)
             
             # Save the DataFrame to a CSV file inside a ZIP file
             if params.export_bars_path:
@@ -538,187 +539,189 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
     else:
         raise ValueError("Invalid parameter type")
     
-    log_live('Data retrieved')
-    
-    timestamps = df.index.get_level_values('timestamp')
-    # print(timestamps)
-    # print(df.columns)
-    # print(df.dtypes)
-    # print(df)
-    
-    # calculate_dynamic_levels(df, ema_short=9, ema_long=30) # default
-    calculate_dynamic_levels(df)
-
-    # Calculate True Range (TR)
-    df['H-L'] = df['high'] - df['low']
-    df['H-PC'] = np.abs(df['high'] - df['close'].shift(1))
-    df['L-PC'] = np.abs(df['low'] - df['close'].shift(1))
-    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-    
-    # apply time decay for certain aggregations
-    weights = create_weights(window_size=params.atr_period, decay_rate=params.rolling_avg_decay_rate)
-    
-    # df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
-    df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # seems better
-
-    df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True) # seems better
-    # df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_median(x, weights), raw=True)
-    
-    log_live('ATR and MTR calculated')
-
-    # Mean: This is more sensitive to outliers and can be useful if you want your strategy to react more quickly to sudden changes in volume or trade count.
-    # Median: This is more robust to outliers and can provide a more stable measure of the typical volume or trade count, which might be preferable if you want 
-    # your strategy to be less affected by occasional spikes in activity.
-    
-    # Calculate rolling average volume and trade count
-    df['shares_per_trade'] = df['volume'] / df['trade_count']
-    
-    
-    df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
-    # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
-    # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
-
-    df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
-    # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
-    # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
-    
-    # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
-    
-    log_live('rolling averages calculated')
-    
-    # Group data by date
-    grouped = df.groupby(timestamps.date)
-    
-    all_support_levels = defaultdict(list)
-    all_resistance_levels = defaultdict(list)
-
-    # def is_res_area(index, day_df):
-    #     return day_df.loc[index, 'close'] > day_df.loc[index, 'central_value']
-    
-    # high_low_diffs_list = []
-    
-    # for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
-    for date, day_df in grouped:
-        day_timestamps = day_df.index.get_level_values('timestamp')
+    try:
+        log_live('Data retrieved')
         
-        potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
+        timestamps = df.index.get_level_values('timestamp')
+        # print(timestamps)
+        # print(df.columns)
+        # print(df.dtypes)
+        # print(df)
         
-        high_low_diffs = [] # only consider the diffs in the current day
-        
-        for i in range(len(day_df)):
-            row = day_df.iloc[i]
-            if row['volume'] <= 0 or row['trade_count'] <= 0:
-                continue
-            
-            high, low, close = row['high'], row['low'], row['close']
-            timestamp = day_timestamps[i]
-            is_res = row['is_res']
-            
-            high_low_diffs.append(high - low)
-            
-            w = np.median(high_low_diffs) / 2
-            x, y = close - w, close + w
-            
-            # Check if this point falls within any existing levels
-            for level in potential_levels.values():
-                if level.x <= close <= level.y and level.is_res == is_res:
-                    level.touches.append(timestamp)
+        # calculate_dynamic_central_value(df, ema_short=9, ema_long=30) # default
+        calculate_dynamic_central_value(df)
+        df['is_res'] = df['close'] >= df['central_value']
 
-            if w != 0:
-                # Add this point to its own level (match by x,y in case the same x,y is already used)
-                if (x,y) not in potential_levels and i not in areas_to_remove:
-                    potential_levels[(x, y)] = Level(i, x, y, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
+        # Calculate True Range (TR)
+        df['H-L'] = df['high'] - df['low']
+        df['H-PC'] = np.abs(df['high'] - df['close'].shift(1))
+        df['L-PC'] = np.abs(df['low'] - df['close'].shift(1))
+        df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        
+        # apply time decay for certain aggregations
+        weights = create_weights(window_size=params.atr_period, decay_rate=params.rolling_avg_decay_rate)
+        
+        # df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+        df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # seems better
+
+        df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True) # seems better
+        # df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_median(x, weights), raw=True)
+        
+        log_live('ATR and MTR calculated')
+
+        # Mean: This is more sensitive to outliers and can be useful if you want your strategy to react more quickly to sudden changes in volume or trade count.
+        # Median: This is more robust to outliers and can provide a more stable measure of the typical volume or trade count, which might be preferable if you want 
+        # your strategy to be less affected by occasional spikes in activity.
+        
+        # Calculate rolling average volume and trade count
+        df['shares_per_trade'] = df['volume'] / df['trade_count']
+        
+        
+        df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
+        # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
+        # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+
+        df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
+        # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
+        # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+        
+        # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
+        
+        log_live('rolling averages calculated')
+        
+        # Group data by date
+        grouped = df.groupby(timestamps.date)
+        
+        all_support_levels = defaultdict(list)
+        all_resistance_levels = defaultdict(list)
+
+        # def is_res_area(index, day_df):
+        #     return day_df.loc[index, 'close'] > day_df.loc[index, 'central_value']
+        
+        # high_low_diffs_list = []
+        
+        # for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
+        for date, day_df in grouped:
+            day_timestamps = day_df.index.get_level_values('timestamp')
+            
+            potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
+            
+            high_low_diffs = [] # only consider the diffs in the current day
+            
+            for i in range(len(day_df)):
+                row = day_df.iloc[i]
+                if row['volume'] <= 0 or row['trade_count'] <= 0:
+                    continue
                 
-        # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
-        # a['date'] = date
-        # high_low_diffs_list.append(a)
-        # print(a)
-        
-        # Filter for strong levels (or filter in the next loop)
-        # strong_levels = [level for level in potential_levels.values() if len(level.touches) >= params.min_touches]
-        
-        # Classify levels as support or resistance
-        # Filter for strong levels
-        for level in potential_levels.values():
-            if len(level.touches) < params.min_touches: # not strong level
-                continue
-            if level.is_res:
-                all_resistance_levels[date].append(level)
-            else:
-                all_support_levels[date].append(level)
+                high, low, close = row['high'], row['low'], row['close']
+                timestamp = day_timestamps[i]
+                is_res = row['is_res']
+                
+                high_low_diffs.append(high - low)
+                
+                w = np.median(high_low_diffs) / 2
+                lmin, lmax = close - w, close + w
+                
+                # Check if this point falls within any existing levels
+                for level in potential_levels.values():
+                    if level.lmin <= close <= level.lmax and level.is_res == is_res:
+                        level.touches.append(timestamp)
 
-    log_live('Levels created')
-    unique_dates = list(pd.unique(timestamps.date))
-    if market_hours is None:
-        market_hours = get_market_hours(unique_dates)
-        log_live('market hours retrieved')
-    
-    if params.end_time:
-        end_time = pd.to_datetime(params.end_time, format='%H:%M').time()
-    else:
-        end_time = None
-    if params.start_time:
-        start_time = pd.to_datetime(params.start_time, format='%H:%M').time()
-    else:
-        start_time = None
-    
-    # print(start_time, end_time)
-    
-    long_touch_area, long_widths = calculate_touch_area(
-        all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
-        params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
-    )
-    log_live(f'{len(long_touch_area)} Long touch areas calculated')
-    short_touch_area, short_widths = calculate_touch_area(
-        all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
-        params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
-    )
-    log_live(f'{len(short_touch_area)} Short touch areas calculated')
-        
-    # widths = long_widths + short_widths
+                if w != 0 and i not in potential_levels:
+                    # Add this point to its own level (match by lmin, lmax in case the same lmin, lmax is already used)
+                    potential_levels[i] = Level(i, lmin, lmax, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
+            
+            if date in areas_to_remove:
+                for i in areas_to_remove[date]:
+                    del potential_levels[i]
+                    
+            # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
+            # a['date'] = date
+            # high_low_diffs_list.append(a)
+            # print(a)
 
-    # might not need to mask out before market_open
-    final_mask = pd.Series(False, index=df.index)
-    for date in unique_dates:
-        market_open, market_close = market_hours.get(date, (None, None))
-        date_obj = pd.Timestamp(date).tz_localize(ny_tz)
-        if market_open and market_close:
-            if start_time:
-                day_start_time = date_obj.replace(hour=start_time.hour, minute=start_time.minute)
-            else:
-                day_start_time = market_open
-            if end_time:
-                day_end_time = min(date_obj.replace(hour=end_time.hour, minute=end_time.minute), market_close - timedelta(minutes=3))
-            else:
-                day_end_time = market_close - timedelta(minutes=3)
+            # Classify levels as support or resistance
+            # Filter for strong levels
+            for level in potential_levels.values():
+                if len(level.touches) < params.min_touches: # not strong level
+                    continue
+                if level.is_res:
+                    all_resistance_levels[date].append(level)
+                else:
+                    all_support_levels[date].append(level)
+
+        log_live('Levels created')
+        unique_dates = list(pd.unique(timestamps.date))
+        if market_hours is None:
+            market_hours = get_market_hours(unique_dates)
+            log_live('market hours retrieved')
+        
+        if params.end_time:
+            end_time = pd.to_datetime(params.end_time, format='%H:%M').time()
         else:
-            day_start_time, day_end_time = date_obj, date_obj
+            end_time = None
+        if params.start_time:
+            start_time = pd.to_datetime(params.start_time, format='%H:%M').time()
+        else:
+            start_time = None
+        
+        # print(start_time, end_time)
+        
+        long_touch_area, long_widths = calculate_touch_area(
+            all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
+            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+        )
+        log_live(f'{len(long_touch_area)} Long touch areas calculated')
+        short_touch_area, short_widths = calculate_touch_area(
+            all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
+            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+        )
+        log_live(f'{len(short_touch_area)} Short touch areas calculated')
+            
+        # widths = long_widths + short_widths
 
-        mask = (timestamps >= day_start_time) & (timestamps <= day_end_time)
-        final_mask |= mask
+        # might not need to mask out before market_open
+        final_mask = pd.Series(False, index=df.index)
+        for date in unique_dates:
+            market_open, market_close = market_hours.get(date, (None, None))
+            date_obj = pd.Timestamp(date).tz_localize(ny_tz)
+            if market_open and market_close:
+                if start_time:
+                    day_start_time = date_obj.replace(hour=start_time.hour, minute=start_time.minute)
+                else:
+                    day_start_time = market_open
+                if end_time:
+                    day_end_time = min(date_obj.replace(hour=end_time.hour, minute=end_time.minute), market_close - timedelta(minutes=3))
+                else:
+                    day_end_time = market_close - timedelta(minutes=3)
+            else:
+                day_start_time, day_end_time = date_obj, date_obj
 
-    log_live('Mask created')
-    
-    df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
+            mask = (timestamps >= day_start_time) & (timestamps <= day_end_time)
+            final_mask |= mask
 
-    ret = {
-        'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
-        'long_touch_area': long_touch_area,
-        'short_touch_area': short_touch_area,
-        'market_hours': market_hours,
-        'bars': df,
-        'mask': final_mask,
-        # 'bid_buffer_pct': params.bid_buffer_pct,
-        'min_touches': params.min_touches,
-        'start_time': start_time,
-        'end_time': end_time,
-        # 'use_median': params.use_median
-    }
-    return TouchDetectionAreas.from_dict(ret)
-    
-    
-    # , high_low_diffs_list
+        log_live('Mask created')
+        
+        df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
 
+        ret = {
+            'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
+            'long_touch_area': long_touch_area,
+            'short_touch_area': short_touch_area,
+            'market_hours': market_hours,
+            'bars': df,
+            'mask': final_mask,
+            # 'bid_buffer_pct': params.bid_buffer_pct,
+            'min_touches': params.min_touches,
+            'start_time': start_time,
+            'end_time': end_time,
+            # 'use_median': params.use_median
+        }
+        return TouchDetectionAreas.from_dict(ret) # , high_low_diffs_list
+        
+    except Exception as e:
+        log(f"{type(e).__qualname__} in calculate_touch_detection_area: {e}", level=logging.ERROR)
+        raise e
 
 
 def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None):

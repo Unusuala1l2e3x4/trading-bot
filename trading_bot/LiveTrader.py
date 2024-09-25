@@ -15,13 +15,14 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
 from typing import List, Tuple, Optional, Dict
+from collections import defaultdict
 
 from alpaca.data.models import Bar
 
 from TradePosition import TradePosition
 from TouchArea import TouchArea
 from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable
-from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters, np_mean, np_median
+from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters, np_mean, np_median, fill_missing_data
 
 
 import logging
@@ -49,6 +50,39 @@ def debug_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def fill_latest_missing_data(df, latest_timestamp):
+    # Get the last timestamp from the dataframe
+    last_timestamp = df.index.get_level_values('timestamp')[-1]
+
+    # Ensure the latest timestamp is greater than the last timestamp
+    if latest_timestamp > last_timestamp:
+        # Get the symbol for the entire dataframe (assumes only one unique symbol)
+        symbol = df.index.get_level_values('symbol')[0]
+        
+        # Create a date range from the last timestamp + 1 minute up to the latest timestamp
+        missing_timestamps = pd.date_range(start=last_timestamp + pd.Timedelta(minutes=1), 
+                                           end=latest_timestamp, 
+                                           freq='min', 
+                                           tz=last_timestamp.tz)
+
+        # Create a DataFrame to store missing rows
+        missing_data = pd.DataFrame({
+            'open': df['close'].iloc[-1],  # Forward fill 'open' with the last 'close' value
+            'high': df['close'].iloc[-1],  # Forward fill 'high' with the last 'close' value
+            'low': df['close'].iloc[-1],   # Forward fill 'low' with the last 'close' value
+            'close': df['close'].iloc[-1], # Forward fill 'close' with the last 'close' value
+            'volume': 0,                   # Set volume to 0
+            'trade_count': 0,               # Set trade_count to 0
+            # 'vwap': np.nan
+        }, index=pd.MultiIndex.from_product([[symbol], missing_timestamps], names=['symbol', 'timestamp']))
+
+        # Use pd.concat to append the missing data
+        df = pd.concat([df, missing_data])
+        
+    # No return statement as requested; df is modified in place if necessary.
+
+
+
 class LiveTrader:
     def __init__(self, api_key, secret_key, symbol, initial_balance, touch_detection_params: LiveTouchDetectionParameters, strategy_params: StrategyParameters, simulation_mode=False):
         self.trading_client = TradingClient(api_key, secret_key, paper=True)
@@ -66,7 +100,7 @@ class LiveTrader:
         self.last_historical_timestamp = None
         self.first_streamed_timestamp = None
         self.open_positions = {}
-        self.areas_to_remove = set()
+        self.area_ids_to_remove = defaultdict(set)
         self.ny_tz = ZoneInfo("America/New_York")
         self.logger = self.setup_logger(logging.INFO)
         self.simulation_mode = simulation_mode
@@ -105,7 +139,6 @@ class LiveTrader:
         self.gap_filled = False
         self.last_historical_timestamp = None
         self.first_streamed_timestamp = None
-        self.areas_to_remove = set()
         
         # Re-initialize historical data for the new day
         await self.initialize_data()
@@ -159,11 +192,14 @@ class LiveTrader:
             level='timestamp'
         )
         df.sort_index(inplace=True)
+        df = fill_missing_data(df) # only fills betweem min and max time already in df
         return df
 
     def get_lagged_time(self):
-        return datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=30)
-
+        # return datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=30)
+        now = datetime.now(self.ny_tz).replace(second=0, microsecond=0)
+        return now - timedelta(minutes=16)
+    
     async def initialize_data(self):
         try:
             end = self.get_lagged_time()
@@ -188,7 +224,8 @@ class LiveTrader:
             self.log(f"Data range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
 
         except Exception as e:
-            self.log(f"Error initializing data: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} initializing data: {e}", logging.ERROR)
+            raise e
 
     async def update_historical_data(self):
         try:
@@ -197,8 +234,10 @@ class LiveTrader:
             debug_print('---')
             if end > start:
                 new_data = self.get_historical_bars(start, end)
+                assert new_data.index.get_level_values('timestamp').min() > self.last_historical_timestamp, (new_data.index.get_level_values('timestamp').min(), self.last_historical_timestamp)
+                
                 debug_print('---')
-                if not new_data.empty and new_data.index.get_level_values('timestamp').max() > self.last_historical_timestamp:
+                if not new_data.empty:
                     debug_print('---')
                     self.data = pd.concat([self.data, new_data])
                     debug_print('update_historical_data')
@@ -207,26 +246,38 @@ class LiveTrader:
                     debug_print('after remove dups ',len(self.data))
                     self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
                     self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
+                
+                assert self.data.index.get_level_values('timestamp')[-1] == self.last_historical_timestamp
+                
+                if self.last_historical_timestamp < end:
+                    self.log(f"calling fill_latest_missing_data for {self.last_historical_timestamp} -> {end}", level=logging.WARNING)
+                    fill_latest_missing_data(self.data, end)
+                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
         
         except Exception as e:
-            self.log(f"Error updating historical data: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} updating historical data: {e}", logging.ERROR)
+            raise e
                 
     async def simulate_bar(self):
-        if self.simulation_mode and not self.data.empty:
-            latest_data = self.data.iloc[-1]
-            bar = SimpleNamespace(
-                symbol=latest_data.name[0],
-                timestamp=latest_data.name[1],  # Assuming multi-index with (symbol, timestamp)
-                open=latest_data['open'],
-                high=latest_data['high'],
-                low=latest_data['low'],
-                close=latest_data['close'],
-                volume=latest_data['volume'],
-                trade_count=latest_data['trade_count'],
-                vwap=latest_data['vwap'],
-                is_simulate_bar=True
-            )
-            await self.on_bar(bar, check_time=latest_data.name[1])
+        try:
+            if self.simulation_mode and not self.data.empty:
+                latest_data = self.data.iloc[-1]
+                bar = SimpleNamespace(
+                    symbol=latest_data.name[0],
+                    timestamp=latest_data.name[1],  # Assuming multi-index with (symbol, timestamp)
+                    open=latest_data['open'],
+                    high=latest_data['high'],
+                    low=latest_data['low'],
+                    close=latest_data['close'],
+                    volume=latest_data['volume'],
+                    trade_count=latest_data['trade_count'],
+                    vwap=latest_data['vwap'],
+                    is_simulate_bar=True
+                )
+                await self.on_bar(bar, check_time=latest_data.name[1])
+        except Exception as e:
+            self.log(f"{type(e).__qualname__} in simulate_bar: {e}", logging.ERROR)
+            raise e
         
     async def on_bar(self, bar:Bar, check_time: Optional[datetime] = None):
         debug_print(bar)
@@ -290,7 +341,8 @@ class LiveTrader:
                 await self.execute_trading_logic()
                 
         except Exception as e:
-            self.log(f"Error in on_bar: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} in on_bar: {e}", logging.ERROR)
+            raise e
 
     async def check_gap_filled(self):
         time_diff = (self.first_streamed_timestamp - self.last_historical_timestamp).total_seconds() / 60
@@ -309,6 +361,7 @@ class LiveTrader:
 
 
     async def execute_trading_logic(self):
+        current_time = None
         try:
             if not self.is_ready:
                 self.log("Data not ready for trading")
@@ -316,6 +369,7 @@ class LiveTrader:
 
             # Update TradingStrategy balance
             current_time = self.data.index.get_level_values('timestamp')[-1]
+            current_date = current_time.date()
             
             # Calculate touch detection areas every minute
             self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.market_hours, current_time))
@@ -327,14 +381,14 @@ class LiveTrader:
                 # self.trading_strategy.handle_new_trading_day(current_time)
 
             # print(self.trading_strategy.touch_detection_areas.symbol)
-            self.log(len(self.trading_strategy.touch_detection_areas.long_touch_area), len(self.trading_strategy.touch_detection_areas.short_touch_area))
+            # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}, {len(self.trading_strategy.touch_detection_areas.short_touch_area)}, {len(self.area_ids_to_remove)}")
 
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
             #     self.log(f'after mask:\n{self.trading_strategy.df}')
 
-            orders, areas_to_remove = self.trading_strategy.process_live_data(current_time)
+            orders, area_ids_to_remove = self.trading_strategy.process_live_data(current_time)
             
-            self.areas_to_remove = self.areas_to_remove | areas_to_remove
+            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | area_ids_to_remove
 
             if orders:
                 # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
@@ -353,14 +407,21 @@ class LiveTrader:
                     
                 # if orders[0]['action'] == 'open':
                     # self.log(self.trading_strategy.df)
+                    
+                    
+                    
+                # total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
+                # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
+                
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
                 pass
             
         except Exception as e:
-            self.log(f"Error in execute_trading_logic: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
+            raise e
 
     def calculate_touch_detection_area(self, market_hours=None, current_timestamp=None):
-        return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp, self.areas_to_remove)
+        return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp, self.area_ids_to_remove)
 
     async def place_order(self, order):
         assert isinstance(order['qty'], int)
@@ -379,7 +440,8 @@ class LiveTrader:
             
             # return placed_order
         except Exception as e:
-            self.log(f"Error placing order: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
+            raise e
 
     async def process_placed_order(self, placed_order: Order, original_order: dict):
         # Log order details
@@ -473,7 +535,7 @@ class LiveTrader:
     #             return None
 
     #     except Exception as e:
-    #         self.log(f"Error placing order: {e}", logging.ERROR)
+    #         self.log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
 
     def validate_order(self, order_data):
         # Implement order validation logic
@@ -538,7 +600,8 @@ class LiveTrader:
                 await asyncio.sleep(2)  # Wait a minute before checking market open status again
 
         except Exception as e:
-            self.log(f"Error in run: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} in run: {e}", logging.ERROR)
+            raise e
 
     async def close(self):
         if hasattr(self, 'data_stream'):
@@ -582,14 +645,21 @@ class LiveTrader:
             
             await self.simulate_bar()
             
-            # if len(self.trading_strategy.touch_detection_areas.long_touch_area) + len(self.trading_strategy.touch_detection_areas.short_touch_area) == 0:
-            if timestamp.time() < time(11,3):
-                sys.stdout = text_trap
-                sleep_interval = 0
-            else:
-                sys.stdout = sys.__stdout__
-                sleep_interval = 0.3
-            await asyncio.sleep(sleep_interval)
+            # # if len(self.trading_strategy.touch_detection_areas.long_touch_area) + len(self.trading_strategy.touch_detection_areas.short_touch_area) == 0:
+            # if timestamp.time() < time(11,3):
+            #     sys.stdout = text_trap
+            #     sleep_interval = 0
+            # else:
+            #     sys.stdout = sys.__stdout__
+            #     sleep_interval = 0.3
+            # await asyncio.sleep(sleep_interval)
+            
+            if timestamp.time() >= time(16,0):
+                break
+            
+        # self.log(f"Printing areas for {current_date}", level=logging.WARNING)
+        # TouchArea.print_areas_list(self.trading_strategy.touch_area_collection.active_date_areas) # print if in log level
+        # print(sorted(self.area_ids_to_remove[current_date]))
         
         self.log(f"Completed simulation for {current_date}")
         
@@ -644,7 +714,7 @@ async def main():
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Stopping trader.")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"{type(e).__qualname__}: {e}")
     finally:
         await trader.close()
         print("Trader stopped.")

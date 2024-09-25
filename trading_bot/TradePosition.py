@@ -118,7 +118,7 @@ class TradePosition:
     use_margin: bool
     is_marginable: bool
     times_buying_power: float
-    actual_margin_multiplier: float
+    # actual_margin_multiplier: float
     entry_price: float
     market_value: float = 0.0
     shares: int = 0
@@ -584,7 +584,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'ROE (P/L %)': float(trade.profit_loss_pct),
             'Cumulative P/L %': float(cumulative_pct_change),
             'Transaction Costs': float(trade.total_transaction_costs),
-            'Margin Multiplier': float(trade.actual_margin_multiplier),
+            # 'Margin Multiplier': float(trade.actual_margin_multiplier),
             'Times Buying Power': float(trade.times_buying_power)
         }
         data.append(row)
