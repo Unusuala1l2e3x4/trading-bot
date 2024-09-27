@@ -24,7 +24,7 @@ from TouchArea import TouchArea
 from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable
 from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters, np_mean, np_median, fill_missing_data
 
-
+from tqdm import tqdm
 import logging
 
 import os, toml
@@ -104,6 +104,7 @@ class LiveTrader:
         self.ny_tz = ZoneInfo("America/New_York")
         self.logger = self.setup_logger(logging.INFO)
         self.simulation_mode = simulation_mode
+        self.trades = list()
         
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('LiveTrader')
@@ -118,7 +119,6 @@ class LiveTrader:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-
         return logger
 
     def log(self, message, level=logging.INFO):
@@ -147,7 +147,7 @@ class LiveTrader:
         if self.trading_strategy is None:
             self.trading_strategy = TradingStrategy(self.calculate_touch_detection_area(), self.strategy_params, is_live_trading=True)
         else:
-            self.trading_strategy.touch_detection_areas = self.calculate_touch_detection_area(self.trading_strategy.market_hours)
+            self.trading_strategy.touch_detection_areas = self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours)
 
         # Update daily parameters in TradingStrategy
         current_date = datetime.now(self.ny_tz).date()
@@ -372,7 +372,7 @@ class LiveTrader:
             current_date = current_time.date()
             
             # Calculate touch detection areas every minute
-            self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.market_hours, current_time))
+            self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours, current_time))
 
             
             # Update daily parameters if it's a new day (already handled in process_live_data)
@@ -386,9 +386,9 @@ class LiveTrader:
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
             #     self.log(f'after mask:\n{self.trading_strategy.df}')
 
-            orders, area_ids_to_remove = self.trading_strategy.process_live_data(current_time)
-            
-            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | area_ids_to_remove
+            orders, positions_to_remove = self.trading_strategy.process_live_data(current_time)
+            self.trades.extend(positions_to_remove)
+            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
 
             if orders:
                 # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
@@ -659,9 +659,11 @@ class LiveTrader:
             
         # self.log(f"Printing areas for {current_date}", level=logging.WARNING)
         # TouchArea.print_areas_list(self.trading_strategy.touch_area_collection.active_date_areas) # print if in log level
-        # print(sorted(self.area_ids_to_remove[current_date]))
+        self.log(f"terminated areas on {current_date}: {sorted(self.area_ids_to_remove[current_date])}", level=logging.WARNING)
         
         self.log(f"Completed simulation for {current_date}")
+        
+        return self.trading_strategy.generate_backtest_results(self.trades)
         
             
 import tracemalloc
@@ -670,6 +672,8 @@ tracemalloc.start()
 async def main():
     symbol = "AMZN"
     initial_balance = 10000
+    # initial_balance = 10103.375669397663
+    
     simulation_mode = True  # Set this to True for simulation, False for live trading
 
     touch_detection_params = LiveTouchDetectionParameters(
@@ -688,7 +692,7 @@ async def main():
     )
 
     strategy_params = StrategyParameters(
-        initial_investment=10_000,
+        initial_investment=initial_balance,
         do_longs=True,
         do_shorts=True,
         sim_longs=True,
@@ -709,7 +713,8 @@ async def main():
         
         
         date_to_simulate = date(2024, 8, 20)
-        await trader.run_day_sim(date_to_simulate)
+        results = await trader.run_day_sim(date_to_simulate)
+        print(results)
         
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Stopping trader.")

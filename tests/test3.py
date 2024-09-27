@@ -137,7 +137,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10000, do
         return max_shares, actual_margin_multiplier, overall_margin_multiplier, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
     
-    def place_stop_market_buy(area: TouchArea, timestamp: datetime, open_price: float, high_price: float, low_price: float, close_price: float, prev_close: float):
+    def create_new_position(area: TouchArea, timestamp: datetime, open_price: float, high_price: float, low_price: float, close_price: float, prev_close: float):
         nonlocal balance, current_id, total_account_value, open_positions, trades_executed, is_marginable
 
         if open_positions or balance <= 0:
@@ -409,7 +409,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10000, do
                     
                     if (area.is_long and do_longs) or (not area.is_long and do_shorts):
 
-                        if place_stop_market_buy(area, current_time, open_price, high_price, low_price, close_price, prev_close):
+                        if create_new_position(area, current_time, open_price, high_price, low_price, close_price, prev_close):
                             break  # Exit the loop after placing a position
         elif current_time >= day_end_time:
             close_all_positions(current_time, df['close'].iloc[i])

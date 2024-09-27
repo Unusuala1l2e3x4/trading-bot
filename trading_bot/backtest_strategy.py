@@ -263,7 +263,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
         return max_shares, actual_margin_multiplier, overall_margin_multiplier, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
     
-    def place_stop_market_buy(area: TouchArea, timestamp: datetime, data, prev_close: float):
+    def create_new_position(area: TouchArea, timestamp: datetime, data, prev_close: float):
         nonlocal balance, current_id, total_account_value, open_positions, trades_executed
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
@@ -693,7 +693,7 @@ def backtest_strategy(touch_detection_areas, initial_investment: float=10_000, m
                         break
                     
                     if (area.is_long and (do_longs or sim_longs)) or (not area.is_long and (do_shorts or sim_shorts)):
-                        if place_stop_market_buy(area, current_time, data, prev_close):
+                        if create_new_position(area, current_time, data, prev_close):
                             break  # Exit the loop after placing a position
         elif current_time >= day_end_time:
             debug_print(f"\n{current_time.strftime("%H:%M")} - Market Close")

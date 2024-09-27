@@ -21,7 +21,6 @@ def setup_logger(log_level=logging.INFO):
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
     return logger
 
 logger = setup_logger(logging.INFO)
@@ -56,13 +55,18 @@ class TouchArea:
         assert self.min_touches > 1, f'{self.min_touches} > 1'
         assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
         assert len(self.valid_atr) == len(self.touches), f'{len(self.valid_atr)} == {len(self.touches)}'
-        self.min_touches_time = self.initial_touches[self.min_touches - 1] if len(self.initial_touches) >= self.min_touches else None
+        assert len(self.initial_touches) == self.min_touches, f'{len(self.initial_touches)} >= {self.min_touches}'
+        self.min_touches_time = self.initial_touches[self.min_touches - 1] # if len(self.initial_touches) >= self.min_touches else None
 
+    # Ensure objects are compared based on date and id
     def __eq__(self, other):
         if isinstance(other, TouchArea):
             return self.id == other.id and self.date == other.date
-        return NotImplemented
-    
+        return False
+
+    # Ensure that objects have a unique hash based on date and id
+    def __hash__(self):
+        return hash((self.id, self.date))
     
     def add_touch(self, touch_time: datetime):
         self.touches.append(touch_time)
@@ -118,7 +122,7 @@ class TouchArea:
     def current_touches(self, current_timestamp: datetime):
         return [touch for touch in self.touches if touch <= current_timestamp]
         
-    def update_bounds(self, current_timestamp: datetime):
+    def update_bounds(self, current_timestamp: datetime, monotonic_duration: Optional[int] = 0):        
         current_atr = self.valid_atr[:len(self.current_touches(current_timestamp))]
         
         _, new_lower_bound, new_upper_bound = self.calculate_bounds(
@@ -146,7 +150,6 @@ class TouchArea:
             
     # @property
     def __str__(self):
-        print('')
         return (f"{'Long ' if self.is_long else 'Short'} TouchArea {self.id}: Level={self.level:.4f} ({self.lmin:.4f},{self.lmax:.4f}), "
                 f"Bounds={self.lower_bound:.4f}-{self.upper_bound:.4f}= {self.get_range:.4f}, initial touches [{" ".join([a.time().strftime("%H:%M") for a in self.initial_touches])}]"
                 # f"Num Touches={len(self.touches)}"
@@ -161,6 +164,7 @@ class TouchAreaCollection:
         self.active_date = None
         self.active_date_areas = list()
         self.terminated_date_areas = list()
+        self.open_position_areas = set()
         
         for area in touch_areas:
             if area.min_touches_time is not None:
@@ -179,6 +183,29 @@ class TouchAreaCollection:
         # return (area.min_touches_time, area.id)
         return (area.min_touches_time, area.initial_touches[0], area.id)
 
+    def get_area(self, area: TouchArea):
+        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+                            key=self.area_sort_key)
+        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+            return self.active_date_areas[index]
+        return None
+
+    def add_open_position_area(self, area: TouchArea):
+        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+                            key=self.area_sort_key)
+        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+            assert self.active_date_areas[index] not in self.open_position_areas
+            self.open_position_areas.add(self.active_date_areas[index])
+            return True
+        return False
+        
+    def del_open_position_area(self, area: TouchArea):
+        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+                            key=self.area_sort_key)
+        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+            self.open_position_areas.remove(self.active_date_areas[index])
+            return True
+        return False
     
     def get_active_areas(self, current_time: datetime):
         try:
@@ -193,10 +220,10 @@ class TouchAreaCollection:
             if self.active_date is None or self.active_date != current_date: # change the date and get areas in that date
                 # log(f"2 {current_date} {current_time}")
                 self.active_date = current_date
-                self.active_date_areas = list(self.areas_by_date[self.active_date])
+                self.active_date_areas = list(self.areas_by_date[self.active_date]) # get copy so that original isnt modified
                 self.terminated_date_areas = list()
             
-            return list(takewhile(lambda area: area.min_touches_time <= current_time, self.active_date_areas)) # to enable area terminations without deleting the data
+            # return list(takewhile(lambda area: area.min_touches_time <= current_time, self.active_date_areas)) # to enable area terminations without deleting the data
         except Exception as e:
             log(f"{type(e).__qualname__} in get_active_areas at {current_time}: {e}", logging.ERROR)
             raise e

@@ -169,6 +169,17 @@ class TradePosition:
     See reference: https://docs.alpaca.markets/docs/margin-and-short-selling#margin-interest-rate
     """
     
+    # Ensure objects are compared based on date and id
+    def __eq__(self, other):
+        if isinstance(other, TouchArea):
+            return self.id == other.id and self.date == other.date
+        return False
+
+    # Ensure that objects have a unique hash based on date and id
+    def __hash__(self):
+        return hash((self.id, self.date))
+    
+    
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('TradePosition')
         logger.setLevel(log_level)
@@ -182,7 +193,6 @@ class TradePosition:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-
         return logger
 
     def log(self, message, level=logging.INFO):

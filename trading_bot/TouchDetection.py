@@ -8,7 +8,7 @@ from alpaca.trading.requests import GetCalendarRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 
-from typing import List, Tuple, Optional, Dict, Union
+from typing import List, Tuple, Optional, Dict
 
 import matplotlib.pyplot as plt
 from collections import defaultdict
@@ -65,7 +65,6 @@ def setup_logger(log_level=logging.INFO):
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
     return logger
 
 logger = setup_logger(logging.WARNING)
@@ -74,7 +73,7 @@ def log(message, level=logging.INFO):
     logger.log(level, message)
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 
@@ -162,26 +161,45 @@ def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
 
 
 def fill_missing_data(df):
-    # Step 1: Create a complete range of timestamps
-    full_idx = pd.date_range(start=df.index.get_level_values('timestamp').min(), 
-                             end=df.index.get_level_values('timestamp').max(), 
-                             freq='min', 
-                             tz=df.index.get_level_values('timestamp').tz)
+    # Ensure the index is sorted
+    df = df.sort_index()
 
-    # Step 2: Reindex the DataFrame
-    df = df.reindex(pd.MultiIndex.from_product([df.index.get_level_values('symbol').unique(), full_idx], 
-                                               names=['symbol', 'timestamp']))
+    # Get the timezone
+    tz = df.index.get_level_values('timestamp').tz
 
-    # Step 3: Forward-fill OHLC values using ffill()
-    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].ffill()
+    # Group by symbol and date
+    grouped = df.groupby([df.index.get_level_values('symbol'),
+                          df.index.get_level_values('timestamp').date])
 
-    # Step 4: Fill volume and trade_count with 0
-    df['volume'] = df['volume'].fillna(0)
-    df['trade_count'] = df['trade_count'].fillna(0)
+    filled_dfs = []
 
-    # VWAP remains NaN where missing (may need to be calculated later if new functionality requires it)
-    
-    return df
+    for (symbol, date), group in grouped:
+        # Get min and max timestamps for the current date and symbol
+        min_time = group.index.get_level_values('timestamp').min()
+        max_time = group.index.get_level_values('timestamp').max()
+
+        # Create a complete range of timestamps for this date
+        full_idx = pd.date_range(start=min_time, end=max_time, freq='min', tz=tz)
+
+        # Reindex the group
+        filled_group = group.reindex(pd.MultiIndex.from_product([[symbol], full_idx],
+                                                                names=['symbol', 'timestamp']))
+
+        # Forward-fill OHLC values
+        filled_group[['open', 'high', 'low', 'close']] = filled_group[['open', 'high', 'low', 'close']].ffill()
+
+        # Fill volume and trade_count with 0
+        filled_group['volume'] = filled_group['volume'].fillna(0)
+        filled_group['trade_count'] = filled_group['trade_count'].fillna(0)
+        
+        # VWAP remains NaN where missing (may need to be calculated later if new functionality requires it)
+
+        filled_dfs.append(filled_group)
+
+    # Concatenate all filled groups
+    result = pd.concat(filled_dfs)
+
+    return result
 
 
 @dataclass
@@ -428,8 +446,8 @@ class BaseTouchDetectionParameters:
 # class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
 class BacktestTouchDetectionParameters():
     symbol: str
-    start_date: datetime
-    end_date: datetime
+    start_date: datetime | str
+    end_date: datetime | str
     atr_period: int = 15
     level1_period: int = 15
     multiplier: float = 1.4
@@ -449,11 +467,10 @@ class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
     pass  # This class doesn't need any additional parameters
 
 
-test = {538,551,421,419,664}
 
-def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameters, LiveTouchDetectionParameters], data: Optional[pd.DataFrame] = None, 
+def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, data: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
-                                   current_timestamp: Optional[datetime] = None, areas_to_remove: Optional[set] = {}):
+                                   current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}):
     def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
             logger.log(level, message)
@@ -602,7 +619,7 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
         
         # for date, day_df in tqdm(grouped, desc='calculate_touch_detection_area'):
         for date, day_df in grouped:
-            day_timestamps = day_df.index.get_level_values('timestamp')
+            day_timestamps = day_df.index.get_level_values('timestamp') # need to limit
             
             potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
             
@@ -631,9 +648,9 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
                     # Add this point to its own level (match by lmin, lmax in case the same lmin, lmax is already used)
                     potential_levels[i] = Level(i, lmin, lmax, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
             
-            if date in areas_to_remove:
-                for i in areas_to_remove[date]:
-                    del potential_levels[i]
+            if date in area_ids_to_remove:
+                for i in area_ids_to_remove[date]:
+                    del potential_levels[i] # area id == level id
                     
             # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
             # a['date'] = date
@@ -666,19 +683,6 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             start_time = None
         
         # print(start_time, end_time)
-        
-        long_touch_area, long_widths = calculate_touch_area(
-            all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
-            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
-        )
-        log_live(f'{len(long_touch_area)} Long touch areas calculated')
-        short_touch_area, short_widths = calculate_touch_area(
-            all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
-            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
-        )
-        log_live(f'{len(short_touch_area)} Short touch areas calculated')
-            
-        # widths = long_widths + short_widths
 
         # might not need to mask out before market_open
         final_mask = pd.Series(False, index=df.index)
@@ -701,9 +705,23 @@ def calculate_touch_detection_area(params: Union[BacktestTouchDetectionParameter
             final_mask |= mask
 
         log_live('Mask created')
-        
-        df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
 
+        
+        long_touch_area, long_widths = calculate_touch_area(
+            all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
+            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+        )
+        log_live(f'{len(long_touch_area)} Long touch areas calculated')
+        short_touch_area, short_widths = calculate_touch_area(
+            all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
+            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+        )
+        log_live(f'{len(short_touch_area)} Short touch areas calculated')
+            
+        # widths = long_widths + short_widths
+
+        df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
+        
         ret = {
             'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
             'long_touch_area': long_touch_area,
