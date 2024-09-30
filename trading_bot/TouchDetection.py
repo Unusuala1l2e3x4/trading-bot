@@ -161,6 +161,22 @@ def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
 
 
 def fill_missing_data(df):
+    """
+    Fill missing data in a multi-index DataFrame of stock market data.
+
+    This function processes a DataFrame with a multi-index of (symbol, timestamp),
+    filling in missing minutes between the first and last timestamp of each day
+    for each symbol. It forward-fills OHLC (Open, High, Low, Close) values and
+    fills volume and trade count with zeros.
+
+    Parameters:
+    df (pandas.DataFrame): A multi-index DataFrame with levels (symbol, timestamp)
+                           containing stock market data.
+
+    Returns:
+    pandas.DataFrame: A DataFrame with missing data filled, maintaining the
+                      original multi-index structure and timezone.
+    """
     # Ensure the index is sorted
     df = df.sort_index()
 

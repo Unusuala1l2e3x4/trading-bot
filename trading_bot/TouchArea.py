@@ -5,7 +5,7 @@ from collections import defaultdict
 from itertools import takewhile
 from numba import jit
 import numpy as np
-from typing import List, Dict, Optional, Tuple, Callable
+from typing import List, Dict, Optional, Tuple, Callable, Set
 
 import logging
 def setup_logger(log_level=logging.INFO):
@@ -158,21 +158,22 @@ class TouchArea:
 
 @dataclass
 class TouchAreaCollection:
-    def __init__(self, touch_areas, min_touches):
-        self.areas_by_date = defaultdict(list)
-        self.min_touches = min_touches
-        self.active_date = None
-        self.active_date_areas = list()
-        self.terminated_date_areas = list()
-        self.open_position_areas = set()
-        
-        for area in touch_areas:
+    touch_areas: List[TouchArea]
+    min_touches: int
+    areas_by_date: Dict[datetime, List[TouchArea]] = field(default_factory=lambda: defaultdict(list))
+    active_date: datetime = None
+    active_date_areas: List[TouchArea] = field(default_factory=list)
+    terminated_date_areas: List[TouchArea] = field(default_factory=list)
+    open_position_areas: Set[TouchArea] = field(default_factory=set)
+            
+    def __post_init__(self):
+        for area in self.touch_areas:
             if area.min_touches_time is not None:
                 self.areas_by_date[area.date].append(area)
         
         for date in self.areas_by_date:
             self.areas_by_date[date].sort(key=self.area_sort_key)
-
+            
     def get_all_areas(self, date: date):
         return self.areas_by_date[date]
     

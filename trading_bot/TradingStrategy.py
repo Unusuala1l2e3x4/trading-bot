@@ -127,6 +127,7 @@ class TradingStrategy:
     count_exit_adjust: int = 0
     count_entry_skip: int = 0
     count_exit_skip: int = 0
+    day_accrued_fees: float = 0
     current_date: Optional[pd.Timestamp] = None
     market_open: Optional[pd.Timestamp] = None
     market_close: Optional[pd.Timestamp] = None
@@ -141,7 +142,7 @@ class TradingStrategy:
     def __post_init__(self):
         self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         self.timestamps = self.df.index.get_level_values('timestamp')
-        self.logger = self.setup_logger(logging.WARNING)
+        self.logger = self.setup_logger(logging.ERROR)
         self.initialize_strategy()
 
     def setup_logger(self, log_level=logging.INFO):
@@ -228,7 +229,10 @@ class TradingStrategy:
             remaining_shares = position.shares
             realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
             assert sum(shares_per_position) == remaining_shares, (shares_per_position, remaining_shares)
-            self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, exit_price)
+            # self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, exit_price)
+            self.rebalance(position.is_simulated, cash_released + realized_pnl, exit_price)
+            if not position.is_simulated:
+                self.day_accrued_fees += fees
             position.close(timestamp, exit_price)
             self.trades_executed += 1
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
@@ -254,7 +258,7 @@ class TradingStrategy:
         assert not self.open_positions, self.open_positions
         return orders, positions_to_remove # set([position.area.id for position in positions_to_remove])
 
-    def calculate_position_details(self, current_price: float, times_buying_power: float, avg_volume: float, avg_trade_count: float, volume: float,
+    def calculate_position_details(self, area: TouchArea, current_price: float, times_buying_power: float, avg_volume: float, avg_trade_count: float, volume: float,
                                 max_volume_percentage: float, min_trade_count: int,
                                 existing_sub_positions: Optional[np.ndarray] = np.array([]), target_shares: Optional[int]=None):
         # Logic for calculating position details (similar to your original function)
@@ -294,7 +298,7 @@ class TradingStrategy:
             mid = (low + high) // 2
             total_shares = current_shares + mid
             invest_amount = mid * current_price
-            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, actual_margin_multiplier, existing_sub_positions)
+            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
             if invest_amount + estimated_entry_cost * actual_margin_multiplier <= available_balance:
                 low = mid + 1
             else:
@@ -315,7 +319,7 @@ class TradingStrategy:
 
         invest_amount = max_additional_shares * current_price
         actual_cash_used = invest_amount / actual_margin_multiplier
-        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, actual_margin_multiplier, existing_sub_positions)
+        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
 
         return max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
@@ -364,7 +368,7 @@ class TradingStrategy:
 
         # Calculate position size, etc...
         max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount = self.calculate_position_details(
-            execution_price, self.params.times_buying_power, avg_volume, avg_trade_count, volume,
+            area, execution_price, self.params.times_buying_power, avg_volume, avg_trade_count, volume,
             self.params.max_volume_percentage, self.params.min_trade_count
         )
 
@@ -398,7 +402,7 @@ class TradingStrategy:
 
         cash_needed, fees, shares_per_position = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
 
-        assert estimated_entry_cost >= fees, (estimated_entry_cost, fees)
+        assert estimated_entry_cost >= fees, (estimated_entry_cost, fees, position.is_long)
         assert sum(shares_per_position) == position.shares, (shares_per_position, position.shares)
         
         self.next_position_id += 1
@@ -407,8 +411,11 @@ class TradingStrategy:
         self.open_positions.add(position)
         self.touch_area_collection.add_open_position_area(area)
         
-        self.rebalance(position.is_simulated, -cash_needed - fees, close_price)
-            
+        # self.rebalance(position.is_simulated, -cash_needed - fees, close_price)
+        self.rebalance(position.is_simulated, -cash_needed, close_price)
+        if not position.is_simulated:
+            self.day_accrued_fees += fees
+        
         # return POSITION_OPENED
         orders = []
         for shares in shares_per_position:
@@ -585,7 +592,10 @@ class TradingStrategy:
                     if shares_to_sell > 0:
                         realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, price_at_action, shares_to_sell, vwap, volume, avg_volume, self.params.slippage_factor)
                         assert sum(shares_per_position) == shares_to_sell, (shares_per_position, shares_to_sell)
-                        self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, price_at_action)
+                        # self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, price_at_action)
+                        self.rebalance(position.is_simulated, cash_released + realized_pnl, price_at_action)
+                        if not position.is_simulated:
+                            self.day_accrued_fees += fees
                         
                         for shares in shares_per_position:
                             orders.append({
@@ -613,7 +623,7 @@ class TradingStrategy:
 
                     existing_sub_positions = np.array([sp.shares for sp in position.sub_positions if sp.shares > 0])
                     max_shares, _, _, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount = self.calculate_position_details(
-                        price_at_action, position.times_buying_power, avg_volume, avg_trade_count, volume,
+                        position.area, price_at_action, position.times_buying_power, avg_volume, avg_trade_count, volume,
                         self.params.max_volume_percentage, math.floor(self.params.min_trade_count * (shares_to_adjust / position.max_shares)), 
                         existing_sub_positions=existing_sub_positions, target_shares=target_shares
                     )
@@ -627,7 +637,10 @@ class TradingStrategy:
                         if not self.soft_end_triggered:
                             cash_needed, fees, shares_per_position = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
                             assert sum(shares_per_position) == shares_to_buy, (shares_per_position, shares_to_buy)
-                            self.rebalance(position.is_simulated, -cash_needed - fees, price_at_action)
+                            # self.rebalance(position.is_simulated, -cash_needed - fees, price_at_action)
+                            self.rebalance(position.is_simulated, -cash_needed, price_at_action)
+                            if not position.is_simulated:
+                                self.day_accrued_fees += fees
                             
                             for shares in shares_per_position:
                                 orders.append({
@@ -690,8 +703,8 @@ class TradingStrategy:
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
         
-        # for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
-        for i in range(1, len(timestamps)):
+        for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
+        # for i in range(1, len(timestamps)):
             current_time = timestamps[i].tz_convert(ny_tz)
             
             if self.current_date is None or current_time.date() != self.current_date:
@@ -726,6 +739,12 @@ class TradingStrategy:
                 all_orders, _ = self.close_all_positions(current_time, data.close, data.vwap, data.volume, data.avg_volume)
                 
                 self.log(f"terminated areas on {self.touch_area_collection.active_date}: {sorted([x.id for x in self.touch_area_collection.terminated_date_areas])}", level=logging.WARNING)
+            
+                if self.day_accrued_fees != 0:
+                    # sum up transaction costs from the day and subtract it from balance
+                    self.rebalance(False, -self.day_accrued_fees)
+                    self.log(f"After ${self.day_accrued_fees:.4f} fees: ${self.balance:.4f}", level=logging.WARNING)
+                    self.day_accrued_fees = 0
                 
             else:
                 all_orders = []
@@ -743,7 +762,7 @@ class TradingStrategy:
 
         # self.log(f"Printing areas for {current_time.date()}", level=logging.WARNING)
         # TouchArea.print_areas_list(self.touch_area_collection.active_date_areas) # print if in log level
-        # self.log(f"terminated areas on {self.touch_area_collection.active_date}: {sorted([x.id for x in self.touch_area_collection.terminated_date_areas])}", level=logging.WARNING)
+        self.log(f"terminated areas on {self.touch_area_collection.active_date}: {sorted([x.id for x in self.touch_area_collection.terminated_date_areas])}", level=logging.WARNING)
         # TouchArea.print_areas_list(self.touch_area_collection.terminated_date_areas) # print if in log level
             
         return self.generate_backtest_results()
@@ -793,6 +812,12 @@ class TradingStrategy:
                         
                 all_orders, positions_to_remove2 = self.close_all_positions(current_time, data.close, data.vwap, 
                                                     data.volume, data.avg_volume)
+                if self.day_accrued_fees != 0:
+                    # sum up transaction costs from the day and subtract it from balance
+                    self.rebalance(False, -self.day_accrued_fees)
+                    self.log(f"After ${self.day_accrued_fees:.4f} fees: ${self.balance:.4f}", level=logging.WARNING)
+                    self.day_accrued_fees = 0
+                    
             else:
                 all_orders = []
                 

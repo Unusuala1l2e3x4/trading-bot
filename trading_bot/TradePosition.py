@@ -1,12 +1,11 @@
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time
+from datetime import datetime, date, timedelta, time as time2
 from typing import List, Tuple, Optional
 from TouchArea import TouchArea
 import math
 import os
 import pandas as pd
-from datetime import datetime, date
 import numpy as np 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -22,7 +21,6 @@ def debug_print(*args, **kwargs):
     
 # https://alpaca.markets/blog/reg-taf-fees/
 # check **Alpaca Securities Brokerage Fee Schedule** in [Alpaca Documents Library](https://alpaca.markets/disclosures) for most up-to-date rates
-# SEC_FEE_RATE = 0.000008  # $8 per $1,000,000
 SEC_FEE_RATE = 0.0000278  # $27.80 per $1,000,000
 FINRA_TAF_RATE = 0.000166  # $166 per 1,000,000 shares
 FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
@@ -47,7 +45,10 @@ def calculate_shares_per_sub(total_shares: int, num_subs: int) -> np.ndarray:
     return np.full(num_subs, shares_per_sub, dtype=np.int32)
 
 @jit(nopython=True)
-def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: np.ndarray = np.array([])) -> float:
+def estimate_entry_cost(total_shares: int, times_buying_power: float, is_long: bool, price: float, existing_sub_positions: np.ndarray = np.array([])) -> float:
+    if is_long:
+        return 0.0  # Long positions have no entry costs
+    
     num_subs = calculate_num_sub_positions(times_buying_power)
     target_shares = calculate_shares_per_sub(total_shares, num_subs)
     
@@ -59,14 +60,65 @@ def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_s
             existing = existing_sub_positions[i] if i < len(existing_sub_positions) else 0
             shares_to_add = max(0, target - existing)
             finra_taf = min(FINRA_TAF_RATE * shares_to_add, FINRA_TAF_MAX)
-            total_cost += finra_taf
+            sec_fee = SEC_FEE_RATE * shares_to_add * price
+            total_cost += finra_taf + sec_fee
     else:
         for i in range(num_subs):
             target = target_shares[i]
             finra_taf = min(FINRA_TAF_RATE * target, FINRA_TAF_MAX)
-            total_cost += finra_taf
+            sec_fee = SEC_FEE_RATE * target * price
+            total_cost += finra_taf + sec_fee
 
     return total_cost
+
+@jit(nopython=True)
+def calculate_slippage(is_long: bool, price: float, trade_size: int, volume: float, avg_volume: float, slippage_factor: float, is_entry: bool) -> float:
+    # Use the average of current volume and average volume, with a minimum to avoid division by zero
+    effective_volume = max((volume + avg_volume) / 2, 1)
+    
+    slippage = slippage_factor * (float(trade_size) / effective_volume)
+    
+    if is_long:
+        if is_entry:
+            return price * (1 + slippage)  # Increase price for long entries
+        else:
+            return price * (1 - slippage)  # Decrease price for long exits
+    else:  # short
+        if is_entry:
+            return price * (1 - slippage)  # Decrease price for short entries
+        else:
+            return price * (1 + slippage)  # Increase price for short exits
+
+
+# @jit(nopython=True)
+# def calculate_slippage(price: float, trade_size: int, avg_volume: float, volatility: float, is_long: bool, is_entry: bool, slippage_factor: float, beta: float = 0.7) -> float:
+#     # Use avg_volume directly as effective volume
+#     effective_volume = max(avg_volume, 1)
+    
+#     # Compute the relative trade size
+#     relative_size = trade_size / effective_volume
+    
+#     # Calculate slippage using a non-linear model
+#     slippage = slippage_factor * (relative_size ** beta)
+    
+#     # Adjust slippage for volatility
+#     slippage *= (1 + volatility)
+    
+#     # Adjust the price based on the direction of the trade
+#     if is_long:
+#         if is_entry:
+#             adjusted_price = price * (1 + slippage)
+#         else:
+#             adjusted_price = price * (1 - slippage)
+#     else:
+#         if is_entry:
+#             adjusted_price = price * (1 - slippage)
+#         else:
+#             adjusted_price = price * (1 + slippage)
+    
+#     return adjusted_price
+
+
 
 
 @dataclass
@@ -224,22 +276,11 @@ class TradePosition:
         return sum(sp.shares for sp in self.sub_positions if sp.exit_time is None)
 
     def calculate_slippage(self, price: float, trade_size: int, volume: float, avg_volume: float, slippage_factor: float, is_entry: bool) -> float:
-        # Use the average of current volume and average volume, with a minimum to avoid division by zero
-        effective_volume = max((volume + avg_volume) / 2, 1)
-        
-        slippage = slippage_factor * (float(trade_size) / effective_volume)
-        
-        if self.is_long:
-            if is_entry:
-                return price * (1 + slippage)  # Increase price for long entries
-            else:
-                return price * (1 - slippage)  # Decrease price for long exits
-        else:  # short
-            if is_entry:
-                return price * (1 - slippage)  # Decrease price for short entries
-            else:
-                return price * (1 + slippage)  # Increase price for short exits
+        return calculate_slippage(self.is_long, price, trade_size, volume, avg_volume, slippage_factor, is_entry)
 
+    # def calculate_slippage(self, price: float, trade_size: int, avg_volume: float, volatility: float, is_entry: bool, slippage_factor: float, beta: float = 0.7) -> float:
+    #     return calculate_slippage(price, trade_size, avg_volume, volatility, self.is_long, is_entry, slippage_factor, beta)
+    
     def update_market_value(self, current_price: float):
         self.last_price = current_price
         for sp in self.sub_positions:
@@ -394,15 +435,14 @@ class TradePosition:
         return calculate_shares_per_sub(total_shares, num_subs)
     
     @staticmethod
-    def estimate_entry_cost(total_shares: int, times_buying_power: float, existing_sub_positions: Optional[np.ndarray] = np.array([])) -> float:
-        return estimate_entry_cost(total_shares, times_buying_power, existing_sub_positions)
+    def estimate_entry_cost(total_shares: int, times_buying_power: float, is_long: bool, price: float, existing_sub_positions: Optional[np.ndarray] = np.array([])) -> float:
+        return estimate_entry_cost(total_shares, times_buying_power, is_long, price, existing_sub_positions)
     
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
-        finra_taf = min(FINRA_TAF_RATE * shares, FINRA_TAF_MAX)
-        sec_fee = 0
-        if not is_entry:  # SEC fee only applies to exits
-            trade_value = price * shares
-            sec_fee = SEC_FEE_RATE * trade_value
+        is_sell = (self.is_long and not is_entry) or (not self.is_long and is_entry)
+        finra_taf = min(FINRA_TAF_RATE * shares, FINRA_TAF_MAX) if is_sell else 0
+        trade_value = price * shares
+        sec_fee = SEC_FEE_RATE * trade_value if is_sell else 0
         
         stock_borrow_cost = 0
         if not self.is_long and not is_entry:  # Stock borrow cost applies only to short position exits
@@ -585,17 +625,16 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
             'Holding Time (min)': trade.holding_time.total_seconds() / 60,
-            'Entry Price': float(trade.entry_price),
-            'Exit Price': float(trade.exit_price) if trade.exit_price else None,
+            'Entry Price': trade.entry_price,
+            'Exit Price': trade.exit_price if trade.exit_price else None,
             'Initial Shares': trade.initial_shares,
-            'Realized P/L': float(trade.get_realized_pnl),
-            'Unrealized P/L': float(trade.get_unrealized_pnl),
-            'Total P/L': float(trade.profit_loss),
-            'ROE (P/L %)': float(trade.profit_loss_pct),
-            'Cumulative P/L %': float(cumulative_pct_change),
-            'Transaction Costs': float(trade.total_transaction_costs),
-            # 'Margin Multiplier': float(trade.actual_margin_multiplier),
-            'Times Buying Power': float(trade.times_buying_power)
+            'Realized P/L': trade.get_realized_pnl,
+            'Unrealized P/L': trade.get_unrealized_pnl,
+            'Total P/L': trade.profit_loss,
+            'ROE (P/L %)': trade.profit_loss_pct,
+            'Cumulative P/L %': cumulative_pct_change,
+            'Transaction Costs': trade.total_transaction_costs,
+            'Times Buying Power': trade.times_buying_power
         }
         data.append(row)
     df = pd.DataFrame(data)
@@ -605,30 +644,131 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     debug_print(f"Trade summary has been exported to {filename}")
 
 
-def time_to_minutes(t: time):
+def time_to_minutes(t: time2):
     return t.hour * 60 + t.minute - (9 * 60 + 30)
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
+@dataclass
+class SimplifiedTradePosition:
+    date: date
+    id: int
+    area_id: int
+    is_long: bool
+    entry_time: datetime
+    exit_time: datetime
+    holding_time: timedelta
+    entry_price: float
+    exit_price: float
+    initial_shares: int
+    realized_pnl: float
+    unrealized_pnl: float
+    profit_loss: float
+    profit_loss_pct: float
+    cumulative_pct_change: float
+    total_transaction_costs: float
+    times_buying_power: float
+
+def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
+    df = pd.read_csv(csv_file_path)
+    trade_positions = []
+    
+    for _, row in df.iterrows():
+        trade_date = datetime.strptime(row['date'], '%Y-%m-%d').date()
+        
+        entry_time = datetime.combine(
+            trade_date, 
+            datetime.strptime(row['Entry Time'], '%H:%M:%S').time()
+        )
+        
+        exit_time = None
+        if pd.notna(row['Exit Time']):
+            exit_time = datetime.combine(
+                trade_date, 
+                datetime.strptime(row['Exit Time'], '%H:%M:%S').time()
+            )
+            # Handle cases where exit time is on the next day
+            if exit_time < entry_time:
+                exit_time += timedelta(days=1)
+        
+        holding_time = timedelta(seconds=row['Holding Time (min)'] * 60)
+        
+        trade_position = SimplifiedTradePosition(
+            date=trade_date,
+            id=row['ID'],
+            area_id=row['AreaID'],
+            is_long=(row['Type'] == 'Long'),
+            entry_time=entry_time,
+            exit_time=exit_time,
+            holding_time=holding_time,
+            entry_price=row['Entry Price'],
+            exit_price=row['Exit Price'] if pd.notna(row['Exit Price']) else None,
+            initial_shares=row['Initial Shares'],
+            realized_pnl=row['Realized P/L'],
+            unrealized_pnl=row['Unrealized P/L'],
+            profit_loss=row['Total P/L'],
+            profit_loss_pct=row['ROE (P/L %)'],
+            cumulative_pct_change=row['Cumulative P/L %'],
+            total_transaction_costs=row['Transaction Costs'],
+            times_buying_power=row['Times Buying Power']
+        )
+        trade_positions.append(trade_position)
+    
+    return trade_positions
+
+# import matplotlib.patches as mpatches
+# def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
+import matplotlib.patches as mpatches
+# import numpy as np
+
+def is_trading_day(date: date):
+    return date.weekday() < 5
+
+def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
     """
-    Create a graph that plots the cumulative profit/loss at each corresponding exit time
-    overlaid on the close price from the DataFrame, using a dual y-axis.
+    Create a graph that plots the cumulative profit/loss (summed percentages) at each corresponding exit time
+    overlaid on the close price and volume from the DataFrame, using a triple y-axis.
+    Volume is grouped by day for periods longer than a week, and by half-hour for periods of a week or less.
     Empty intervals before and after intraday trading are removed.
     
     Args:
     trades (list): List of TradePosition objects
-    df (pd.DataFrame): DataFrame containing the price data
-    initial_investment (float): Initial investment balance for normalization
+    df (pd.DataFrame): DataFrame containing the price and volume data
+    when_above_max_investment (list): List of timestamps when investment is above max
     filename (str): Name of the image file to be created
     """
     
     symbol = df.index.get_level_values('symbol')[0]
     
     timestamps = df.index.get_level_values('timestamp')
-    # Filter df to include only intraday data
     df['time'] = timestamps.time
     df['date'] = timestamps.date
-    df_intraday = df[(df['time'] >= time(9, 30)) & (df['time'] <= time(16, 0))].copy()
+
+    # Identify trading days (days with price changes)
+    trading_days = df.groupby('date').apply(lambda x: x['close'].nunique() > 1).reset_index()
+    trading_days = set(trading_days[trading_days[0]]['date'])
+
+    # Filter df to include only intraday data and trading days
+    df_intraday = df[
+        (df['time'] >= time2(9, 30)) & 
+        (df['time'] <= time2(16, 0)) &
+        (df['date'].isin(trading_days))
+    ].copy()
+
     timestamps = df_intraday.index.get_level_values('timestamp')
+    
+    # Determine if the data spans more than a week
+    date_range = (df_intraday['date'].max() - df_intraday['date'].min()).days
+    is_short_period = date_range <= 7
+    
+    if is_short_period:
+        # Group by half-hour intervals
+        df_intraday['half_hour'] = df_intraday['time'].apply(lambda t: t.replace(minute=0 if t.minute < 30 else 30, second=0))
+        volume_data = df_intraday.groupby(['date', 'half_hour'])['volume'].mean().reset_index()
+        volume_data['datetime'] = volume_data.apply(lambda row: pd.Timestamp.combine(row['date'], row['half_hour']), axis=1)
+        volume_data = volume_data.set_index('datetime').sort_index()
+        volume_data = volume_data[volume_data.index.time != time2(16, 0)]
+    else:
+        # Group by day
+        volume_data = df_intraday.groupby('date')['volume'].mean()
     
     # Create a continuous index
     unique_dates = sorted(df_intraday['date'].unique())
@@ -637,26 +777,24 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     
     for date in unique_dates:
         day_data = df_intraday[df_intraday['date'] == date]
-        day_minutes = day_data['time'].apply(time_to_minutes)
+        day_minutes = day_data['time'].apply(lambda t: (t.hour - 9) * 60 + t.minute - 30)
         continuous_index.extend(cumulative_minutes + day_minutes)
         cumulative_minutes += 390  # 6.5 hours of trading
     
     df_intraday['continuous_index'] = continuous_index
     
     # Prepare data for plotting
-    exit_times = [trades[0].entry_time]
-    cumulative_pnl = [0]
-    cumulative_pnl_longs = [0]
-    cumulative_pnl_shorts = [0]
+    exit_times = []
+    cumulative_pnl = []
+    cumulative_pnl_longs = []
+    cumulative_pnl_shorts = []
     running_pnl = 0
     running_pnl_longs = 0
     running_pnl_shorts = 0
     
     for trade in trades:
-        if trade.exit_time:
+        if trade.exit_time and trade.exit_time.date() in trading_days:
             exit_times.append(trade.exit_time)
-            # running_pnl += trade.profit_loss
-            # cumulative_pnl.append(100 * running_pnl / initial_investment)
             running_pnl += trade.profit_loss_pct
             if trade.is_long:
                 running_pnl_longs += trade.profit_loss_pct
@@ -666,11 +804,52 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
             cumulative_pnl_longs.append(running_pnl_longs)
             cumulative_pnl_shorts.append(running_pnl_shorts)
 
+    # Convert exit times to continuous index
+    exit_continuous_index = []
+    for exit_time in exit_times:
+        exit_date = exit_time.date()
+        if exit_date in unique_dates:
+            exit_minute = (exit_time.time().hour - 9) * 60 + (exit_time.time().minute - 30)
+            days_passed = unique_dates.index(exit_date)
+            exit_continuous_index.append(days_passed * 390 + exit_minute)
+
+    # Ensure all arrays have the same length
+    min_length = min(len(exit_continuous_index), len(cumulative_pnl), len(cumulative_pnl_longs), len(cumulative_pnl_shorts))
+    exit_continuous_index = exit_continuous_index[:min_length]
+    cumulative_pnl = cumulative_pnl[:min_length]
+    cumulative_pnl_longs = cumulative_pnl_longs[:min_length]
+    cumulative_pnl_shorts = cumulative_pnl_shorts[:min_length]
+
     # Create figure and primary y-axis
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(18, 10))
     
     # Plot close price on primary y-axis
     ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='gray', label='Close Price')
+    
+    # Add red dots for the start of each trading day
+    day_start_indices = []
+    day_start_prices = []
+    day_start_pnl = []
+    day_start_pnl_longs = []
+    day_start_pnl_shorts = []
+    
+    for date in unique_dates:
+        day_data = df_intraday[df_intraday['date'] == date]
+        if not day_data.empty:
+            start_index = day_data['continuous_index'].iloc[0]
+            start_price = day_data['close'].iloc[0]
+            day_start_indices.append(start_index)
+            day_start_prices.append(start_price)
+            
+            # Find the closest P/L values for this day start
+            closest_index = min(range(len(exit_continuous_index)), 
+                                key=lambda i: abs(exit_continuous_index[i] - start_index))
+            day_start_pnl.append(cumulative_pnl[closest_index])
+            day_start_pnl_longs.append(cumulative_pnl_longs[closest_index])
+            day_start_pnl_shorts.append(cumulative_pnl_shorts[closest_index])
+    
+    ax1.scatter(day_start_indices, day_start_prices, color='red', s=1, zorder=5, label='Day Start')
+
     ax1.set_xlabel('Trading Time (minutes)')
     ax1.set_ylabel('Close Price', color='black')
     ax1.tick_params(axis='y', labelcolor='black')
@@ -679,42 +858,71 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
         # Convert when_above_max_investment to continuous index
         above_max_continuous_index = []
         for timestamp in when_above_max_investment:
-            date = timestamp.date()
-            minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
-            days_passed = unique_dates.index(date)
-            above_max_continuous_index.append(days_passed * 390 + minute)
+            if timestamp.date() in trading_days:
+                date = timestamp.date()
+                minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
+                days_passed = unique_dates.index(date)
+                above_max_continuous_index.append(days_passed * 390 + minute)
 
         # Get the minimum close price for y-value of the points
         min_close = df_intraday['close'].min()
 
         # Plot points for when above max investment
         ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
-                    color='red', label='Above Max Investment')
+                    color='red', marker='o', linestyle='None', label='Above Max Investment')
 
-    # Create secondary y-axis
+    # Create secondary y-axis for cumulative P/L
     ax2 = ax1.twinx()
     
-    # Convert exit times to continuous index
-    exit_continuous_index = []
-    for exit_time in exit_times:
-        exit_date = exit_time.date()
-        exit_minute = time_to_minutes(exit_time.time())
-        days_passed = unique_dates.index(exit_date)
-        exit_continuous_index.append(days_passed * 390 + exit_minute)
-    
     # Plot cumulative P/L on secondary y-axis
-    ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='All')
-    ax2.plot(exit_continuous_index, cumulative_pnl_longs, color='blue', label='Longs')
-    ax2.plot(exit_continuous_index, cumulative_pnl_shorts, color='yellow', label='Shorts')
-    # ax2.set_ylabel('Cumulative P/L', color='green')
+    if len(exit_continuous_index) > 0:
+        ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='All P/L')
+        ax2.plot(exit_continuous_index, cumulative_pnl_longs, color='blue', label='Longs P/L')
+        ax2.plot(exit_continuous_index, cumulative_pnl_shorts, color='yellow', label='Shorts P/L')
+        
+        # Add day start markers for P/L lines
+        ax2.scatter(day_start_indices, day_start_pnl, color='red', s=1, zorder=5)
+        ax2.scatter(day_start_indices, day_start_pnl_longs, color='red', s=1, zorder=5)
+        ax2.scatter(day_start_indices, day_start_pnl_shorts, color='red', s=1, zorder=5)
+    else:
+        print("Warning: No valid exit times found in the trading days.")
+    
     ax2.set_ylabel('Cumulative P/L % Change', color='black')
     ax2.tick_params(axis='y', labelcolor='black')
     
+    # Create tertiary y-axis for volume
+    ax3 = ax1.twinx()
+    
+    # Offset the right spine of ax3 to the left so it's not on top of ax2
+    ax3.spines['right'].set_position(('axes', 1.1))
+    
+    # Plot volume as bars
+    if is_short_period:
+        bar_width = 30  # Width of half-hour in minutes
+        for timestamp, row in volume_data.iterrows():
+            date = timestamp.date()
+            time = timestamp.time()
+            days_passed = unique_dates.index(date)
+            minutes = (time.hour - 9) * 60 + time.minute - 30
+            x_position = days_passed * 390 + minutes
+            ax3.bar(x_position, row['volume'], width=bar_width, alpha=0.3, color='purple', align='edge')
+        volume_label = 'Half-hourly Mean Volume'
+    else:
+        bar_width = 390  # Width of one trading day in minutes
+        for i, (date, mean_volume) in enumerate(volume_data.items()):
+            ax3.bar(i * 390, mean_volume, width=bar_width, alpha=0.3, color='purple', align='edge')
+        volume_label = 'Daily Mean Volume'
+    
+    ax3.set_ylabel(volume_label, color='purple')
+    ax3.tick_params(axis='y', labelcolor='purple')
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',')))
+    
     # Set title and legend
-    plt.title(f'{symbol}: Cumulative P/L % Change vs Close Price')
+    plt.title(f'{symbol}: Cumulative P/L % Change vs Close Price and {volume_label}')
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    ax3_patch = mpatches.Patch(color='purple', alpha=0.3, label=volume_label)
+    ax1.legend(lines1 + lines2 + [ax3_patch], labels1 + labels2 + [volume_label], loc='upper left')
     
     # Set x-axis ticks to show dates
     all_days = [date.strftime('%Y-%m-%d') for date in unique_dates]
@@ -737,7 +945,6 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
         ax1.set_xticklabels([], minor=True)
 
     ax1.set_xticklabels([all_days[i] for i in week_starts], rotation=45, ha='right')
-    # ax1.tick_params(axis='x', which='major', colors='red')
 
     # Format minor ticks
     ax1.tick_params(axis='x', which='minor', bottom=True)
@@ -751,11 +958,9 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition], df: pd.DataFrame,
     if filename:
         # Save the figure
         os.makedirs(os.path.dirname(filename), exist_ok=True)
-        plt.savefig(filename)
+        plt.savefig(filename, dpi=300)
         debug_print(f"Graph has been saved as {filename}")
     else:
         plt.show()
         
     plt.close()
-    
-

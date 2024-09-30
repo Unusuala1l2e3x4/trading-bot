@@ -14,6 +14,7 @@ from alpaca.trading.models import Order
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from collections import defaultdict
 
@@ -82,29 +83,40 @@ def fill_latest_missing_data(df, latest_timestamp):
     # No return statement as requested; df is modified in place if necessary.
 
 
-
+@dataclass
 class LiveTrader:
-    def __init__(self, api_key, secret_key, symbol, initial_balance, touch_detection_params: LiveTouchDetectionParameters, strategy_params: StrategyParameters, simulation_mode=False):
-        self.trading_client = TradingClient(api_key, secret_key, paper=True)
-        self.data_stream = StockDataStream(api_key, secret_key, feed=DataFeed.IEX, websocket_params={"ping_interval": 1,"ping_timeout": 180,"max_queue": 1024})
-        self.historical_client = StockHistoricalDataClient(api_key, secret_key)
-        self.touch_detection_params = touch_detection_params
-        self.strategy_params = strategy_params
-        self.trading_strategy = None # not initialized until execute_trading_logic
-        self.symbol = symbol
-        self.balance = initial_balance # self.strategy_params.initial_investment
-        self.data = pd.DataFrame()
-        self.is_ready = False
-        self.gap_filled = False
-        self.streamed_data = pd.DataFrame()
-        self.last_historical_timestamp = None
-        self.first_streamed_timestamp = None
-        self.open_positions = {}
-        self.area_ids_to_remove = defaultdict(set)
-        self.ny_tz = ZoneInfo("America/New_York")
+    api_key: str
+    secret_key: str
+    symbol: str
+    initial_balance: float
+    touch_detection_params: LiveTouchDetectionParameters
+    strategy_params: StrategyParameters
+    simulation_mode: bool = False
+    
+    trading_client: TradingClient = field(init=False)
+    data_stream: StockDataStream = field(init=False)
+    historical_client: StockHistoricalDataClient = field(init=False)
+    trading_strategy: Optional[TradingStrategy] = None
+    balance: float = field(init=False)
+    data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    is_ready: bool = False
+    gap_filled: bool = False
+    streamed_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    last_historical_timestamp: Optional[pd.Timestamp] = None
+    first_streamed_timestamp: Optional[pd.Timestamp] = None
+    open_positions: Dict = field(default_factory=dict)
+    area_ids_to_remove: defaultdict = field(default_factory=lambda: defaultdict(set))
+    ny_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
+    logger: logging.Logger = field(init=False)
+    trades: List = field(default_factory=list)
+
+    def __post_init__(self):
+        self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
+        self.data_stream = StockDataStream(self.api_key, self.secret_key, feed=DataFeed.IEX, 
+                                           websocket_params={"ping_interval": 1, "ping_timeout": 180, "max_queue": 1024})
+        self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+        self.balance = self.initial_balance
         self.logger = self.setup_logger(logging.INFO)
-        self.simulation_mode = simulation_mode
-        self.trades = list()
         
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('LiveTrader')
@@ -391,29 +403,29 @@ class LiveTrader:
             self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
 
             if orders:
-                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
+                self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
                 
-                # if not self.simulation_mode:
-                #     # Place all orders concurrently
-                #     await asyncio.gather(*[self.place_order(order) for order in orders])
-                # else:
-                #     # In simulation mode, just log the orders
-                #     # for order in orders:
-                #     #     self.log({k:order[k] for k in order if k != 'position'})
+                if not self.simulation_mode:
+                    # Place all orders concurrently
+                    await asyncio.gather(*[self.place_order(order) for order in orders])
+                else:
+                    # In simulation mode, just log the orders
+                    # for order in orders:
+                    #     self.log({k:order[k] for k in order if k != 'position'})
 
-                #     self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
-                #     # self.balance not updated yet
+                    self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
+                    # self.balance not updated yet
                     
                     
-                # if orders[0]['action'] == 'open':
-                    # self.log(self.trading_strategy.df)
+                if orders[0]['action'] == 'open':
+                    self.log(self.trading_strategy.df)
                     
                     
                     
-                # total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
-                # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
+                total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
+                self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
                 
-                # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
+                plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
                 pass
             
         except Exception as e:
@@ -480,6 +492,13 @@ class LiveTrader:
         # elif action == 'close':
         #     # Remove the position from open positions -> already done in TradingStrategy
         #     del self.trading_strategy.open_positions[position.area.id]
+        
+        
+        # access the trading stream and record data for analysis here 
+        # for slippage effects
+        
+        
+        
 
         # Recalculate account balance
         self.recalculate_balance(placed_order, original_order)
@@ -637,7 +656,7 @@ class LiveTrader:
         text_trap = io.StringIO()
         
         # Simulate each minute of the day
-        for timestamp in day_data.index.get_level_values('timestamp')[2:]:
+        for timestamp in tqdm(day_data.index.get_level_values('timestamp')[2:]):
             # self.log(timestamp)
             # Update self.data with all rows up to and including the current timestamp
             self.data = day_data.loc[day_data.index.get_level_values('timestamp') <= timestamp]
@@ -663,7 +682,7 @@ class LiveTrader:
         
         self.log(f"Completed simulation for {current_date}")
         
-        return self.trading_strategy.generate_backtest_results(self.trades)
+        # return self.trading_strategy.generate_backtest_results(self.trades)
         
             
 import tracemalloc
@@ -671,8 +690,8 @@ tracemalloc.start()
 
 async def main():
     symbol = "AMZN"
-    initial_balance = 10000
-    # initial_balance = 10103.375669397663
+    # initial_balance = 10000
+    initial_balance = 10103.889074410155
     
     simulation_mode = True  # Set this to True for simulation, False for live trading
 
