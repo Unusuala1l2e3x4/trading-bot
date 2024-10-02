@@ -127,13 +127,21 @@ class Transaction:
     shares: int
     price: float
     is_entry: bool # Was it a buy (entry) or sell (exit)
+    is_long: bool
     transaction_cost: float # total of next 3 fields
     finra_taf: float
-    sec_fee: float  # 0 if is_entry is True
-    stock_borrow_cost: float # 0 if it is a long.
+    sec_fee: float  # > 0 for sells (long exits and short entries)
+    stock_borrow_cost: float # 0 if not is_long and not is_entry (short exits)
     value: float  # Positive if profit, negative if loss (before transaction costs are applied)
     vwap: float
-    realized_pnl: Optional[float] = None # None if is_entry is True
+    realized_pl: Optional[float] = None # None if is_entry is True
+    
+    # def __post_init__(self):
+    #     if not self.is_long and not self.is_entry:
+    #         assert self.stock_borrow_cost != 0
+    #     else:
+    #         assert self.stock_borrow_cost == 0
+
 
 @dataclass
 class SubPosition:
@@ -142,8 +150,8 @@ class SubPosition:
     shares: int
     cash_committed: float
     market_value: float = field(init=False)
-    unrealized_pnl: float = field(init=False)
-    realized_pnl: float = 0.0
+    unrealized_pl: float = field(init=False)
+    realized_pl: float = 0.0
     transactions: List[Transaction] = field(default_factory=list)
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
@@ -153,7 +161,7 @@ class SubPosition:
 
     def update_market_value(self, current_price: float):
         self.market_value = self.shares * current_price
-        self.unrealized_pnl = self.market_value - (self.shares * self.entry_price)
+        self.unrealized_pl = self.market_value - (self.shares * self.entry_price)
 
     def add_transaction(self, transaction: Transaction):
         self.transactions.append(transaction)
@@ -188,8 +196,8 @@ class TradePosition:
     last_price: float = field(default=0.0)
     cash_committed: float = field(init=False)
     is_simulated: float = field(init=False)
-    unrealized_pnl: float = field(default=0.0)
-    realized_pnl: float = 0.0
+    unrealized_pl: float = field(default=0.0)
+    realized_pl: float = 0.0
     log_level: Optional[int] = logging.INFO
     # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
     stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
@@ -286,7 +294,7 @@ class TradePosition:
         for sp in self.sub_positions:
             if sp.shares > 0:
                 sp.update_market_value(current_price)
-        self.unrealized_pnl = sum(sp.unrealized_pnl for sp in self.sub_positions if sp.shares > 0)
+        self.unrealized_pl = sum(sp.unrealized_pl for sp in self.sub_positions if sp.shares > 0)
         self.market_value = sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)
 
         t = abs(self.market_value - sum(sp.market_value for sp in self.sub_positions if sp.shares > 0))
@@ -302,9 +310,10 @@ class TradePosition:
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
         
         adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
+        # adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, avg_volume, volatility, False, slippage_factor, beta)
 
         cash_released = 0
-        realized_pnl = 0
+        realized_pl = 0
         fees = 0
 
         active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
@@ -316,21 +325,21 @@ class TradePosition:
             shares_sold = int(shares_to_sell * (float(sp.shares) / float(total_shares)))
             if shares_sold > 0:
                 sub_cash_released = (float(shares_sold) / float(sp.shares)) * sp.cash_committed
-                sp_realized_pnl = (adjusted_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - adjusted_price) * shares_sold
+                sp_realized_pl = (adjusted_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - adjusted_price) * shares_sold
                 
                 old_shares = sp.shares
                 sp.shares -= shares_sold
                 sp.cash_committed -= sub_cash_released
-                sp.realized_pnl += sp_realized_pnl
+                sp.realized_pl += sp_realized_pl
                 # sp.update_market_value(exit_price)
 
                 cash_released += sub_cash_released
-                realized_pnl += sp_realized_pnl
+                realized_pl += sp_realized_pl
                 
-                fees += self.add_transaction(exit_time, shares_sold, adjusted_price, is_entry=False, vwap=vwap, sub_position=sp, sp_realized_pnl=sp_realized_pnl)
+                fees += self.add_transaction(exit_time, shares_sold, adjusted_price, is_entry=False, vwap=vwap, sub_position=sp, sp_realized_pl=sp_realized_pl)
 
                 debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
-                    f"Realized PnL: {sp_realized_pnl:.4f}, Cash released: {sub_cash_released:.4f}, "
+                    f"Realized PnL: {sp_realized_pl:.4f}, Cash released: {sub_cash_released:.4f}, "
                     f"Old shares: {old_shares}, New shares: {sp.shares}")
                 
                 shares_sold_per_position.append(shares_sold)
@@ -346,19 +355,20 @@ class TradePosition:
         assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
             f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
 
-        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pnl:.4f}")
+        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}")
         debug_print("DEBUG: Remaining sub-positions:")
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
 
-        return realized_pnl, cash_released, fees, shares_sold_per_position
+        return realized_pl, cash_released, fees, shares_sold_per_position
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         debug_print(f"DEBUG: partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
         debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
 
         adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
+        # adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, avg_volume, volatility, True, slippage_factor, beta)
 
         new_total_shares = self.shares + shares_to_buy
         new_num_subs = self.calculate_num_sub_positions(self.times_buying_power)
@@ -421,7 +431,7 @@ class TradePosition:
         for i, sp in enumerate(self.sub_positions):
             if sp.shares > 0:
                 debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
-        # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pnl:.4f}, "
+        # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pl:.4f}, "
         #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
         
         return additional_cash_committed, fees, shares_bought_per_position
@@ -478,7 +488,7 @@ class TradePosition:
 
 
 
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool, vwap: float, sub_position: SubPosition, sp_realized_pnl: Optional[float] = None):
+    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool, vwap: float, sub_position: SubPosition, sp_realized_pl: Optional[float] = None):
         finra_taf, sec_fee, stock_borrow_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp, sub_position)
         transaction_cost = finra_taf + sec_fee + stock_borrow_cost
         value = -shares * price if is_entry else shares * price
@@ -486,17 +496,17 @@ class TradePosition:
         if is_entry:
             debug_print('add_transaction', shares, transaction_cost)
         
-        transaction = Transaction(timestamp, shares, price, is_entry, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, value, vwap, sp_realized_pnl)
+        transaction = Transaction(timestamp, shares, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, value, vwap, sp_realized_pl)
         self.transactions.append(transaction)
         sub_position.add_transaction(transaction)
         
         if not is_entry:
-            if sp_realized_pnl is None:
-                raise ValueError("sp_realized_pnl must be provided for exit transactions")
-            self.realized_pnl += sp_realized_pnl
+            if sp_realized_pl is None:
+                raise ValueError("sp_realized_pl must be provided for exit transactions")
+            self.realized_pl += sp_realized_pl
             
         debug_print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
-            f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pnl if sp_realized_pnl is not None else 'N/A'}")
+            f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pl if sp_realized_pl is not None else 'N/A'}")
 
         return transaction_cost
 
@@ -540,12 +550,14 @@ class TradePosition:
     def total_stock_borrow_cost(self) -> float:
         if self.is_long:
             return 0.0
-        
         total_cost = 0.0
         for sub_position in self.sub_positions:
             for transaction in sub_position.transactions:
                 if not transaction.is_entry:  # We only consider exit transactions
+                    # assert transaction.stock_borrow_cost != 0
                     total_cost += transaction.stock_borrow_cost
+                # else:
+                #     assert transaction.stock_borrow_cost == 0
         
         return total_cost
 
@@ -571,20 +583,21 @@ class TradePosition:
         return sum(t.transaction_cost for t in self.transactions) # / self.times_buying_power
 
     @property
-    def get_unrealized_pnl(self) -> float:
-        return self.unrealized_pnl # / self.times_buying_power
+    def get_unrealized_pl(self) -> float:
+        return self.unrealized_pl # / self.times_buying_power
 
     @property
-    def get_realized_pnl(self) -> float:
-        return self.realized_pnl # / self.times_buying_power
+    def get_realized_pl(self) -> float:
+        return self.realized_pl # / self.times_buying_power
 
     @property
-    def profit_loss(self) -> float:
-        return self.get_unrealized_pnl + self.get_realized_pnl - self.total_transaction_costs
+    def pl(self) -> float:
+        return self.get_unrealized_pl + self.get_realized_pl - self.total_transaction_costs
 
     @property
-    def profit_loss_pct(self) -> float:
-        return (self.profit_loss / self.initial_balance) * 100
+    def plpc(self) -> float:
+        # NOTE: initial_balance is the invest amount divided my actual_margin_multiplier, so reflective of account balance but not
+        return (self.pl / self.initial_balance) * 100
 
     @property
     def price_diff(self) -> float:
@@ -616,7 +629,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     data = []
     cumulative_pct_change = 0
     for trade in trades:
-        cumulative_pct_change += trade.profit_loss_pct
+        cumulative_pct_change += trade.plpc
         row = {
             'date': trade.date,
             'ID': trade.id,
@@ -628,10 +641,10 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Entry Price': trade.entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
             'Initial Shares': trade.initial_shares,
-            'Realized P/L': trade.get_realized_pnl,
-            'Unrealized P/L': trade.get_unrealized_pnl,
-            'Total P/L': trade.profit_loss,
-            'ROE (P/L %)': trade.profit_loss_pct,
+            'Realized P/L': trade.get_realized_pl,
+            'Unrealized P/L': trade.get_unrealized_pl,
+            'Total P/L': trade.pl,
+            'ROE (P/L %)': trade.plpc,
             'Cumulative P/L %': cumulative_pct_change,
             'Transaction Costs': trade.total_transaction_costs,
             'Times Buying Power': trade.times_buying_power
@@ -659,10 +672,10 @@ class SimplifiedTradePosition:
     entry_price: float
     exit_price: float
     initial_shares: int
-    realized_pnl: float
-    unrealized_pnl: float
-    profit_loss: float
-    profit_loss_pct: float
+    realized_pl: float
+    unrealized_pl: float
+    pl: float
+    plpc: float
     cumulative_pct_change: float
     total_transaction_costs: float
     times_buying_power: float
@@ -702,10 +715,10 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
             entry_price=row['Entry Price'],
             exit_price=row['Exit Price'] if pd.notna(row['Exit Price']) else None,
             initial_shares=row['Initial Shares'],
-            realized_pnl=row['Realized P/L'],
-            unrealized_pnl=row['Unrealized P/L'],
-            profit_loss=row['Total P/L'],
-            profit_loss_pct=row['ROE (P/L %)'],
+            realized_pl=row['Realized P/L'],
+            unrealized_pl=row['Unrealized P/L'],
+            pl=row['Total P/L'],
+            plpc=row['ROE (P/L %)'],
             cumulative_pct_change=row['Cumulative P/L %'],
             total_transaction_costs=row['Transaction Costs'],
             times_buying_power=row['Times Buying Power']
@@ -715,14 +728,14 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
     return trade_positions
 
 # import matplotlib.patches as mpatches
-# def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
+# def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
 import matplotlib.patches as mpatches
 # import numpy as np
 
 def is_trading_day(date: date):
     return date.weekday() < 5
 
-def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
+def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss (summed percentages) at each corresponding exit time
     overlaid on the close price and volume from the DataFrame, using a triple y-axis.
@@ -785,24 +798,24 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePo
     
     # Prepare data for plotting
     exit_times = []
-    cumulative_pnl = []
-    cumulative_pnl_longs = []
-    cumulative_pnl_shorts = []
-    running_pnl = 0
-    running_pnl_longs = 0
-    running_pnl_shorts = 0
+    cumulative_pl = []
+    cumulative_pl_longs = []
+    cumulative_pl_shorts = []
+    running_pl = 0
+    running_pl_longs = 0
+    running_pl_shorts = 0
     
     for trade in trades:
         if trade.exit_time and trade.exit_time.date() in trading_days:
             exit_times.append(trade.exit_time)
-            running_pnl += trade.profit_loss_pct
+            running_pl += trade.plpc
             if trade.is_long:
-                running_pnl_longs += trade.profit_loss_pct
+                running_pl_longs += trade.plpc
             else:
-                running_pnl_shorts += trade.profit_loss_pct
-            cumulative_pnl.append(running_pnl)
-            cumulative_pnl_longs.append(running_pnl_longs)
-            cumulative_pnl_shorts.append(running_pnl_shorts)
+                running_pl_shorts += trade.plpc
+            cumulative_pl.append(running_pl)
+            cumulative_pl_longs.append(running_pl_longs)
+            cumulative_pl_shorts.append(running_pl_shorts)
 
     # Convert exit times to continuous index
     exit_continuous_index = []
@@ -814,11 +827,11 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePo
             exit_continuous_index.append(days_passed * 390 + exit_minute)
 
     # Ensure all arrays have the same length
-    min_length = min(len(exit_continuous_index), len(cumulative_pnl), len(cumulative_pnl_longs), len(cumulative_pnl_shorts))
+    min_length = min(len(exit_continuous_index), len(cumulative_pl), len(cumulative_pl_longs), len(cumulative_pl_shorts))
     exit_continuous_index = exit_continuous_index[:min_length]
-    cumulative_pnl = cumulative_pnl[:min_length]
-    cumulative_pnl_longs = cumulative_pnl_longs[:min_length]
-    cumulative_pnl_shorts = cumulative_pnl_shorts[:min_length]
+    cumulative_pl = cumulative_pl[:min_length]
+    cumulative_pl_longs = cumulative_pl_longs[:min_length]
+    cumulative_pl_shorts = cumulative_pl_shorts[:min_length]
 
     # Create figure and primary y-axis
     fig, ax1 = plt.subplots(figsize=(18, 10))
@@ -829,9 +842,9 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePo
     # Add red dots for the start of each trading day
     day_start_indices = []
     day_start_prices = []
-    day_start_pnl = []
-    day_start_pnl_longs = []
-    day_start_pnl_shorts = []
+    day_start_pl = []
+    day_start_pl_longs = []
+    day_start_pl_shorts = []
     
     for date in unique_dates:
         day_data = df_intraday[df_intraday['date'] == date]
@@ -844,9 +857,9 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePo
             # Find the closest P/L values for this day start
             closest_index = min(range(len(exit_continuous_index)), 
                                 key=lambda i: abs(exit_continuous_index[i] - start_index))
-            day_start_pnl.append(cumulative_pnl[closest_index])
-            day_start_pnl_longs.append(cumulative_pnl_longs[closest_index])
-            day_start_pnl_shorts.append(cumulative_pnl_shorts[closest_index])
+            day_start_pl.append(cumulative_pl[closest_index])
+            day_start_pl_longs.append(cumulative_pl_longs[closest_index])
+            day_start_pl_shorts.append(cumulative_pl_shorts[closest_index])
     
     ax1.scatter(day_start_indices, day_start_prices, color='red', s=1, zorder=5, label='Day Start')
 
@@ -876,14 +889,14 @@ def plot_cumulative_pnl_and_price(trades: List[TradePosition | SimplifiedTradePo
     
     # Plot cumulative P/L on secondary y-axis
     if len(exit_continuous_index) > 0:
-        ax2.plot(exit_continuous_index, cumulative_pnl, color='green', label='All P/L')
-        ax2.plot(exit_continuous_index, cumulative_pnl_longs, color='blue', label='Longs P/L')
-        ax2.plot(exit_continuous_index, cumulative_pnl_shorts, color='yellow', label='Shorts P/L')
+        ax2.plot(exit_continuous_index, cumulative_pl, color='green', label='All P/L')
+        ax2.plot(exit_continuous_index, cumulative_pl_longs, color='blue', label='Longs P/L')
+        ax2.plot(exit_continuous_index, cumulative_pl_shorts, color='yellow', label='Shorts P/L')
         
         # Add day start markers for P/L lines
-        ax2.scatter(day_start_indices, day_start_pnl, color='red', s=1, zorder=5)
-        ax2.scatter(day_start_indices, day_start_pnl_longs, color='red', s=1, zorder=5)
-        ax2.scatter(day_start_indices, day_start_pnl_shorts, color='red', s=1, zorder=5)
+        ax2.scatter(day_start_indices, day_start_pl, color='red', s=1, zorder=5)
+        ax2.scatter(day_start_indices, day_start_pl_longs, color='red', s=1, zorder=5)
+        ax2.scatter(day_start_indices, day_start_pl_shorts, color='red', s=1, zorder=5)
     else:
         print("Warning: No valid exit times found in the trading days.")
     

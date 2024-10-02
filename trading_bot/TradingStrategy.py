@@ -8,7 +8,7 @@ import pandas as pd
 import math
 from TouchDetection import TouchDetectionAreas
 from TouchArea import TouchArea, TouchAreaCollection
-from TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pnl_and_price
+from TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -83,6 +83,8 @@ class StrategyParameters:
     max_volume_percentage: float = 0.01
     min_trade_count: int = 100
     slippage_factor: Optional[float] = 0.001
+    slippage_factor: Optional[float] = 0.02
+    beta:  Optional[float] = 0.95
     
     def __post_init__(self):
         assert 0 < self.times_buying_power <= 4
@@ -227,10 +229,10 @@ class TradingStrategy:
 
         for position in self.open_positions:
             remaining_shares = position.shares
-            realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
+            realized_pl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
             assert sum(shares_per_position) == remaining_shares, (shares_per_position, remaining_shares)
-            # self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, exit_price)
-            self.rebalance(position.is_simulated, cash_released + realized_pnl, exit_price)
+            # self.rebalance(position.is_simulated, cash_released + realized_pl - fees, exit_price)
+            self.rebalance(position.is_simulated, cash_released + realized_pl, exit_price)
             if not position.is_simulated:
                 self.day_accrued_fees += fees
             position.close(timestamp, exit_price)
@@ -326,6 +328,8 @@ class TradingStrategy:
 
     def create_new_position(self, area: TouchArea, timestamp: datetime, data, prev_close: float):
         # Logic for placing a stop market buy order (similar to your original function)
+        # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'central_value', 'is_res', 'shares_per_trade', 
+        # 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'time', 'date']
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
@@ -394,6 +398,10 @@ class TradingStrategy:
             max_price=high_price if area.is_long else None,
             min_price=low_price if not area.is_long else None
         )
+        
+        # print(list(data.index))
+        # print(list(data.values))
+        # print(data.iat[0], data.iat[1])
     
         if (area.is_long and self.params.do_longs) or (not area.is_long and self.params.do_shorts and self.is_etb):  # if conditions not met, simulate position only.
             position.is_simulated = False
@@ -464,7 +472,8 @@ class TradingStrategy:
 
     def update_positions(self, timestamp: datetime, data):
         # Logic for updating positions (similar to your original function)
-        
+        # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'central_value', 'is_res', 'shares_per_trade', 
+        # 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'time', 'date']
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
             data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
         
@@ -590,10 +599,10 @@ class TradingStrategy:
                     )
                     
                     if shares_to_sell > 0:
-                        realized_pnl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, price_at_action, shares_to_sell, vwap, volume, avg_volume, self.params.slippage_factor)
+                        realized_pl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, price_at_action, shares_to_sell, vwap, volume, avg_volume, self.params.slippage_factor)
                         assert sum(shares_per_position) == shares_to_sell, (shares_per_position, shares_to_sell)
-                        # self.rebalance(position.is_simulated, cash_released + realized_pnl - fees, price_at_action)
-                        self.rebalance(position.is_simulated, cash_released + realized_pnl, price_at_action)
+                        # self.rebalance(position.is_simulated, cash_released + realized_pl - fees, price_at_action)
+                        self.rebalance(position.is_simulated, cash_released + realized_pl, price_at_action)
                         if not position.is_simulated:
                             self.day_accrued_fees += fees
                         
@@ -908,26 +917,26 @@ class TradingStrategy:
         end_price = self.df.iloc[-1].close
         baseline_change = ((end_price - start_price) / start_price) * 100
         
-        total_profit_loss = sum(trade.profit_loss for trade in trades)
+        total_pl = sum(trade.pl for trade in trades)
         
-        total_profit = sum(trade.profit_loss for trade in trades if trade.profit_loss > 0)
-        total_loss = sum(trade.profit_loss for trade in trades if trade.profit_loss < 0)
+        total_profit = sum(trade.pl for trade in trades if trade.pl > 0)
+        total_loss = sum(trade.pl for trade in trades if trade.pl < 0)
         
         total_transaction_costs = sum(trade.total_transaction_costs for trade in trades)
         total_stock_borrow_costs = sum(trade.total_stock_borrow_cost for trade in trades)
 
-        mean_profit_loss = np.mean([trade.profit_loss for trade in trades])
-        mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades])
+        mean_pl = np.mean([trade.pl for trade in trades])
+        mean_plpc = np.mean([trade.plpc for trade in trades])
 
-        win_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades if trade.profit_loss > 0])
-        lose_mean_profit_loss_pct = np.mean([trade.profit_loss_pct for trade in trades if trade.profit_loss < 0])
+        win_mean_plpc = np.mean([trade.plpc for trade in trades if trade.pl > 0])
+        lose_mean_plpc = np.mean([trade.plpc for trade in trades if trade.pl < 0])
         
-        win_trades = sum(1 for trade in trades if trade.profit_loss > 0)
-        lose_trades = sum(1 for trade in trades if trade.profit_loss < 0)
-        win_longs = sum(1 for trade in trades if trade.is_long and trade.profit_loss > 0)
-        lose_longs = sum(1 for trade in trades if trade.is_long and trade.profit_loss < 0)
-        win_shorts = sum(1 for trade in trades if not trade.is_long and trade.profit_loss > 0)
-        lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.profit_loss < 0)
+        win_trades = sum(1 for trade in trades if trade.pl > 0)
+        lose_trades = sum(1 for trade in trades if trade.pl < 0)
+        win_longs = sum(1 for trade in trades if trade.is_long and trade.pl > 0)
+        lose_longs = sum(1 for trade in trades if trade.is_long and trade.pl < 0)
+        win_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl > 0)
+        lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl < 0)
         
         avg_sub_pos = np.mean([len(trade.sub_positions) for trade in trades])
         avg_transact = np.mean([len(trade.transactions) for trade in trades])
@@ -948,25 +957,25 @@ class TradingStrategy:
         print(f"Balance % change:   {balance_change:.4f}% ***")
         print(f"Baseline % change:  {baseline_change:.4f}%")
         print('Number of Trades Executed:', self.trades_executed)
-        print(f"\nTotal Profit/Loss (after fees): ${total_profit_loss:.4f}")
+        print(f"\nTotal Profit/Loss (after fees): ${total_pl:.4f}")
         print(f"  Total Profit: ${total_profit:.4f}")
         print(f"  Total Loss:   ${total_loss:.4f}")
         print(f"Total Transaction Costs: ${total_transaction_costs:.4f}")
         print(f"  Borrow Fees: ${total_stock_borrow_costs:.4f}")
         
-        print(f"\nAverage Profit/Loss per Trade (after fees): ${mean_profit_loss:.4f}")
+        print(f"\nAverage Profit/Loss per Trade (after fees): ${mean_pl:.4f}")
 
         # Create Series for different trade categories
         trade_categories = {
-            'All': [trade.profit_loss_pct for trade in trades],
-            # 'Long': [trade.profit_loss_pct for trade in trades if trade.is_long],
-            # 'Short': [trade.profit_loss_pct for trade in trades if not trade.is_long],
-            'Win': [trade.profit_loss_pct for trade in trades if trade.profit_loss > 0],
-            'Lose': [trade.profit_loss_pct for trade in trades if trade.profit_loss <= 0],
-            'Lwin': [trade.profit_loss_pct for trade in trades if trade.is_long and trade.profit_loss > 0],
-            'Swin': [trade.profit_loss_pct for trade in trades if not trade.is_long and trade.profit_loss > 0],
-            'Llose': [trade.profit_loss_pct for trade in trades if trade.is_long and trade.profit_loss <= 0],
-            'Slose': [trade.profit_loss_pct for trade in trades if not trade.is_long and trade.profit_loss <= 0]
+            'All': [trade.plpc for trade in trades],
+            # 'Long': [trade.plpc for trade in trades if trade.is_long],
+            # 'Short': [trade.plpc for trade in trades if not trade.is_long],
+            'Win': [trade.plpc for trade in trades if trade.pl > 0],
+            'Lose': [trade.plpc for trade in trades if trade.pl <= 0],
+            'Lwin': [trade.plpc for trade in trades if trade.is_long and trade.pl > 0],
+            'Swin': [trade.plpc for trade in trades if not trade.is_long and trade.pl > 0],
+            'Llose': [trade.plpc for trade in trades if trade.is_long and trade.pl <= 0],
+            'Slose': [trade.plpc for trade in trades if not trade.is_long and trade.pl <= 0]
         }
 
         describe_results = pd.DataFrame({category: pd.Series(data).describe() for category, data in trade_categories.items()})
@@ -1012,12 +1021,12 @@ class TradingStrategy:
         if self.export_trades_path:
             export_trades_to_csv(self.trades, self.export_trades_path)
 
-        plot_cumulative_pnl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
+        plot_cumulative_pl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
 
-        # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
+        # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
         #     win_trades / len(self.trades) * 100,  \
         #     total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
-        return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_profit_loss_pct, win_mean_profit_loss_pct, lose_mean_profit_loss_pct, \
+        return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
             win_trades / len(self.trades) * 100, total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
 
 

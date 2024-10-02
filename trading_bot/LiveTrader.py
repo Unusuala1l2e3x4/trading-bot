@@ -198,7 +198,7 @@ class LiveTrader:
         )
         df = self.historical_client.get_stock_bars(request_params).df
         if df.empty:
-            return pd.DataFrame()
+            return df
         df.index = df.index.set_levels(
             df.index.get_level_values('timestamp').tz_convert(self.ny_tz),
             level='timestamp'
@@ -403,29 +403,29 @@ class LiveTrader:
             self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
 
             if orders:
-                self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
+                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
                 
-                if not self.simulation_mode:
-                    # Place all orders concurrently
-                    await asyncio.gather(*[self.place_order(order) for order in orders])
-                else:
-                    # In simulation mode, just log the orders
-                    # for order in orders:
-                    #     self.log({k:order[k] for k in order if k != 'position'})
+                # if not self.simulation_mode:
+                #     # Place all orders concurrently
+                #     await asyncio.gather(*[self.place_order(order) for order in orders])
+                # else:
+                #     # In simulation mode, just log the orders
+                #     # for order in orders:
+                #     #     self.log({k:order[k] for k in order if k != 'position'})
 
-                    self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
-                    # self.balance not updated yet
+                #     self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
+                #     # self.balance not updated yet
                     
                     
-                if orders[0]['action'] == 'open':
-                    self.log(self.trading_strategy.df)
+                # if orders[0]['action'] == 'open':
+                #     self.log(self.trading_strategy.df)
                     
                     
                     
-                total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
-                self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
+                # total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
+                # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
                 
-                plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
+                # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
                 pass
             
         except Exception as e:

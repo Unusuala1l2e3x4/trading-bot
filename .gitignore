@@ -9,4 +9,5 @@ __pycache__/
 *.lnk
 *.pdf
 bars
+quotes
 trading_bot/reject

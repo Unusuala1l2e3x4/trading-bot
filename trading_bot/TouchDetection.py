@@ -33,6 +33,8 @@ from TouchArea import TouchArea
 import logging
 import traceback
 
+import time as t2
+
 from dotenv import load_dotenv
 
 ny_tz = ZoneInfo("America/New_York")
@@ -500,8 +502,8 @@ class BaseTouchDetectionParameters:
 # class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
 class BacktestTouchDetectionParameters():
     symbol: str
-    start_date: datetime | str
-    end_date: datetime | str
+    start_date: datetime # | str
+    end_date: datetime # | str
     atr_period: int = 15
     level1_period: int = 15
     multiplier: float = 1.4
@@ -617,16 +619,70 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                     qdf.set_index(['symbol', 'timestamp'], inplace=True)
                     print(f'Retrieved quotes from {quotes_zip_path}')
         else:
-            request_params = StockQuotesRequest(
-                symbol_or_symbols=params.symbol,
-                start=params.start_date.tz_convert('UTC'),
-                end=params.end_date.tz_convert('UTC'),
-            )
-            qdf = clean_quotes_data(client.get_stock_quotes(request_params).df)
-            qdf.sort_index(inplace=True)
+            # Now, fetch quote data for each minute interval
+            minute_intervals = df.index.get_level_values('timestamp')
+            minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time <= time(16, 0))]
+
+            # Initialize an empty list to collect DataFrames
+            quotes_dataframes = []
             
+            for minute in tqdm(minute_intervals, desc='minute_intervals'):
+                minute_end = minute + timedelta(seconds=1)
+                
+                # Fetch quote data
+                try:
+                    i = 3
+                    latest_before_earlier = pd.NaT
+                    qdf0 = pd.DataFrame()
+                    while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
+                        # Record start time
+                        start_time = t2.time()
+
+                        minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
+
+                        request_params = StockQuotesRequest(
+                            symbol_or_symbols=params.symbol,
+                            start=minute_start.tz_convert('UTC'),
+                            end=minute_end.tz_convert('UTC'),
+                        )
+                        qdf0 = client.get_stock_quotes(request_params).df
+
+                        i += 4
+                        if not qdf0.empty:
+                            qdf0 = clean_quotes_data(qdf0)
+                            t = qdf0.index.get_level_values('timestamp')
+                            latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
+                            if not pd.isna(latest_before_earlier):
+                                qdf0 = qdf0[t >= latest_before_earlier]
+
+                        # Record end time and calculate elapsed time
+                        elapsed_time = t2.time() - start_time
+
+                        # Calculate remaining sleep time to maintain 0.3 seconds between requests
+                        # 60/1000 = 0.06 sec if we have Elite Smart Router
+                        # 60/10000 = 0.006 sec if we have Algo Trader Plus
+                        remaining_sleep_time = max(0, 0.3 - elapsed_time)
+                        t2.sleep(remaining_sleep_time)
+
+                    if not qdf0.empty:
+                        quotes_dataframes.append(qdf0)
+                    
+                except Exception as e:
+                    print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
+                    
+                # sleep(0.3)
+
+            # Concatenate all the DataFrames
+            if quotes_dataframes:
+                qdf = pd.concat(quotes_dataframes)
+                qdf.sort_index(inplace=True)
+            else:
+                qdf = pd.DataFrame()
+
             # Save the DataFrame to a CSV file inside a ZIP file
             if params.export_quotes_path:
+                quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
+                os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
                 with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
                     with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
                         qdf.reset_index().to_csv(csv_file, index=False)
