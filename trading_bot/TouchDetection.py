@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from numba import jit
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
 from alpaca.trading import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.data.timeframe import TimeFrame
@@ -218,6 +218,42 @@ def fill_missing_data(df):
     return result
 
 
+def clean_quotes_data(df: pd.DataFrame):
+    """
+    Clean duplicate timestamped quotes for each symbol by keeping the most relevant quotes.
+
+    Args:
+    - df (pd.DataFrame): A pandas DataFrame with a MultiIndex containing 'symbol' and 'timestamp'.
+      The DataFrame should have the following columns: 'bid_price', 'ask_price', 'bid_size', 'ask_size',
+      'bid_exchange', 'ask_exchange', 'conditions', and 'tape'.
+
+    Returns:
+    - pd.DataFrame: A cleaned DataFrame with one quote per symbol per timestamp, prioritizing the most relevant quotes.
+    """
+    if df.empty:
+        return df
+    
+    # Define an aggregation strategy for each column
+    agg_funcs = {
+        'bid_price': 'max',  # Keep the highest bid price
+        'ask_price': 'min',  # Keep the lowest ask price
+        'bid_size': 'max',   # Keep the largest bid size
+        'ask_size': 'max',   # Keep the largest ask size
+        'bid_exchange': 'first',  # Arbitrarily keep the first exchange (can modify based on preference)
+        'ask_exchange': 'first',  # Same for ask exchange
+        'conditions': 'first',    # Arbitrarily keep the first condition
+        'tape': 'first'           # Same for tape
+    }
+
+    # Apply groupby and aggregation
+    df = df.groupby(level=['symbol', 'timestamp']).agg(agg_funcs)
+    df.index = df.index.set_levels(
+        df.index.get_level_values('timestamp').tz_convert(ny_tz),
+        level='timestamp'
+    )
+
+    return df
+
 @dataclass
 class Level:
     id: int
@@ -405,6 +441,7 @@ class TouchDetectionAreas:
     short_touch_area: List[TouchArea]
     market_hours: Dict[date, Tuple[datetime, datetime]]
     bars: pd.DataFrame
+    quotes: pd.DataFrame
     mask: pd.Series
     min_touches: int
     start_time: Optional[time]
@@ -418,6 +455,7 @@ class TouchDetectionAreas:
             short_touch_area=data['short_touch_area'],
             market_hours=data['market_hours'],
             bars=data['bars'],
+            quotes=data['quotes'],
             mask=data['mask'],
             min_touches=data['min_touches'],
             start_time=data['start_time'],
@@ -477,6 +515,7 @@ class BacktestTouchDetectionParameters():
     touch_area_width_agg: Callable = np_median
     use_saved_bars: bool = False
     export_bars_path: Optional[str] = None
+    export_quotes_path: Optional[str] = None
 
 @dataclass
 class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
@@ -530,17 +569,17 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
 
         # Define the path to the zip file
         if params.export_bars_path:
-            zip_file_path = params.export_bars_path.replace('.csv', '.zip')
+            bars_zip_path = params.export_bars_path.replace('.csv', '.zip')
             os.makedirs(os.path.dirname(params.export_bars_path), exist_ok=True)
-
+            
         # Check if the ZIP file exists and read from it
-        if params.use_saved_bars and params.export_bars_path and os.path.isfile(zip_file_path):
-            with zipfile.ZipFile(zip_file_path, 'r') as zip_file:
+        if params.use_saved_bars and params.export_bars_path and os.path.isfile(bars_zip_path):
+            with zipfile.ZipFile(bars_zip_path, 'r') as zip_file:
                 with zip_file.open(os.path.basename(params.export_bars_path)) as csv_file:
                     df = pd.read_csv(csv_file)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(ny_tz)
                     df.set_index(['symbol', 'timestamp'], inplace=True)
-                    print(f'Retrieved bars from {zip_file_path}')
+                    print(f'Retrieved bars from {bars_zip_path}')
         else:
             # Request historical data
             request_params = StockBarsRequest(
@@ -560,11 +599,39 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             
             # Save the DataFrame to a CSV file inside a ZIP file
             if params.export_bars_path:
-                with zipfile.ZipFile(zip_file_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+                with zipfile.ZipFile(bars_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
                     with zip_file.open(os.path.basename(params.export_bars_path), 'w') as csv_file:
                         df.reset_index().to_csv(csv_file, index=False)
-                print(f'Saved bars to {zip_file_path}')
-        # return None        
+                print(f'Saved bars to {bars_zip_path}')
+        
+        if params.export_quotes_path:
+            quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
+            os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
+            
+        # Check if the ZIP file exists and read from it
+        if params.use_saved_bars and params.export_quotes_path and os.path.isfile(quotes_zip_path):
+            with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
+                with zip_file.open(os.path.basename(params.export_quotes_path)) as csv_file:
+                    qdf = pd.read_csv(csv_file)
+                    qdf['timestamp'] = pd.to_datetime(qdf['timestamp'], utc=True).dt.tz_convert(ny_tz)
+                    qdf.set_index(['symbol', 'timestamp'], inplace=True)
+                    print(f'Retrieved quotes from {quotes_zip_path}')
+        else:
+            request_params = StockQuotesRequest(
+                symbol_or_symbols=params.symbol,
+                start=params.start_date.tz_convert('UTC'),
+                end=params.end_date.tz_convert('UTC'),
+            )
+            qdf = clean_quotes_data(client.get_stock_quotes(request_params).df)
+            qdf.sort_index(inplace=True)
+            
+            # Save the DataFrame to a CSV file inside a ZIP file
+            if params.export_quotes_path:
+                with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+                    with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
+                        qdf.reset_index().to_csv(csv_file, index=False)
+                print(f'Saved quotes to {quotes_zip_path}')
+      
     elif isinstance(params, LiveTouchDetectionParameters):
         if data is None:
             raise ValueError("Data must be provided for live trading parameters")
@@ -621,6 +688,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
         
         log_live('rolling averages calculated')
+        
+        df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+        df['volatility'] = df['log_return'].rolling(window=15).std().fillna(0)
         
         # Group data by date
         grouped = df.groupby(timestamps.date)
@@ -744,6 +814,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'short_touch_area': short_touch_area,
             'market_hours': market_hours,
             'bars': df,
+            'quotes': qdf,
             'mask': final_mask,
             # 'bid_buffer_pct': params.bid_buffer_pct,
             'min_touches': params.min_touches,
