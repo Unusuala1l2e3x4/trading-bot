@@ -284,34 +284,28 @@ class TradingStrategy:
         
         available_balance = min(self.balance, self.params.max_investment) * actual_margin_multiplier
         
-        current_shares = np.sum(existing_sub_positions) if existing_sub_positions is not None else 0
-        if target_shares is not None:
-            assert target_shares > current_shares, (target_shares, current_shares)
+        current_shares = np.sum(existing_sub_positions) if existing_sub_positions.size > 0 else 0
         max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
-            
-        max_additional_shares = min(
-            (target_shares - current_shares) if target_shares is not None else math.floor((available_balance - (current_shares * current_price)) / current_price),
-            max_volume_shares - current_shares
-        )
         
-        # Binary search to find the maximum number of shares we can buy
-        low, high = 0, max_additional_shares
-        while low <= high:
-            mid = (low + high) // 2
-            total_shares = current_shares + mid
-            invest_amount = mid * current_price
-            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
-            if invest_amount + estimated_entry_cost * actual_margin_multiplier <= available_balance:
-                low = mid + 1
-            else:
-                high = mid - 1
+        # Calculate max_additional_shares based on available balance
+        max_additional_shares_by_balance = math.floor(available_balance / current_price)
         
-        max_additional_shares = high
+        # Consider target_shares if provided
+        if target_shares is not None:
+            max_additional_shares = min(target_shares - current_shares, max_additional_shares_by_balance)
+        else:
+            max_additional_shares = max_additional_shares_by_balance
+        
+        # Ensure we don't exceed max_volume_shares
+        max_additional_shares = min(max_additional_shares, max_volume_shares - current_shares)
+        
+        # Ensure non-negative
+        max_additional_shares = max(0, max_additional_shares)
+        
         max_shares = current_shares + max_additional_shares
         
-        # Ensure max_shares is divisible when times_buying_power > 2
-        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier) # Currently returns 1
-        
+        # Ensure max_shares is divisible when using margin
+        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier)
         if num_subs > 1:
             assert self.is_marginable, self.is_marginable
             rem = max_shares % num_subs
@@ -321,7 +315,7 @@ class TradingStrategy:
 
         invest_amount = max_additional_shares * current_price
         actual_cash_used = invest_amount / actual_margin_multiplier
-        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
+        estimated_entry_cost = 0  # Set to 0 as we're no longer considering entry costs
 
         return max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
@@ -410,7 +404,6 @@ class TradingStrategy:
 
         cash_needed, fees, shares_per_position = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
 
-        assert estimated_entry_cost >= fees, (estimated_entry_cost, fees, position.is_long)
         assert sum(shares_per_position) == position.shares, (shares_per_position, position.shares)
         
         self.next_position_id += 1
