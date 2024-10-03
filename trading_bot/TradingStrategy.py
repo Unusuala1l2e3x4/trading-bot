@@ -294,23 +294,10 @@ class TradingStrategy:
             max_volume_shares - current_shares
         )
         
-        # Binary search to find the maximum number of shares we can buy
-        low, high = 0, max_additional_shares
-        while low <= high:
-            mid = (low + high) // 2
-            total_shares = current_shares + mid
-            invest_amount = mid * current_price
-            estimated_entry_cost = TradePosition.estimate_entry_cost(total_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
-            if invest_amount + estimated_entry_cost * actual_margin_multiplier <= available_balance:
-                low = mid + 1
-            else:
-                high = mid - 1
-        
-        max_additional_shares = high
         max_shares = current_shares + max_additional_shares
         
         # Ensure max_shares is divisible when times_buying_power > 2
-        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier) # Currently returns 1
+        num_subs = TradePosition.calculate_num_sub_positions(actual_margin_multiplier)
         
         if num_subs > 1:
             assert self.is_marginable, self.is_marginable
@@ -321,7 +308,7 @@ class TradingStrategy:
 
         invest_amount = max_additional_shares * current_price
         actual_cash_used = invest_amount / actual_margin_multiplier
-        estimated_entry_cost = TradePosition.estimate_entry_cost(max_shares, actual_margin_multiplier, area.is_long, current_price, existing_sub_positions)
+        estimated_entry_cost = 0  # Set to 0 as we're no longer considering entry costs
 
         return max_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, max_additional_shares, invest_amount
 
