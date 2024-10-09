@@ -38,32 +38,6 @@ def calculate_shares_per_sub(total_shares: int, num_subs: int) -> np.ndarray:
 
     return np.full(num_subs, shares_per_sub, dtype=np.int32)
 
-@jit(nopython=True)
-def estimate_entry_cost(total_shares: int, times_buying_power: float, is_long: bool, price: float, existing_sub_positions: np.ndarray = np.array([])) -> float:
-    if is_long:
-        return 0.0  # Long positions have no entry costs
-    
-    num_subs = calculate_num_sub_positions(times_buying_power)
-    target_shares = calculate_shares_per_sub(total_shares, num_subs)
-    
-    total_cost = 0.0
-    
-    if existing_sub_positions.size > 0:
-        for i in range(num_subs):
-            target = target_shares[i]
-            existing = existing_sub_positions[i] if i < len(existing_sub_positions) else 0
-            shares_to_add = max(0, target - existing)
-            finra_taf = min(FINRA_TAF_RATE * shares_to_add, FINRA_TAF_MAX)
-            sec_fee = SEC_FEE_RATE * shares_to_add * price
-            total_cost += finra_taf + sec_fee
-    else:
-        for i in range(num_subs):
-            target = target_shares[i]
-            finra_taf = min(FINRA_TAF_RATE * target, FINRA_TAF_MAX)
-            sec_fee = SEC_FEE_RATE * target * price
-            total_cost += finra_taf + sec_fee
-
-    return total_cost
 
 @jit(nopython=True)
 def calculate_slippage(is_long: bool, price: float, trade_size: int, volume: float, avg_volume: float, slippage_factor: float, is_entry: bool) -> float:
@@ -307,10 +281,6 @@ class TradePosition:
     @staticmethod
     def calculate_shares_per_sub(total_shares: int, num_subs: int) -> np.ndarray:
         return calculate_shares_per_sub(total_shares, num_subs)
-    
-    @staticmethod
-    def estimate_entry_cost(total_shares: int, times_buying_power: float, is_long: bool, price: float, existing_sub_positions: Optional[np.ndarray] = np.array([])) -> float:
-        return estimate_entry_cost(total_shares, times_buying_power, is_long, price, existing_sub_positions)
     
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime, sub_position: SubPosition) -> float:
         is_sell = (self.is_long and not is_entry) or (not self.is_long and is_entry)
