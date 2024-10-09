@@ -10,13 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from numba import jit
-
 import logging
-
-debug = False
-def debug_print(*args, **kwargs):
-    if debug:
-        print(*args, **kwargs)
 
     
 # https://alpaca.markets/blog/reg-taf-fees/
@@ -136,15 +130,10 @@ class Transaction:
     vwap: float
     realized_pl: Optional[float] = None # None if is_entry is True
     
-    # def __post_init__(self):
-    #     if not self.is_long and not self.is_entry:
-    #         assert self.stock_borrow_cost != 0
-    #     else:
-    #         assert self.stock_borrow_cost == 0
-
 
 @dataclass
 class SubPosition:
+    is_long: bool
     entry_time: datetime
     entry_price: float
     shares: int
@@ -160,12 +149,27 @@ class SubPosition:
         self.update_market_value(self.entry_price)
 
     def update_market_value(self, current_price: float):
-        self.market_value = self.shares * current_price
+        self.market_value = self.shares * current_price if self.is_long else -self.shares * current_price
         self.unrealized_pl = self.market_value - (self.shares * self.entry_price)
 
     def add_transaction(self, transaction: Transaction):
         self.transactions.append(transaction)
+        
+    def calculate_average_entry_price(self) -> float:
+        total_cost = 0
+        total_shares = 0
+        for transaction in self.transactions:
+            if transaction.is_entry:
+                total_cost += transaction.price * transaction.shares
+                total_shares += transaction.shares
+        return total_cost / total_shares if total_shares > 0 else 0
 
+    def calculate_realized_pl(self, exit_price: float, shares_sold: int) -> float:
+        if self.is_long:
+            return (exit_price - self.entry_price) * shares_sold
+        else:
+            return (self.entry_price - exit_price) * shares_sold
+        
 @dataclass
 class TradePosition:
     date: date
@@ -178,7 +182,6 @@ class TradePosition:
     use_margin: bool
     is_marginable: bool
     times_buying_power: float
-    # actual_margin_multiplier: float
     entry_price: float
     market_value: float = 0.0
     shares: int = 0
@@ -259,7 +262,6 @@ class TradePosition:
         self.logger.log(level, message)
     
     def __post_init__(self):
-        # self.market_value = self.initial_shares * self.entry_price
         self.market_value = 0
         self.shares = 0
         self.last_price = self.entry_price
@@ -269,12 +271,8 @@ class TradePosition:
         
         self.logger = self.setup_logger(logging.WARNING)
         
-        debug_print(f'initial_shares {self.initial_shares}')
+        self.log(f'initial_shares {self.initial_shares}',level=logging.DEBUG)
 
-
-    def initial_entry(self, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares, vwap, volume, avg_volume, slippage_factor)
-        
     @property
     def is_open(self) -> bool:
         return any(sp.exit_time is None for sp in self.sub_positions)
@@ -301,140 +299,6 @@ class TradePosition:
         assert t < 1e-8, \
             f"Market value mismatch: {self.market_value} != {sum(sp.market_value for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        num_subs = self.calculate_num_sub_positions(self.times_buying_power)
-        new_total_shares = self.shares - shares_to_sell
-        assert new_total_shares % num_subs == 0, f"Total shares {new_total_shares} is not evenly divisible by number of sub-positions {num_subs}"
-
-        debug_print(f"DEBUG: partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}")
-        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
-        
-        adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
-        # adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, avg_volume, volatility, False, slippage_factor, beta)
-
-        cash_released = 0
-        realized_pl = 0
-        fees = 0
-
-        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
-        total_shares = sum(sp.shares for sp in active_sub_positions)
-        shares_sold_per_position = []
-
-        for sp in active_sub_positions:
-            assert sp.shares == int(float(total_shares)/float(num_subs)), (sp.shares, total_shares, num_subs)
-            shares_sold = int(shares_to_sell * (float(sp.shares) / float(total_shares)))
-            if shares_sold > 0:
-                sub_cash_released = (float(shares_sold) / float(sp.shares)) * sp.cash_committed
-                sp_realized_pl = (adjusted_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - adjusted_price) * shares_sold
-                
-                old_shares = sp.shares
-                sp.shares -= shares_sold
-                sp.cash_committed -= sub_cash_released
-                sp.realized_pl += sp_realized_pl
-                # sp.update_market_value(exit_price)
-
-                cash_released += sub_cash_released
-                realized_pl += sp_realized_pl
-                
-                fees += self.add_transaction(exit_time, shares_sold, adjusted_price, is_entry=False, vwap=vwap, sub_position=sp, sp_realized_pl=sp_realized_pl)
-
-                debug_print(f"DEBUG: Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
-                    f"Realized PnL: {sp_realized_pl:.4f}, Cash released: {sub_cash_released:.4f}, "
-                    f"Old shares: {old_shares}, New shares: {sp.shares}")
-                
-                shares_sold_per_position.append(shares_sold)
-
-        self.shares -= shares_to_sell
-        self.cash_committed -= cash_released
-        self.update_market_value(adjusted_price)
-        self.partial_exit_count += 1
-
-        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
-        assert t < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
-        assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
-            f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
-
-        debug_print(f"DEBUG: Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}")
-        debug_print("DEBUG: Remaining sub-positions:")
-        for i, sp in enumerate(self.sub_positions):
-            if sp.shares > 0:
-                debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
-
-        return realized_pl, cash_released, fees, shares_sold_per_position
-
-    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        debug_print(f"DEBUG: partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}")
-        debug_print(f"DEBUG: Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}")
-
-        adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
-        # adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, avg_volume, volatility, True, slippage_factor, beta)
-
-        new_total_shares = self.shares + shares_to_buy
-        new_num_subs = self.calculate_num_sub_positions(self.times_buying_power)
-        assert new_total_shares % new_num_subs == 0, f"Total shares {new_total_shares} is not evenly divisible by number of sub-positions {new_num_subs}"
-
-        additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
-
-        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
-        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
-        shares_bought_per_position = []
-
-        fees = 0
-        shares_added = 0
-
-        debug_print(f"DEBUG: Target shares per sub-position: {target_shares}")
-
-        for i, target in enumerate(target_shares):
-            if i < len(active_sub_positions):
-                # Existing sub-position
-                sp = active_sub_positions[i]
-                shares_to_add = target - sp.shares
-                if shares_to_add > 0:
-                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
-                    old_shares = sp.shares
-                    sp.shares += shares_to_add
-                    sp.cash_committed += sub_cash_committed
-                    # sp.update_market_value(entry_price)
-                    fees += self.add_transaction(entry_time, shares_to_add, adjusted_price, is_entry=True, vwap=vwap, sub_position=sp)
-                    shares_added += shares_to_add
-                    debug_print(f"DEBUG: Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
-                        f"Cash committed: {sub_cash_committed:.4f}, Old shares: {old_shares}, New shares: {sp.shares}")
-                    
-                    shares_bought_per_position.append(shares_to_add)
-            else:
-                # New sub-position
-                sub_cash_committed = (target * entry_price) / self.times_buying_power
-                new_sub = SubPosition(entry_time, adjusted_price, target, sub_cash_committed)
-                self.sub_positions.append(new_sub)
-                fees += self.add_transaction(entry_time, target, adjusted_price, is_entry=True, vwap=vwap, sub_position=new_sub)
-                shares_added += target
-                debug_print(f"DEBUG: Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
-                    f"Cash committed: {sub_cash_committed:.4f}")
-                
-                shares_bought_per_position.append(target)
-
-        self.shares += shares_added
-        self.cash_committed += additional_cash_committed
-        self.update_market_value(adjusted_price)
-        self.partial_entry_count += 1
-
-        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
-        assert t < 1e-8, \
-            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
-        assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
-            f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
-
-        debug_print(f"DEBUG: Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
-            f"New cash committed: {self.cash_committed:.4f}")
-        debug_print("DEBUG: Current sub-positions:")
-        for i, sp in enumerate(self.sub_positions):
-            if sp.shares > 0:
-                debug_print(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}")
-        # debug_print(f"DEBUG: Current Realized PnL: {self.realized_pl:.4f}, "
-        #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}")
-        
-        return additional_cash_committed, fees, shares_bought_per_position
 
     @staticmethod
     def calculate_num_sub_positions(times_buying_power: float) -> int:
@@ -476,14 +340,8 @@ class TradePosition:
                 holding_time = timestamp - entry_transaction.timestamp
                 days_held = float(holding_time.total_seconds()) / float(24 * 60 * 60)
                 total_cost += relevant_shares * price * daily_borrow_rate * days_held
-                
-                # debug_print(f"Entry: {entry_transaction.timestamp}, Total Shares: {entry_transaction.shares}, Relevant Shares: {relevant_shares}, Days Held: {days_held:.2f}")
-            
             assert cumulative_shares == shares, f"Mismatch in shares calculation: {cumulative_shares} != {shares}"
             stock_borrow_cost = total_cost
-
-        # debug_print(f"FINRA TAF: {finra_taf:.6f}, SEC Fee: {sec_fee:.6f}, Stock Borrow Cost: {stock_borrow_cost:.6f}")
-        # return finra_taf + sec_fee + stock_borrow_cost
         return finra_taf, sec_fee, stock_borrow_cost
 
 
@@ -494,7 +352,7 @@ class TradePosition:
         value = -shares * price if is_entry else shares * price
         
         if is_entry:
-            debug_print('add_transaction', shares, transaction_cost)
+            self.log(f'add_transaction {shares} {transaction_cost}',level=logging.DEBUG)
         
         transaction = Transaction(timestamp, shares, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, value, vwap, sp_realized_pl)
         self.transactions.append(transaction)
@@ -505,10 +363,149 @@ class TradePosition:
                 raise ValueError("sp_realized_pl must be provided for exit transactions")
             self.realized_pl += sp_realized_pl
             
-        debug_print(f"DEBUG: Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
-            f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pl if sp_realized_pl is not None else 'N/A'}")
+        self.log(f"Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
+            f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {sp_realized_pl if sp_realized_pl is not None else 'N/A'}",level=logging.DEBUG)
 
         return transaction_cost
+
+
+    def initial_entry(self, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
+        return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares, vwap, volume, avg_volume, slippage_factor)
+        
+    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
+        self.log(f"partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}",level=logging.DEBUG)
+        self.log(f"Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}",level=logging.DEBUG)
+
+        adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
+        # adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, avg_volume, volatility, True, slippage_factor, beta)
+
+        new_total_shares = self.shares + shares_to_buy
+        new_num_subs = self.calculate_num_sub_positions(self.times_buying_power)
+        assert new_total_shares % new_num_subs == 0, f"Total shares {new_total_shares} is not evenly divisible by number of sub-positions {new_num_subs}"
+
+        additional_cash_committed = (shares_to_buy * entry_price) / self.times_buying_power
+
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        target_shares = self.calculate_shares_per_sub(new_total_shares, new_num_subs)
+        shares_bought_per_position = []
+
+        fees = 0
+        shares_added = 0
+
+        self.log(f"Target shares per sub-position: {target_shares}",level=logging.DEBUG)
+
+        for i, target in enumerate(target_shares):
+            if i < len(active_sub_positions):
+                # Existing sub-position
+                sp = active_sub_positions[i]
+                shares_to_add = target - sp.shares
+                if shares_to_add > 0:
+                    sub_cash_committed = (shares_to_add * entry_price) / self.times_buying_power
+                    old_shares = sp.shares
+                    sp.shares += shares_to_add
+                    sp.cash_committed += sub_cash_committed
+
+                    fees += self.add_transaction(entry_time, shares_to_add, adjusted_price, is_entry=True, vwap=vwap, sub_position=sp)
+                    shares_added += shares_to_add
+                    self.log(f"Adding to sub-position {i} - Entry price: {sp.entry_price:.4f}, Shares added: {shares_to_add}, "
+                        f"Cash committed: {sub_cash_committed:.4f}, Old shares: {old_shares}, New shares: {sp.shares}",level=logging.DEBUG)
+                    
+                    shares_bought_per_position.append(shares_to_add)
+            else:
+                # New sub-position
+                sub_cash_committed = (target * entry_price) / self.times_buying_power
+                new_sub = SubPosition(self.is_long, entry_time, adjusted_price, target, sub_cash_committed)
+                self.sub_positions.append(new_sub)
+                fees += self.add_transaction(entry_time, target, adjusted_price, is_entry=True, vwap=vwap, sub_position=new_sub)
+                shares_added += target
+                self.log(f"Created new sub-position {i} - Entry price: {entry_price:.4f}, Shares: {target}, "
+                    f"Cash committed: {sub_cash_committed:.4f}",level=logging.DEBUG)
+                
+                shares_bought_per_position.append(target)
+
+        self.shares += shares_added
+        self.cash_committed += additional_cash_committed
+        self.update_market_value(adjusted_price)
+        self.partial_entry_count += 1
+
+        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
+        assert t < 1e-8, \
+            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
+        assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
+            f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
+
+        self.log(f"Partial entry complete - Shares added: {shares_added}, New total shares: {self.shares}, "
+            f"New cash committed: {self.cash_committed:.4f}",level=logging.DEBUG)
+        self.log("Current sub-positions:",level=logging.DEBUG)
+        for i, sp in enumerate(self.sub_positions):
+            if sp.shares > 0:
+                self.log(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}",level=logging.DEBUG)
+        # self.log(f"Current Realized PnL: {self.realized_pl:.4f}, "
+        #     f"Total Transaction Costs: {sum(t.transaction_cost for t in self.transactions):.4f}",level=logging.DEBUG)
+        
+        return additional_cash_committed, fees, shares_bought_per_position
+
+    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
+        num_subs = self.calculate_num_sub_positions(self.times_buying_power)
+        new_total_shares = self.shares - shares_to_sell
+        assert new_total_shares % num_subs == 0, f"Total shares {new_total_shares} is not evenly divisible by number of sub-positions {num_subs}"
+
+        self.log(f"partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}",level=logging.DEBUG)
+        self.log(f"Current position - Shares: {self.shares}, Cash committed: {self.cash_committed:.4f}",level=logging.DEBUG)
+        
+        adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
+        # adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, avg_volume, volatility, False, slippage_factor, beta)
+
+        cash_released = 0
+        realized_pl = 0
+        fees = 0
+
+        active_sub_positions = [sp for sp in self.sub_positions if sp.shares > 0]
+        total_shares = sum(sp.shares for sp in active_sub_positions)
+        shares_sold_per_position = []
+
+        for sp in active_sub_positions:
+            assert sp.shares == int(float(total_shares)/float(num_subs)), (sp.shares, total_shares, num_subs)
+            shares_sold = int(shares_to_sell * (float(sp.shares) / float(total_shares)))
+            if shares_sold > 0:
+                sub_cash_released = (float(shares_sold) / float(sp.shares)) * sp.cash_committed
+                # sp_realized_pl = (adjusted_price - sp.entry_price) * shares_sold if self.is_long else (sp.entry_price - adjusted_price) * shares_sold
+                sp_realized_pl = sp.calculate_realized_pl(adjusted_price, shares_sold)
+                
+                old_shares = sp.shares
+                sp.shares -= shares_sold
+                sp.cash_committed -= sub_cash_released
+                sp.realized_pl += sp_realized_pl
+
+                cash_released += sub_cash_released
+                realized_pl += sp_realized_pl
+                
+                fees += self.add_transaction(exit_time, shares_sold, adjusted_price, is_entry=False, vwap=vwap, sub_position=sp, sp_realized_pl=sp_realized_pl)
+
+                self.log(f"Selling from sub-position - Entry price: {sp.entry_price:.4f}, Shares sold: {shares_sold}, "
+                    f"Realized PnL: {sp_realized_pl:.4f}, Cash released: {sub_cash_released:.4f}, "
+                    f"Old shares: {old_shares}, New shares: {sp.shares}",level=logging.DEBUG)
+                
+                shares_sold_per_position.append(shares_sold)
+
+        self.shares -= shares_to_sell
+        self.cash_committed -= cash_released
+        self.update_market_value(adjusted_price)
+        self.partial_exit_count += 1
+
+        t = abs(self.cash_committed - sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0))
+        assert t < 1e-8, \
+            f"Cash committed mismatch: {self.cash_committed} != {sum(sp.cash_committed for sp in self.sub_positions if sp.shares > 0)}, diff {t}"
+        assert self.shares == sum(sp.shares for sp in self.sub_positions if sp.shares > 0), \
+            f"Shares mismatch: {self.shares} != {sum(sp.shares for sp in self.sub_positions if sp.shares > 0)}"
+
+        self.log(f"Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}",level=logging.DEBUG)
+        self.log("Remaining sub-positions:",level=logging.DEBUG)
+        for i, sp in enumerate(self.sub_positions):
+            if sp.shares > 0:
+                self.log(f"  Sub-position {i}: Shares: {sp.shares}, Entry price: {sp.entry_price:.4f}",level=logging.DEBUG)
+
+        return realized_pl, cash_released, fees, shares_sold_per_position
 
     # customized to specific strategy
     def update_stop_price(self, current_price: float, current_timestamp: datetime):
@@ -572,23 +569,23 @@ class TradePosition:
 
     @property
     def entry_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions if t.is_entry) # / self.times_buying_power
+        return sum(t.transaction_cost for t in self.transactions if t.is_entry)
 
     @property
     def exit_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions if not t.is_entry) # / self.times_buying_power
+        return sum(t.transaction_cost for t in self.transactions if not t.is_entry)
 
     @property
     def total_transaction_costs(self) -> float:
-        return sum(t.transaction_cost for t in self.transactions) # / self.times_buying_power
+        return sum(t.transaction_cost for t in self.transactions)
 
     @property
     def get_unrealized_pl(self) -> float:
-        return self.unrealized_pl # / self.times_buying_power
+        return self.unrealized_pl
 
     @property
     def get_realized_pl(self) -> float:
-        return self.realized_pl # / self.times_buying_power
+        return self.realized_pl
 
     @property
     def pl(self) -> float:
@@ -596,7 +593,7 @@ class TradePosition:
 
     @property
     def plpc(self) -> float:
-        # NOTE: initial_balance is the invest amount divided my actual_margin_multiplier, so reflective of account balance but not
+        # NOTE: currently, initial_balance is passed in as the invest amount divided my times_buying_power, so reflective of usable cash but not margin
         return (self.pl / self.initial_balance) * 100
 
     @property
@@ -607,16 +604,7 @@ class TradePosition:
         avg_exit_price = sum(sp.exit_price * sp.shares for sp in self.sub_positions) / sum(sp.shares for sp in self.sub_positions)
         diff = avg_exit_price - avg_entry_price
         return diff if self.is_long else -diff
-                
-    @property
-    def total_investment(self) -> float:
-        return sum(sp.entry_price * sp.shares for sp in self.sub_positions)
-
-    @property
-    def margin_used(self) -> float:
-        return self.total_investment - self.initial_balance
-
-
+    
 
 def export_trades_to_csv(trades: List[TradePosition], filename: str):
     """
@@ -654,7 +642,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     if len(os.path.dirname(filename)) > 0:
         os.makedirs(os.path.dirname(filename), exist_ok=True)
     df.to_csv(filename, index=False)
-    debug_print(f"Trade summary has been exported to {filename}")
+    print(f"Trade summary has been exported to {filename}")
 
 
 def time_to_minutes(t: time2):
@@ -972,7 +960,7 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
         # Save the figure
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         plt.savefig(filename, dpi=300)
-        debug_print(f"Graph has been saved as {filename}")
+        print(f"Graph has been saved as {filename}")
     else:
         plt.show()
         
