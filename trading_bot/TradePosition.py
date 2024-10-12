@@ -566,16 +566,6 @@ class TradePosition:
         # NOTE: currently, initial_balance is passed in as the invest amount divided my times_buying_power, so reflective of usable cash but not margin
         return (self.pl / self.initial_balance) * 100
 
-    @property
-    def price_diff(self) -> float:
-        if not self.sub_positions or any(sp.exit_time is None for sp in self.sub_positions):
-            return 0
-        avg_entry_price = sum(sp.entry_price * sp.shares for sp in self.sub_positions) / sum(sp.shares for sp in self.sub_positions)
-        avg_exit_price = sum(sp.exit_price * sp.shares for sp in self.sub_positions) / sum(sp.shares for sp in self.sub_positions)
-        diff = avg_exit_price - avg_entry_price
-        return diff if self.is_long else -diff
-    
-
 def export_trades_to_csv(trades: List[TradePosition], filename: str):
     """
     Export the trades data to a CSV file using pandas.

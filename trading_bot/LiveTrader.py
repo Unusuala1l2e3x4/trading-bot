@@ -7,22 +7,23 @@ from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.stream import TradingStream
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
+from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest, LimitOrderRequest, StopLimitOrderRequest, TrailingStopOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce, OrderType
-from alpaca.trading.models import Order
+from alpaca.trading.models import Order, TradeUpdate
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from collections import defaultdict
 
 from alpaca.data.models import Bar
 
 from TradePosition import TradePosition
 from TouchArea import TouchArea
-from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable
+from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable, IntendedOrder
 from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters, np_mean, np_median, fill_missing_data
 
 from tqdm import tqdm
@@ -82,6 +83,52 @@ def fill_latest_missing_data(df, latest_timestamp):
         
     # No return statement as requested; df is modified in place if necessary.
 
+def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]):
+    assert len(orders_list) <= 2
+    
+    if len(orders_list) == 1:
+        return orders_list
+
+    if len(orders_list) == 2:
+        first_order, second_order = orders_list
+        
+        assert first_order.symbol == second_order.symbol, f"{first_order.symbol} == {second_order.symbol}"
+        # if first_order.symbol != second_order.symbol:
+        #     return orders_list
+
+        # Assert that the first order is a close and the second is an open
+        assert first_order.action == 'close' and second_order.action == 'open', \
+            f"When two orders are present, the first must be a close and the second must be an open. ({first_order.action}, {second_order.action})"
+
+        # Case 1: Same order side (closing one direction and opening the opposite)
+        if first_order.side == second_order.side:
+            assert first_order.position.is_long != second_order.position.is_long, (first_order.position.is_long, second_order.position.is_long)
+            # These orders must be executed sequentially
+            return orders_list
+
+        # Case 2: Different order side (closing and reopening in the same direction)
+        else:
+            assert first_order.position.is_long == second_order.position.is_long, (first_order.position.is_long, second_order.position.is_long)
+            # Determine the resulting order details
+            qty_difference = first_order.qty - second_order.qty
+            if qty_difference == 0:
+                # return []  # No order needed if quantities cancel out
+                side = None
+            else:
+                side = first_order.side if qty_difference > 0 else second_order.side
+            
+            combined_order = IntendedOrder(
+                action = second_order.action, # == 'open'
+                side = side,
+                symbol = second_order.symbol,
+                qty = abs(qty_difference),
+                price = second_order.price,  # 2nd order price might be more recent
+                position = second_order.position
+            )
+            return [combined_order]
+
+    # If there are more than 2 orders, raise an error
+    raise ValueError("More than 2 orders in a minute is not supported")
 
 @dataclass
 class LiveTrader:
@@ -95,25 +142,30 @@ class LiveTrader:
     
     trading_client: TradingClient = field(init=False)
     data_stream: StockDataStream = field(init=False)
+    trading_stream: TradingStream = field(init=False)
     historical_client: StockHistoricalDataClient = field(init=False)
     trading_strategy: Optional[TradingStrategy] = None
     balance: float = field(init=False)
     data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    trade_updates: List[TradeUpdate] = field(default_factory=list)
     is_ready: bool = False
     gap_filled: bool = False
     streamed_data: pd.DataFrame = field(default_factory=pd.DataFrame)
     last_historical_timestamp: Optional[pd.Timestamp] = None
     first_streamed_timestamp: Optional[pd.Timestamp] = None
     open_positions: Dict = field(default_factory=dict)
+    open_order_ids: Set = field(default_factory=set)
     area_ids_to_remove: defaultdict = field(default_factory=lambda: defaultdict(set))
     ny_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
     logger: logging.Logger = field(init=False)
-    trades: List = field(default_factory=list)
+    trades: List[TradePosition] = field(default_factory=list)
 
     def __post_init__(self):
-        self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
+        self.trading_client = TradingClient(self.api_key, self.secret_key, paper= livepaper == 'paper')
         self.data_stream = StockDataStream(self.api_key, self.secret_key, feed=DataFeed.IEX, 
-                                           websocket_params={"ping_interval": 1, "ping_timeout": 180, "max_queue": 1024})
+                                           websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
+        self.trading_stream = TradingStream(self.api_key, self.secret_key, paper= livepaper == 'paper',
+                                           websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
         self.balance = self.initial_balance
         self.logger = self.setup_logger(logging.INFO)
@@ -398,27 +450,41 @@ class LiveTrader:
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
             #     self.log(f'after mask:\n{self.trading_strategy.df}')
 
-            orders, positions_to_remove = self.trading_strategy.process_live_data(current_time)
-            self.trades.extend(positions_to_remove)
-            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
+            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time)
 
-            if orders:
-                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders)} ORDERS CREATED")  
+
+            if orders_list:
+                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders_list)} ORDERS CREATED")  
                 
-                # if not self.simulation_mode:
-                #     # Place all orders concurrently
-                #     await asyncio.gather(*[self.place_order(order) for order in orders])
-                # else:
-                #     # In simulation mode, just log the orders
-                #     # for order in orders:
-                #     #     self.log({k:order[k] for k in order if k != 'position'})
-
-                #     self.log(f"{[f"{a['position'].id} {a['position'].is_long} {a['action']} {str(a['order_side']).split('.')[1]} {int(a['qty'])} * {a['price']}, width {a['position'].area.get_range:.4f}" for a in orders]} {self.trading_strategy.balance:.4f}")
-                #     # self.balance not updated yet
+                if not self.simulation_mode:
+                    # Place all orders concurrently
+                    
+                    orders_list = combine_two_orders_same_symbol(orders_list)
+                    
+                    # not sure how to do this. 2 options:
+                    # for order in orders_list:
+                    #     await self.place_order(order) # NOTE: preferred, MUST be sequential unless different symbol
+                    # await asyncio.gather(*[self.place_order(order) for order in orders_list])
+                else:
+                    # In simulation mode, just log the orders (already done in TradingStrategy)
+                    
+                    # self.log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f} after {len(orders_list)} orders.", level=logging.INFO)
+                    # self.log(f"    market value ${self.total_market_value:.4f}, margin used ${self.margin_used:.4f}, buying power ${self.buying_power:.4f}", level=logging.INFO)
+                    
+                    for a in orders_list:
+                        # self.log({k:order[k] for k in order if k != 'position'})
+                        peak = a.position.max_price if a.position.is_long else a.position.min_price
+                        self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
+                            level=logging.INFO)
+                        
+                    # self.log(f"{[f"{a.position.id} {a.position.is_long} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, width {a.position.area.get_range:.4f}" for a in orders_list]} {self.trading_strategy.balance:.4f}")
                     
                     
-                # if orders[0]['action'] == 'open':
-                #     self.log(self.trading_strategy.df)
+                    # NOTE: self.balance not updated yet
+                    
+                    
+                if orders_list[0].action == 'open':
+                    self.log(self.trading_strategy.df)
                     
                     
                     
@@ -428,56 +494,160 @@ class LiveTrader:
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
                 pass
             
+            
+            # do after to not slow things down
+            self.trades.extend(positions_to_remove)
+            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
+            
+            
         except Exception as e:
             self.log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
             raise e
 
     def calculate_touch_detection_area(self, market_hours=None, current_timestamp=None):
         return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp, self.area_ids_to_remove)
+    
+    async def place_order(self, intended_order: IntendedOrder):
+        assert isinstance(intended_order.qty, int)
+        assert isinstance(intended_order.side, OrderSide)
+        
+        # class TimeInForce(str, Enum):
+        #     """
+        #     Represents the various time in force options for an Order.
 
-    async def place_order(self, order):
-        assert isinstance(order['qty'], int)
-        assert isinstance(order['order_side'], OrderSide)
+        #     The Time-In-Force values supported by Alpaca vary based on the order's security type. Here is a breakdown of the supported TIFs for each specific security type:
+        #     - Equity trading: day, gtc, opg, cls, ioc, fok.
+        #     - Options trading: day.
+        #     - Crypto trading: gtc, ioc.
+        #     Below are the descriptions of each TIF:
+        #     - day: A day order is eligible for execution only on the day it is live. By default, the order is only valid during Regular Trading Hours (9:30am - 4:00pm ET). 
+        #             If unfilled after the closing auction, it is automatically canceled. If submitted after the close, it is queued and submitted the following trading day. 
+        #             However, if marked as eligible for extended hours, the order can also execute during supported extended hours.
+        #     - gtc: The order is good until canceled. Non-marketable GTC limit orders are subject to price adjustments to offset corporate actions affecting the issue. 
+        #             We do not currently support Do Not Reduce(DNR) orders to opt out of such price adjustments.
+        #     - opg: Use this TIF with a market/limit order type to submit “market on open” (MOO) and “limit on open” (LOO) orders. This order is eligible to execute only in 
+        #             the market opening auction. Any unfilled orders after the open will be cancelled. OPG orders submitted after 9:28am but before 7:00pm ET will be rejected. 
+        #             OPG orders submitted after 7:00pm will be queued and routed to the following day’s opening auction. On open/on close orders are routed to the primary exchange. 
+        #             Such orders do not necessarily execute exactly at 9:30am / 4:00pm ET but execute per the exchange’s auction rules.
+        #     - cls: Use this TIF with a market/limit order type to submit “market on close” (MOC) and “limit on close” (LOC) orders. This order is eligible to execute only in 
+        #             the market closing auction. Any unfilled orders after the close will be cancelled. CLS orders submitted after 3:50pm but before 7:00pm ET will be rejected. 
+        #             CLS orders submitted after 7:00pm will be queued and routed to the following day’s closing auction. Only available with API v2.
+        #     - ioc: An Immediate Or Cancel (IOC) order requires all or part of the order to be executed immediately. Any unfilled portion of the order is canceled. 
+        #             Only available with API v2. Most market makers who receive IOC orders will attempt to fill the order on a principal basis only, and cancel any unfilled balance. 
+        #             On occasion, this can result in the entire order being cancelled if the market maker does not have any existing inventory of the security in question.
+        #     - fok: A Fill or Kill (FOK) order is only executed if the entire order quantity can be filled, otherwise the order is canceled. Only available with API v2.
+        #     """
+
+        #     DAY = "day"
+        #     GTC = "gtc"
+        #     OPG = "opg"
+        #     CLS = "cls"
+        #     IOC = "ioc"
+        #     FOK = "fok"
+        
+        
         try:
+            # TODO: REVIEW:
+                # class TimeInForce
+                # https://docs.alpaca.markets/docs/working-with-orders#using-client-order-ids
+                
+            # TODO: figure out out TIF strategy, and apply intended strategy to backtesting first
+            
+            
+            limit_order_request = LimitOrderRequest(
+                symbol=intended_order.symbol,
+                qty=intended_order.qty,
+                side=intended_order.side,
+                
+                time_in_force=TimeInForce.DAY,
+                # probably need to use IOC (needs elite smart router)
+                # or use GTC - cancel it (call cancel_order_by_id) after waiting a couple seconds, or up to next minute (as long as it is a limit order)
+                
+                
+                limit_price=intended_order.price
+            )
+            
+            
             order_request = MarketOrderRequest(
-                symbol=order['symbol'],
-                qty=order['qty'],
-                side=order['order_side'],
+                symbol=intended_order.symbol,
+                qty=intended_order.qty,
+                side=intended_order.side,
                 time_in_force=TimeInForce.DAY
             )
-            # placed_order = self.trading_client.submit_order(order_request)
-            self.log(f"Placed {order['order_side']} order for {order['qty']} shares of {order['symbol']} - {order['action']}")
+            # new_order = self.trading_client.submit_order(order_request) # class Order
+            self.log(f"Placed {intended_order.side} order for {intended_order.qty} shares of {intended_order.symbol} - {intended_order.action}")
             
-            # await self.process_placed_order(placed_order, order)
+            # TODO: wait to receive TradeUpdate, which contains the Order after updates
             
-            # return placed_order
+            # await self.process_new_order(new_order, intended_order) # NOTE: probably not with new order. need to pass in Order from TradeUpdate.
+            
+            # return new_order
         except Exception as e:
             self.log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
             raise e
+        
+    
+    async def on_msg(self, data: TradeUpdate):
+        # Print the update to the console.
+        print("Update for {}. Event: {}.".format(data.event))
+        
+        
+        # TODO: implement this function. we need:
+        # class TradeUpdate(BaseModel):
+        #     """
+        #     Represents a trade update.
 
-    async def process_placed_order(self, placed_order: Order, original_order: dict):
-        # Log order details
-        self.log(f"Order ID: {placed_order.id}")
+        #     ref. https://docs.alpaca.markets/docs/websocket-streaming#example
+        #     """
+
+        #     event: Union[TradeEvent, str]
+        #     execution_id: Optional[UUID] = None
+        #     order: Order
+        #     timestamp: datetime
+        #     position_qty: Optional[float] = None
+        #     price: Optional[float] = None
+        #     qty: Optional[float] = None
+        
+        
+    async def process_new_order(self, new_order: Order, intended_order: IntendedOrder):
+        self.log(f"Order ID: {new_order.id}") # NEED ID FOR CANCELLATION
+        self.log(f"Order Status: {new_order.status}") # assert "new"
+        
+        self.open_order_ids.add(new_order.id)
+        
+        # TODO
+
+
+
+    async def process_order_update(self, placed_order: Order, intended_order: IntendedOrder):
+        # Log NEW order details
+        
+        # see class Order
+        # TODO: this function should handle Order objects from TradeUpdate, not NEW orders
+        
+        
+        
+        self.log(f"Order ID: {placed_order.id}") # NEED ID FOR CANCELLATION
         self.log(f"Order Status: {placed_order.status}")
         self.log(f"Filled Qty: {placed_order.filled_qty}")
         self.log(f"Filled Avg Price: {placed_order.filled_avg_price}")
 
         # Update internal state based on order status
         if placed_order.status == OrderStatus.FILLED:
-            await self.update_position_after_fill(placed_order, original_order)
+            await self.update_position_after_fill(placed_order, intended_order)
         elif placed_order.status == OrderStatus.PARTIALLY_FILLED:
-            await self.handle_partial_fill(placed_order, original_order)
+            await self.handle_partial_fill(placed_order, intended_order)
         elif placed_order.status in [OrderStatus.REJECTED, OrderStatus.CANCELED]:
-            await self.handle_failed_order(placed_order, original_order)
+            await self.handle_failed_order(placed_order, intended_order)
         else:
             # For other statuses like NEW, ACCEPTED, etc.
             self.log(f"Order {placed_order.id} is in {placed_order.status} status. Waiting for fill.")
 
-    async def update_position_after_fill(self, placed_order: Order, original_order: dict):
+    async def update_position_after_fill(self, placed_order: Order, intended_order: IntendedOrder):
         self.log(f"Order {placed_order.id} filled completely - {placed_order.filled_qty} out of {placed_order.qty}")
         
-        position = original_order['position']
-        action = original_order['action']
+        position = intended_order.position
+        action = intended_order.action
         
         if action == 'open':
             # Update the position with actual filled quantity and price
@@ -485,10 +655,14 @@ class LiveTrader:
             position.entry_price = float(placed_order.filled_avg_price)
         elif action in ['partial_entry', 'partial_exit', 'close']:
             # Update the position for partial fills
-            if original_order['order_side'] == OrderSide.BUY:
-                position.shares += int(placed_order.filled_qty)
-            else:
-                position.shares -= int(placed_order.filled_qty)
+            
+            if (position.is_long and intended_order.side == OrderSide.BUY) or (not position.is_long and intended_order.side == OrderSide.SELL): # entry
+                # position.shares += int(placed_order.filled_qty)
+                position.shares -= (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+            else: # exit
+                # position.shares -= int(placed_order.filled_qty) 
+                position.shares += (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+                
         # elif action == 'close':
         #     # Remove the position from open positions -> already done in TradingStrategy
         #     del self.trading_strategy.open_positions[position.area.id]
@@ -501,27 +675,35 @@ class LiveTrader:
         
 
         # Recalculate account balance
-        self.recalculate_balance(placed_order, original_order)
+        self.recalculate_balance(placed_order, intended_order)
 
-    async def handle_partial_fill(self, placed_order: Order, original_order: dict):
+    async def handle_partial_fill(self, placed_order: Order, intended_order: IntendedOrder):
         self.log(f"Order {placed_order.id} partially filled. Filled {placed_order.filled_qty} out of {placed_order.qty}")
         # Update position with partially filled amount
-        await self.update_position_after_fill(placed_order, original_order)
+        await self.update_position_after_fill(placed_order, intended_order)
+        
+        # TODO: modify max_price of the corresponding position; be sure to replace/update the position in self.trading_strategy.open_positions
+        
         # You might want to create a new order for the remaining quantity
         remaining_qty = float(placed_order.qty) - float(placed_order.filled_qty)
         if remaining_qty > 0:
-            new_order = original_order.copy()
-            new_order['qty'] = remaining_qty
+            new_order = intended_order.copy()
+            new_order.qty = remaining_qty
             await self.place_order(new_order)
 
-    async def handle_failed_order(self, placed_order: Order, original_order: dict):
+
+
+
+
+
+    async def handle_failed_order(self, placed_order: Order, intended_order: IntendedOrder):
         self.log(f"Order {placed_order.id} failed with status {placed_order.status}")
         # Implement logic to handle failed orders (e.g., retry, adjust strategy, etc.)
 
-    def recalculate_balance(self, placed_order: Order, original_order: dict):
+    def recalculate_balance(self, placed_order: Order, intended_order: IntendedOrder):
         # Recalculate balance based on the filled order
         filled_value = float(placed_order.filled_qty) * float(placed_order.filled_avg_price)
-        if original_order['order_side'] == OrderSide.BUY:
+        if intended_order.side == OrderSide.BUY:
             self.balance -= filled_value
         else:
             self.balance += filled_value
@@ -595,8 +777,12 @@ class LiveTrader:
                 await self.reset_daily_data()
 
                 self.data_stream.subscribe_bars(self.on_bar, self.symbol)
-
-
+        
+                self.data_stream.subscribe_quotes(self.on_quote, self.symbol)
+                
+                self.trading_stream.subscribe_trade_updates
+                
+                
                 update_task = asyncio.create_task(self.update_historical_periodically())
                 stream_task = asyncio.create_task(self.data_stream._run_forever())
                 

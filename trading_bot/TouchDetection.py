@@ -21,14 +21,8 @@ from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 from tqdm import tqdm
 
-# Importing the modules themselves for reloading
-import TouchArea
-
-# Reloading the modules to apply any changes
-import importlib
-importlib.reload(TouchArea)
-
 from TouchArea import TouchArea
+# from MultiSymbolDataRetrieval import retrieve_quote_data
 
 import logging
 import traceback
@@ -619,74 +613,79 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                     qdf.set_index(['symbol', 'timestamp'], inplace=True)
                     print(f'Retrieved quotes from {quotes_zip_path}')
         else:
-            # Now, fetch quote data for each minute interval
+            # # Now, fetch quote data for each minute interval
             minute_intervals = df.index.get_level_values('timestamp')
-            minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time <= time(16, 0))]
-
-            # Initialize an empty list to collect DataFrames
-            quotes_dataframes = []
+            minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 31)) & (minute_intervals.time <= time(15,59))]
             
-            for minute in tqdm(minute_intervals, desc='minute_intervals'):
-                minute_end = minute + timedelta(seconds=1)
+            qdf = pd.DataFrame() # placeholder
+            
+            # # retrieve_quote_data(client, [params.symbol], {params.symbol: minute_intervals}, params) # causes circular import
+            # raise ValueError("Quote data must be already saved for backtesting")
+            
+            # # Initialize an empty list to collect DataFrames
+            # quotes_dataframes = []
+            
+            # for minute in tqdm(minute_intervals, desc='minute_intervals'):
+            #     minute_end = minute + timedelta(seconds=1)
                 
-                # Fetch quote data
-                try:
-                    i = 3
-                    latest_before_earlier = pd.NaT
-                    qdf0 = pd.DataFrame()
-                    while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
-                        # Record start time
-                        start_time = t2.time()
+            #     # Fetch quote data
+            #     try:
+            #         i = 3
+            #         latest_before_earlier = pd.NaT
+            #         qdf0 = pd.DataFrame()
+            #         while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
+            #             # Record start time
+            #             start_time = t2.time()
 
-                        minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
+            #             minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
 
-                        request_params = StockQuotesRequest(
-                            symbol_or_symbols=params.symbol,
-                            start=minute_start.tz_convert('UTC'),
-                            end=minute_end.tz_convert('UTC'),
-                        )
-                        qdf0 = client.get_stock_quotes(request_params).df
+            #             request_params = StockQuotesRequest(
+            #                 symbol_or_symbols=params.symbol,
+            #                 start=minute_start.tz_convert('UTC'),
+            #                 end=minute_end.tz_convert('UTC'),
+            #             )
+            #             qdf0 = client.get_stock_quotes(request_params).df
 
-                        i += 4
-                        if not qdf0.empty:
-                            qdf0 = clean_quotes_data(qdf0)
-                            t = qdf0.index.get_level_values('timestamp')
-                            latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
-                            if not pd.isna(latest_before_earlier):
-                                qdf0 = qdf0[t >= latest_before_earlier]
+            #             i += 4
+            #             if not qdf0.empty:
+            #                 qdf0 = clean_quotes_data(qdf0)
+            #                 t = qdf0.index.get_level_values('timestamp')
+            #                 latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
+            #                 if not pd.isna(latest_before_earlier):
+            #                     qdf0 = qdf0[t >= latest_before_earlier]
 
-                        # Record end time and calculate elapsed time
-                        elapsed_time = t2.time() - start_time
+            #             # Record end time and calculate elapsed time
+            #             elapsed_time = t2.time() - start_time
 
-                        # Calculate remaining sleep time to maintain 0.3 seconds between requests
-                        # 60/1000 = 0.06 sec if we have Elite Smart Router
-                        # 60/10000 = 0.006 sec if we have Algo Trader Plus
-                        remaining_sleep_time = max(0, 0.3 - elapsed_time)
-                        t2.sleep(remaining_sleep_time)
+            #             # Calculate remaining sleep time to maintain 0.3 seconds between requests
+            #             # 60/1000 = 0.06 sec if we have Elite Smart Router
+            #             # 60/10000 = 0.006 sec if we have Algo Trader Plus
+            #             remaining_sleep_time = max(0, 0.3 - elapsed_time)
+            #             t2.sleep(remaining_sleep_time)
 
-                    if not qdf0.empty:
-                        quotes_dataframes.append(qdf0)
+            #         if not qdf0.empty:
+            #             quotes_dataframes.append(qdf0)
                     
-                except Exception as e:
-                    print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
+            #     except Exception as e:
+            #         print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
                     
-                # sleep(0.3)
+            #     # sleep(0.3)
 
-            # Concatenate all the DataFrames
-            if quotes_dataframes:
-                qdf = pd.concat(quotes_dataframes)
-                qdf.sort_index(inplace=True)
-            else:
-                qdf = pd.DataFrame()
+            # # Concatenate all the DataFrames
+            # if quotes_dataframes:
+            #     qdf = pd.concat(quotes_dataframes)
+            #     qdf.sort_index(inplace=True)
+            # else:
+            #     qdf = pd.DataFrame()
 
-            # Save the DataFrame to a CSV file inside a ZIP file
-            if params.export_quotes_path:
-                quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
-                os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
-                with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-                    with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
-                        qdf.reset_index().to_csv(csv_file, index=False)
-                print(f'Saved quotes to {quotes_zip_path}')
+            # # Save the DataFrame to a CSV file inside a ZIP file
+            # if params.export_quotes_path:
+            #     quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
+            #     os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
+            #     with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+            #         with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
+            #             qdf.reset_index().to_csv(csv_file, index=False)
+            #     print(f'Saved quotes to {quotes_zip_path}')
       
     elif isinstance(params, LiveTouchDetectionParameters):
         if data is None:
@@ -885,7 +884,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         raise e
 
 
-def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None):
+def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None, filter_date=None, filter_areas=None):
     """
     Visualizes touch detection areas and price data on a chart.
 
@@ -910,14 +909,21 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     start_time = touch_detection_areas.start_time
     end_time = touch_detection_areas.end_time
     # use_median = touch_detection_areas.use_median
-
-        
+    
+    
     plt.figure(figsize=(14, 7))
-    plt.plot(df.index.get_level_values('timestamp'), df['central_value'], label='central_value', color='yellow')
-    plt.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue')
+    if not filter_date:
+        plt.plot(df.index.get_level_values('timestamp'), df['central_value'], label='central_value', color='yellow')
+        plt.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue')
+    else:
+        df = df.loc[df.index.get_level_values('timestamp').date == filter_date]
+        mask = mask.loc[mask.index.get_level_values('timestamp').date == filter_date]
+        plt.plot(df.index.get_level_values('timestamp'), df['central_value'], label='central_value', color='yellow')
+        plt.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue')
 
     df = df[mask]
     timestamps = df.index.get_level_values('timestamp')
+    
 
     # Prepare data structures for combined plotting
     scatter_data = defaultdict(lambda: defaultdict(list))
@@ -979,13 +985,21 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                     day_timestamps = day_data.index.get_level_values('timestamp')
                     if day_end_time >= day_timestamps[-1]: # only needed for graphing
                         day_end_time = day_timestamps[-1] + pd.Timedelta(minutes=1)
-                
-                end_idx = find_area_end_idx(start_idx, area, day_start_time, day_end_time)
+
+                if area.entries_exits:
+                    exit_time = area.entries_exits[-1][2]
+                    end_idx = df.index.get_loc(df[timestamps == exit_time].index[0])
+                else:
+                    end_idx = find_area_end_idx(start_idx, area, day_start_time, day_end_time)
                 x1 = [timestamps[start_idx].tz_convert(ny_tz), area.get_min_touch_time]
                 x2 = [area.get_min_touch_time, timestamps[end_idx].tz_convert(ny_tz)]
                 
                 if timestamps[end_idx].tz_convert(ny_tz) >= day_end_time:
                     continue
+                        
+                if filter_areas and filter_areas[current_date] and area.id not in filter_areas[current_date]:
+                    continue
+                        
                 scatter_color = 'gray' if i != min_touches - 1 else 'red' if end_idx == start_idx else 'blue'
                 scatter_data[scatter_color][mark_shape].append((touch_time, mark_pos))
                 
@@ -996,7 +1010,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
 
     # for area in tqdm(long_touch_area + short_touch_area, desc='plotting areas'):
     for area in long_touch_area + short_touch_area:
-        process_area(area)
+        if not filter_date or area.date == filter_date:
+            process_area(area)
 
     # Plot combined data
     for color, shape_data in scatter_data.items():
