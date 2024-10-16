@@ -477,22 +477,22 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                         first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, group_size: int = 10):
     quotes_data = {symbol: {'raw': [], 'agg': [], 'last_minute': None, 'acc_carryover': 0} for symbol in symbols}
 
-
-    def filter_first_seconds(symbol_df) -> pd.DataFrame:
+    def filter_first_and_last_seconds(symbol_df: pd.DataFrame) -> pd.DataFrame:
         seconds = symbol_df.index.get_level_values('timestamp').second
-        end_idx = np.searchsorted(seconds, 1, side='left')
-        data = symbol_df.iloc[:end_idx]
-        if len(data) > first_seconds_sample:
-            return data.sample(n=first_seconds_sample, replace=False, random_state=seeds[symbol])
-        return data
-
-    def filter_last_seconds(symbol_df) -> pd.DataFrame:
-        seconds = symbol_df.index.get_level_values('timestamp').second
-        start_idx = np.searchsorted(seconds, 58, side='left')
-        data = symbol_df.iloc[start_idx:]
-        if len(data) > last_seconds_sample:
-            return data.sample(n=last_seconds_sample, replace=False, random_state=seeds[symbol])
-        return data
+        first_end_idx = np.searchsorted(seconds, 1, side='left')
+        last_start_idx = np.searchsorted(seconds, 58, side='left')
+        first_seconds_data = symbol_df.iloc[:first_end_idx]
+        last_seconds_data = symbol_df.iloc[last_start_idx:]
+        
+        if len(first_seconds_data) > first_seconds_sample or len(last_seconds_data) > last_seconds_sample:
+            rs = np.random.RandomState(seeds[symbol])
+            if len(first_seconds_data) > first_seconds_sample:
+                first_indices = rs.choice(first_seconds_data.index, first_seconds_sample, replace=False)
+                first_seconds_data = first_seconds_data.loc[first_indices]
+            if len(last_seconds_data) > last_seconds_sample:
+                last_indices = rs.choice(last_seconds_data.index, last_seconds_sample, replace=False)
+                last_seconds_data = last_seconds_data.loc[last_indices]
+        return pd.concat([first_seconds_data, last_seconds_data])
 
     drop_cols = ['bid_exchange', 'ask_exchange', 'conditions', 'tape']
     
@@ -533,9 +533,8 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                     # log(f'---{symbol} grouped + weighted---')
 
                     # Extract raw data for the previous minute
-                    first_seconds = filter_first_seconds(weighted_data)
-                    last_seconds = filter_last_seconds(weighted_data)
-                    quotes_data[symbol]['raw'].extend([first_seconds.drop('duration', axis=1), last_seconds.drop('duration', axis=1)])
+                    filtered_data = filter_first_and_last_seconds(weighted_data)
+                    quotes_data[symbol]['raw'].append(filtered_data.drop('duration', axis=1))
                     
                     # log(f'---{symbol} raw---')
                     
@@ -567,9 +566,8 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
             weighted_data = apply_grouping_and_weighting(last_minute_df)
             
             # Extract raw data for the last minute
-            first_seconds = filter_first_seconds(weighted_data)
-            last_seconds = filter_last_seconds(weighted_data)
-            quotes_data[symbol]['raw'].extend([first_seconds.drop('duration', axis=1), last_seconds.drop('duration', axis=1)])
+            filtered_data = filter_first_and_last_seconds(weighted_data)
+            quotes_data[symbol]['raw'].append(filtered_data.drop('duration', axis=1))
             
             aggregated_data = aggregate_quotes_time_based(weighted_data)
             quotes_data[symbol]['agg'].append(aggregated_data)
