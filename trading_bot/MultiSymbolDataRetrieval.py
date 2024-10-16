@@ -306,10 +306,10 @@ def retrieve_bar_data(client: StockHistoricalDataClient, symbol, params: Backtes
                                   ('df_split_adjusted', split_adjusted_csv_name),
                                   ('df_dividend_adjusted', dividend_adjusted_csv_name)
                                   ]:
-            # if csv_name not in zip_file.namelist():
-            with zip_file.open(csv_name, 'w') as csv_file:
-                locals()[df_name].reset_index().to_csv(csv_file, index=False)
-            log(f'Saved {df_name} to {bars_zip_path}')
+            if csv_name not in zip_file.namelist():
+                with zip_file.open(csv_name, 'w') as csv_file:
+                    locals()[df_name].reset_index().to_csv(csv_file, index=False)
+                log(f'Saved {df_name} to {bars_zip_path}')
         
         # if adjustments_csv_name not in zip_file.namelist():
         with zip_file.open(adjustments_csv_name, 'w') as csv_file:
@@ -374,7 +374,7 @@ def get_seed(symbol: str, minute: datetime) -> int:
 
 # parallelization doesnt seem to speed it up. using parallel=False for now.
 @jit(nopython=True, parallel=False)
-def compute_weighted_averages(group_indices, group_counts, bid_sizes, ask_sizes, durations):
+def compute_weighted_sizes(group_indices, group_counts, bid_sizes, ask_sizes, durations):
     n = len(group_indices)
     result_bid_sizes = np.empty(n, dtype=np.float64)
     result_ask_sizes = np.empty(n, dtype=np.float64)
@@ -419,7 +419,7 @@ def apply_grouping_and_weighting(df: pd.DataFrame):
     result_durations = np.add.reduceat(durations, group_indices)
     
     # Compute weighted averages using Numba
-    result_bid_sizes, result_ask_sizes = compute_weighted_averages(
+    result_bid_sizes, result_ask_sizes = compute_weighted_sizes(
         group_indices, group_counts, bid_sizes, ask_sizes, durations
     )
     
@@ -438,7 +438,7 @@ def apply_grouping_and_weighting(df: pd.DataFrame):
 
 
 @jit(nopython=True)
-def compute_weighted_sizes(prices, sizes, durations):
+def compute_weighted_sizes_single(prices, sizes, durations):
     n = len(prices)
     result_sizes = np.empty(n, dtype=np.float64)
     current_price = prices[0]
@@ -463,12 +463,12 @@ def compute_weighted_sizes(prices, sizes, durations):
     return result_sizes
 
 @jit(nopython=True)
-def aggregate_data(prices, sizes, unique_timestamps, indices):
+def aggregate_data(prices, sizes, durations, unique_timestamps, indices):
     n = len(prices)
     m = len(unique_timestamps)
     max_prices = np.empty(m, dtype=prices.dtype)
     min_prices = np.empty(m, dtype=prices.dtype)
-    mean_prices = np.empty(m, dtype=prices.dtype)
+    wm_prices = np.empty(m, dtype=prices.dtype)
     max_sizes = np.empty(m, dtype=sizes.dtype)
     sum_sizes = np.empty(m, dtype=sizes.dtype)
     
@@ -478,13 +478,43 @@ def aggregate_data(prices, sizes, unique_timestamps, indices):
         
         group_prices = prices[start:end]
         group_sizes = sizes[start:end]
+        group_durations = durations[start:end]
         
         max_prices[i] = np.max(group_prices)
         min_prices[i] = np.min(group_prices)
-        mean_prices[i] = np.mean(group_prices)
         max_sizes[i] = np.max(group_sizes)
         sum_sizes[i] = np.sum(group_sizes)
-    return max_prices, min_prices, mean_prices, max_sizes, sum_sizes
+        
+        total_duration = np.sum(group_durations)
+        if total_duration == 0:
+            wm_prices[i] = group_prices[0]
+        else:
+            wm_prices[i] = np.sum(group_prices * group_durations) / total_duration
+    
+    return max_prices, min_prices, wm_prices, max_sizes, sum_sizes
+
+@jit(nopython=True)
+def aggregate_spread_data(spreads, durations, unique_timestamps, indices):
+    n = len(spreads)
+    m = len(unique_timestamps)
+    min_spreads = np.empty(m, dtype=spreads.dtype)
+    max_spreads = np.empty(m, dtype=spreads.dtype)
+    weighted_spreads = np.empty(m, dtype=spreads.dtype)
+    for i in range(m):
+        start = indices[i]
+        end = indices[i+1] if i < m-1 else n
+        group_spreads = spreads[start:end]
+        group_durations = durations[start:end]
+        total_duration = np.sum(group_durations)
+        
+        min_spreads[i] = np.min(group_spreads)
+        max_spreads[i] = np.max(group_spreads)
+        
+        if total_duration == 0:
+            weighted_spreads[i] = group_spreads[0]
+        else:
+            weighted_spreads[i] = np.sum(group_spreads * group_durations) / total_duration
+    return min_spreads, max_spreads, weighted_spreads
 
 def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
     df = df.reset_index(drop=False)
@@ -496,17 +526,20 @@ def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
     bid_sizes = df['bid_size'].values
     ask_sizes = df['ask_size'].values
     durations = df['duration'].values
-    spreads = df['spread'].values # TODO
+    spreads = df['spread'].values
     
-    # Re-weight bid and ask sizes
-    bid_sizes = compute_weighted_sizes(bid_prices, bid_sizes, durations)
-    ask_sizes = compute_weighted_sizes(ask_prices, ask_sizes, durations)
-
     floored_timestamps = (timestamps // interval_seconds) * interval_seconds
     unique_timestamps, indices = np.unique(floored_timestamps, return_index=True)
     
-    bid_max, _, bid_mean, bid_size_max, bid_size_sum = aggregate_data(bid_prices, bid_sizes, unique_timestamps, indices)
-    _, ask_min, ask_mean, ask_size_max, ask_size_sum = aggregate_data(ask_prices, ask_sizes, unique_timestamps, indices)
+    # Aggregate spread data
+    min_spreads, max_spreads, weighted_spreads = aggregate_spread_data(spreads, durations, unique_timestamps, indices)
+    
+    # Re-weight bid and ask sizes
+    bid_sizes = compute_weighted_sizes_single(bid_prices, bid_sizes, durations)
+    ask_sizes = compute_weighted_sizes_single(ask_prices, ask_sizes, durations)
+
+    bid_max, _, bid_wm, bid_size_max, bid_size_sum = aggregate_data(bid_prices, bid_sizes, durations, unique_timestamps, indices)
+    _, ask_min, ask_wm, ask_size_max, ask_size_sum = aggregate_data(ask_prices, ask_sizes, durations, unique_timestamps, indices)
     
     # Combine results
     result = pd.DataFrame({
@@ -514,12 +547,15 @@ def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
         'timestamp': pd.to_datetime(unique_timestamps, unit='s', utc=True).tz_convert(ny_tz),
         'max_bid_price': bid_max,
         'min_ask_price': ask_min,
-        'mean_bid_price': bid_mean,
-        'mean_ask_price': ask_mean,
+        'wm_bid_price': bid_wm,
+        'wm_ask_price': ask_wm,
         'max_bid_size': np.floor(bid_size_max),
         'max_ask_size': np.floor(ask_size_max),
         'total_bid_size': np.floor(bid_size_sum),
-        'total_ask_size': np.floor(ask_size_sum)
+        'total_ask_size': np.floor(ask_size_sum),
+        'min_spread': min_spreads,
+        'max_spread': max_spreads,
+        'wm_spread': weighted_spreads
     })
     return result.set_index(['symbol', 'timestamp'])
 
