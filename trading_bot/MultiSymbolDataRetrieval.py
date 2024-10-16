@@ -256,6 +256,7 @@ def retrieve_bar_data(client: StockHistoricalDataClient, symbol, params: Backtes
             
             # Adjust past close values
             past_mask = change_indices.get_level_values('timestamp') < idx[1]
+            # past_mask = change_indices < idx
             if split_adjustment and True in past_mask:
                 df_all_adj.loc[past_mask] /= split_factor
                 df_split_adj.loc[past_mask] /= split_factor
@@ -298,65 +299,28 @@ def retrieve_bar_data(client: StockHistoricalDataClient, symbol, params: Backtes
         
     # Calculate adjustment factors
     adjustment_factors = calculate_adjustments(df, df_unadjusted, df_split_adjusted, df_dividend_adjusted)
-    
-    # TODO: if replacing, need to delete existing file first 
-    
-    with zipfile.ZipFile(bars_zip_path, 'a', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+
+    with zipfile.ZipFile(bars_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
         for df_name, csv_name in [('df', adjusted_csv_name), 
                                   ('df_unadjusted', unadjusted_csv_name),
                                   ('df_split_adjusted', split_adjusted_csv_name),
                                   ('df_dividend_adjusted', dividend_adjusted_csv_name)
                                   ]:
-            if csv_name not in zip_file.namelist():
-                with zip_file.open(csv_name, 'w') as csv_file:
-                    locals()[df_name].reset_index().to_csv(csv_file, index=False)
-                log(f'Saved {df_name} to {bars_zip_path}')
+            # if csv_name not in zip_file.namelist():
+            with zip_file.open(csv_name, 'w') as csv_file:
+                locals()[df_name].reset_index().to_csv(csv_file, index=False)
+            log(f'Saved {df_name} to {bars_zip_path}')
         
-        if adjustments_csv_name not in zip_file.namelist():
-            with zip_file.open(adjustments_csv_name, 'w') as csv_file:
-                adjustment_factors.to_csv(csv_file, index=True)
-            log(f'Saved adjustments to {bars_zip_path}')
+        # if adjustments_csv_name not in zip_file.namelist():
+        with zip_file.open(adjustments_csv_name, 'w') as csv_file:
+            adjustment_factors.to_csv(csv_file, index=True)
+        log(f'Saved adjustments to {bars_zip_path}')
             
     return df, adjustment_factors
 
 
-
-def aggregate_quotes_time_based(quotes_df: pd.DataFrame, interval_seconds=1):
-    quotes_df = quotes_df.reset_index()
-    quotes_df = quotes_df.sort_values('timestamp').copy()
-    quotes_df['interval_start'] = quotes_df['timestamp'].dt.floor(f'{interval_seconds}s')
-    
-    grouped = quotes_df.groupby(['symbol', 'interval_start'])
-    
-    agg_funcs = {
-        'bid_price': ['max', 'mean'],
-        'ask_price': ['min', 'mean'],
-        'bid_size': ['max', 'sum'],
-        'ask_size': ['max', 'sum'],
-    }
-    
-    aggregated = grouped.agg(agg_funcs)
-    aggregated.columns = ['_'.join(col).strip() for col in aggregated.columns.values]
-    
-    aggregated.rename(columns={
-        'bid_price_max': 'max_bid_price',
-        'bid_price_mean': 'mean_bid_price',
-        'ask_price_min': 'min_ask_price',
-        'ask_price_mean': 'mean_ask_price',
-        'bid_size_max': 'max_bid_size',
-        'bid_size_sum': 'total_bid_size',
-        'ask_size_max': 'max_ask_size',
-        'ask_size_sum': 'total_ask_size',
-    }, inplace=True)
-    
-    aggregated_df = aggregated.reset_index()
-    aggregated_df.set_index(['symbol', 'interval_start'], inplace=True)
-    
-    return aggregated_df
-
-
 # Define aggregation functions
-agg_funcs = {
+clean_quotes_data_agg_funcs = {
     'bid_price': 'max',  # Keep the highest bid price
     'ask_price': 'min',  # Keep the lowest ask price
     'bid_size': 'max',   # Keep the largest bid size
@@ -384,7 +348,7 @@ def clean_quotes_data(df: pd.DataFrame, interval_start: pd.Timestamp, interval_e
         return df, (interval_end - interval_start).total_seconds()
 
     # Step 1: Remove duplicate timestamps
-    df = df.groupby(level=['symbol', 'timestamp']).agg(agg_funcs)
+    df = df.groupby(level=['symbol', 'timestamp']).agg(clean_quotes_data_agg_funcs)
     df.index = df.index.set_levels(
         df.index.get_level_values('timestamp').tz_convert(ny_tz),
         level='timestamp'
@@ -408,7 +372,6 @@ SEED_DIV = 2**32
 def get_seed(symbol: str, minute: datetime) -> int:
     return int(hashlib.sha256(f"{symbol}_{minute}".encode()).hexdigest(), 16) % SEED_DIV
 
-
 # parallelization doesnt seem to speed it up. using parallel=False for now.
 @jit(nopython=True, parallel=False)
 def compute_weighted_averages(group_indices, group_counts, bid_sizes, ask_sizes, durations):
@@ -427,8 +390,8 @@ def compute_weighted_averages(group_indices, group_counts, bid_sizes, ask_sizes,
             result_bid_sizes[i] = group_bid_sizes[0]
             result_ask_sizes[i] = group_ask_sizes[0]
         else:
-            result_bid_sizes[i] = np.floor(np.sum(group_bid_sizes * group_durations) / total_duration)
-            result_ask_sizes[i] = np.floor(np.sum(group_ask_sizes * group_durations) / total_duration)
+            result_bid_sizes[i] = np.sum(group_bid_sizes * group_durations) / total_duration
+            result_ask_sizes[i] = np.sum(group_ask_sizes * group_durations) / total_duration
     return result_bid_sizes, result_ask_sizes
 
 def apply_grouping_and_weighting(df: pd.DataFrame):
@@ -466,9 +429,97 @@ def apply_grouping_and_weighting(df: pd.DataFrame):
         'timestamp': pd.to_datetime(result_timestamps, utc=True).tz_convert(ny_tz),
         'bid_price': result_bid_prices,
         'ask_price': result_ask_prices,
+        'spread': result_ask_prices - result_bid_prices,
         'bid_size': result_bid_sizes,
         'ask_size': result_ask_sizes,
         'duration': result_durations
+    })
+    return result.set_index(['symbol', 'timestamp'])
+
+
+@jit(nopython=True)
+def compute_weighted_sizes(prices, sizes, durations):
+    n = len(prices)
+    result_sizes = np.empty(n, dtype=np.float64)
+    current_price = prices[0]
+    start_idx = 0
+    
+    for i in range(1, n + 1):
+        if i == n or prices[i] != current_price:
+            end_idx = i
+            group_durations = durations[start_idx:end_idx]
+            group_sizes = sizes[start_idx:end_idx]
+            total_duration = np.sum(group_durations)
+            if total_duration == 0:
+                weighted_size = group_sizes[0]
+            else:
+                weighted_size = np.sum(group_sizes * group_durations) / total_duration
+            
+            result_sizes[start_idx:end_idx] = weighted_size
+            
+            if i < n:
+                current_price = prices[i]
+                start_idx = i
+    return result_sizes
+
+@jit(nopython=True)
+def aggregate_data(prices, sizes, unique_timestamps, indices):
+    n = len(prices)
+    m = len(unique_timestamps)
+    max_prices = np.empty(m, dtype=prices.dtype)
+    min_prices = np.empty(m, dtype=prices.dtype)
+    mean_prices = np.empty(m, dtype=prices.dtype)
+    max_sizes = np.empty(m, dtype=sizes.dtype)
+    sum_sizes = np.empty(m, dtype=sizes.dtype)
+    
+    for i in range(m):
+        start = indices[i]
+        end = indices[i+1] if i < m-1 else n
+        
+        group_prices = prices[start:end]
+        group_sizes = sizes[start:end]
+        
+        max_prices[i] = np.max(group_prices)
+        min_prices[i] = np.min(group_prices)
+        mean_prices[i] = np.mean(group_prices)
+        max_sizes[i] = np.max(group_sizes)
+        sum_sizes[i] = np.sum(group_sizes)
+    return max_prices, min_prices, mean_prices, max_sizes, sum_sizes
+
+def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
+    df = df.reset_index(drop=False)
+    timestamps = df['timestamp'].values.astype(np.int64) // 10**9
+    
+    symbols = df['symbol'].values
+    bid_prices = df['bid_price'].values
+    ask_prices = df['ask_price'].values
+    bid_sizes = df['bid_size'].values
+    ask_sizes = df['ask_size'].values
+    durations = df['duration'].values
+    spreads = df['spread'].values # TODO
+    
+    # Re-weight bid and ask sizes
+    bid_sizes = compute_weighted_sizes(bid_prices, bid_sizes, durations)
+    ask_sizes = compute_weighted_sizes(ask_prices, ask_sizes, durations)
+
+    floored_timestamps = (timestamps // interval_seconds) * interval_seconds
+    unique_timestamps, indices = np.unique(floored_timestamps, return_index=True)
+    
+    bid_max, _, bid_mean, bid_size_max, bid_size_sum = aggregate_data(bid_prices, bid_sizes, unique_timestamps, indices)
+    _, ask_min, ask_mean, ask_size_max, ask_size_sum = aggregate_data(ask_prices, ask_sizes, unique_timestamps, indices)
+    
+    # Combine results
+    result = pd.DataFrame({
+        'symbol': symbols[indices],
+        'timestamp': pd.to_datetime(unique_timestamps, unit='s', utc=True).tz_convert(ny_tz),
+        'max_bid_price': bid_max,
+        'min_ask_price': ask_min,
+        'mean_bid_price': bid_mean,
+        'mean_ask_price': ask_mean,
+        'max_bid_size': np.floor(bid_size_max),
+        'max_ask_size': np.floor(ask_size_max),
+        'total_bid_size': np.floor(bid_size_sum),
+        'total_ask_size': np.floor(ask_size_sum)
     })
     return result.set_index(['symbol', 'timestamp'])
 
@@ -534,12 +585,14 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
 
                     # Extract raw data for the previous minute
                     filtered_data = filter_first_and_last_seconds(weighted_data)
-                    quotes_data[symbol]['raw'].append(filtered_data.drop('duration', axis=1))
+                    filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
+                    # print(filtered_data)
+                    quotes_data[symbol]['raw'].append(filtered_data.drop(columns=['spread','duration']))
                     
                     # log(f'---{symbol} raw---')
                     
-                    # Aggregate the previous minute's data
                     aggregated_data = aggregate_quotes_time_based(weighted_data)
+                    # print(aggregated_data)
                     quotes_data[symbol]['agg'].append(aggregated_data)
                     
                     # log(f'---{symbol} agg---')
@@ -567,7 +620,8 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
             
             # Extract raw data for the last minute
             filtered_data = filter_first_and_last_seconds(weighted_data)
-            quotes_data[symbol]['raw'].append(filtered_data.drop('duration', axis=1))
+            filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
+            quotes_data[symbol]['raw'].append(filtered_data.drop(columns=['spread','duration']))
             
             aggregated_data = aggregate_quotes_time_based(weighted_data)
             quotes_data[symbol]['agg'].append(aggregated_data)
