@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from tqdm import tqdm
 
 from TouchArea import TouchArea
-# from MultiSymbolDataRetrieval import retrieve_quote_data
+# from MultiSymbolDataRetrieval import retrieve_quote_data, clean_quotes_data
 
 import logging
 import traceback
@@ -213,42 +213,6 @@ def fill_missing_data(df):
 
     return result
 
-
-def clean_quotes_data(df: pd.DataFrame):
-    """
-    Clean duplicate timestamped quotes for each symbol by keeping the most relevant quotes.
-
-    Args:
-    - df (pd.DataFrame): A pandas DataFrame with a MultiIndex containing 'symbol' and 'timestamp'.
-      The DataFrame should have the following columns: 'bid_price', 'ask_price', 'bid_size', 'ask_size',
-      'bid_exchange', 'ask_exchange', 'conditions', and 'tape'.
-
-    Returns:
-    - pd.DataFrame: A cleaned DataFrame with one quote per symbol per timestamp, prioritizing the most relevant quotes.
-    """
-    if df.empty:
-        return df
-    
-    # Define an aggregation strategy for each column
-    agg_funcs = {
-        'bid_price': 'max',  # Keep the highest bid price
-        'ask_price': 'min',  # Keep the lowest ask price
-        'bid_size': 'max',   # Keep the largest bid size
-        'ask_size': 'max',   # Keep the largest ask size
-        'bid_exchange': 'first',  # Arbitrarily keep the first exchange (can modify based on preference)
-        'ask_exchange': 'first',  # Same for ask exchange
-        'conditions': 'first',    # Arbitrarily keep the first condition
-        'tape': 'first'           # Same for tape
-    }
-
-    # Apply groupby and aggregation
-    df = df.groupby(level=['symbol', 'timestamp']).agg(agg_funcs)
-    df.index = df.index.set_levels(
-        df.index.get_level_values('timestamp').tz_convert(ny_tz),
-        level='timestamp'
-    )
-
-    return df
 
 @dataclass
 class Level:
@@ -603,89 +567,92 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         if params.export_quotes_path:
             quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
             os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
+        
+        
+        qdf = pd.DataFrame()
+        
+        # # Check if the ZIP file exists and read from it
+        # if params.use_saved_bars and params.export_quotes_path and os.path.isfile(quotes_zip_path):
+        #     with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
+        #         with zip_file.open(os.path.basename(params.export_quotes_path)) as csv_file:
+        #             qdf = pd.read_csv(csv_file)
+        #             qdf['timestamp'] = pd.to_datetime(qdf['timestamp'], utc=True).dt.tz_convert(ny_tz)
+        #             qdf.set_index(['symbol', 'timestamp'], inplace=True)
+        #             print(f'Retrieved quotes from {quotes_zip_path}')
+        # else:
+        #     # # Now, fetch quote data for each minute interval
+        #     minute_intervals = df.index.get_level_values('timestamp')
+        #     minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 31)) & (minute_intervals.time <= time(15,59))]
             
-        # Check if the ZIP file exists and read from it
-        if params.use_saved_bars and params.export_quotes_path and os.path.isfile(quotes_zip_path):
-            with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
-                with zip_file.open(os.path.basename(params.export_quotes_path)) as csv_file:
-                    qdf = pd.read_csv(csv_file)
-                    qdf['timestamp'] = pd.to_datetime(qdf['timestamp'], utc=True).dt.tz_convert(ny_tz)
-                    qdf.set_index(['symbol', 'timestamp'], inplace=True)
-                    print(f'Retrieved quotes from {quotes_zip_path}')
-        else:
-            # # Now, fetch quote data for each minute interval
-            minute_intervals = df.index.get_level_values('timestamp')
-            minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 31)) & (minute_intervals.time <= time(15,59))]
+        #     qdf = pd.DataFrame() # placeholder
             
-            qdf = pd.DataFrame() # placeholder
+        #     # # retrieve_quote_data(client, [params.symbol], {params.symbol: minute_intervals}, params) # causes circular import
+        #     # raise ValueError("Quote data must be already saved for backtesting")
             
-            # # retrieve_quote_data(client, [params.symbol], {params.symbol: minute_intervals}, params) # causes circular import
-            # raise ValueError("Quote data must be already saved for backtesting")
+        #     # # Initialize an empty list to collect DataFrames
+        #     # quotes_dataframes = []
             
-            # # Initialize an empty list to collect DataFrames
-            # quotes_dataframes = []
-            
-            # for minute in tqdm(minute_intervals, desc='minute_intervals'):
-            #     minute_end = minute + timedelta(seconds=1)
+        #     # for minute in tqdm(minute_intervals, desc='minute_intervals'):
+        #     #     minute_end = minute + timedelta(seconds=1)
                 
-            #     # Fetch quote data
-            #     try:
-            #         i = 3
-            #         latest_before_earlier = pd.NaT
-            #         qdf0 = pd.DataFrame()
-            #         while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
-            #             # Record start time
-            #             start_time = t2.time()
+        #     #     # Fetch quote data
+        #     #     try:
+        #     #         i = 3
+        #     #         latest_before_earlier = pd.NaT
+        #     #         qdf0 = pd.DataFrame()
+        #     #         while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
+        #     #             # Record start time
+        #     #             start_time = t2.time()
 
-            #             minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
+        #     #             minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
 
-            #             request_params = StockQuotesRequest(
-            #                 symbol_or_symbols=params.symbol,
-            #                 start=minute_start.tz_convert('UTC'),
-            #                 end=minute_end.tz_convert('UTC'),
-            #             )
-            #             qdf0 = client.get_stock_quotes(request_params).df
+        #     #             request_params = StockQuotesRequest(
+        #     #                 symbol_or_symbols=params.symbol,
+        #     #                 start=minute_start.tz_convert('UTC'),
+        #     #                 end=minute_end.tz_convert('UTC'),
+        #     #             )
+        #     #             qdf0 = client.get_stock_quotes(request_params).df
 
-            #             i += 4
-            #             if not qdf0.empty:
-            #                 qdf0 = clean_quotes_data(qdf0)
-            #                 t = qdf0.index.get_level_values('timestamp')
-            #                 latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
-            #                 if not pd.isna(latest_before_earlier):
-            #                     qdf0 = qdf0[t >= latest_before_earlier]
+        #     #             i += 4
+        #     #             if not qdf0.empty:
+        #     #                 qdf0 = clean_quotes_data(qdf0)
+        #     #                 t = qdf0.index.get_level_values('timestamp')
+        #     #                 latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
+        #     #                 if not pd.isna(latest_before_earlier):
+        #     #                     qdf0 = qdf0[t >= latest_before_earlier]
 
-            #             # Record end time and calculate elapsed time
-            #             elapsed_time = t2.time() - start_time
+        #     #             # Record end time and calculate elapsed time
+        #     #             elapsed_time = t2.time() - start_time
 
-            #             # Calculate remaining sleep time to maintain 0.3 seconds between requests
-            #             # 60/1000 = 0.06 sec if we have Elite Smart Router
-            #             # 60/10000 = 0.006 sec if we have Algo Trader Plus
-            #             remaining_sleep_time = max(0, 0.3 - elapsed_time)
-            #             t2.sleep(remaining_sleep_time)
+        #     #             # Calculate remaining sleep time to maintain 0.3 seconds between requests
+        #     #             # 60/1000 = 0.06 sec if we have Elite Smart Router
+        #     #             # 60/10000 = 0.006 sec if we have Algo Trader Plus
+        #     #             remaining_sleep_time = max(0, 0.3 - elapsed_time)
+        #     #             t2.sleep(remaining_sleep_time)
 
-            #         if not qdf0.empty:
-            #             quotes_dataframes.append(qdf0)
+        #     #         if not qdf0.empty:
+        #     #             quotes_dataframes.append(qdf0)
                     
-            #     except Exception as e:
-            #         print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
+        #     #     except Exception as e:
+        #     #         print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
                     
-            #     # sleep(0.3)
+        #     #     # sleep(0.3)
 
-            # # Concatenate all the DataFrames
-            # if quotes_dataframes:
-            #     qdf = pd.concat(quotes_dataframes)
-            #     qdf.sort_index(inplace=True)
-            # else:
-            #     qdf = pd.DataFrame()
+        #     # # Concatenate all the DataFrames
+        #     # if quotes_dataframes:
+        #     #     qdf = pd.concat(quotes_dataframes)
+        #     #     qdf.sort_index(inplace=True)
+        #     # else:
+        #     #     qdf = pd.DataFrame()
 
-            # # Save the DataFrame to a CSV file inside a ZIP file
-            # if params.export_quotes_path:
-            #     quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
-            #     os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
-            #     with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-            #         with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
-            #             qdf.reset_index().to_csv(csv_file, index=False)
-            #     print(f'Saved quotes to {quotes_zip_path}')
+        #     # # Save the DataFrame to a CSV file inside a ZIP file
+        #     # if params.export_quotes_path:
+        #     #     quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
+        #     #     os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
+        #     #     with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+        #     #         with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
+        #     #             qdf.reset_index().to_csv(csv_file, index=False)
+        #     #     print(f'Saved quotes to {quotes_zip_path}')
       
     elif isinstance(params, LiveTouchDetectionParameters):
         if data is None:
@@ -938,7 +905,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
             current_time = timestamps[i].tz_convert(ny_tz)
             if current_time >= day_end_time:
                 return i
-            current_price = df['close'].iloc[i]
+            # current_price = df['close'].iloc[i]
+            current_price = df.iloc[i, df.columns.get_loc('close')]
             
             if current_time >= area.get_min_touch_time:
                 if area.is_long and current_price >= entry_price:
@@ -987,8 +955,10 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                         day_end_time = day_timestamps[-1] + pd.Timedelta(minutes=1)
 
                 if area.entries_exits:
-                    exit_time = area.entries_exits[-1][2]
-                    end_idx = df.index.get_loc(df[timestamps == exit_time].index[0])
+                    # exit_time = area.entries_exits[-1].exit_time
+                    # end_idx = df.index.get_loc(df[timestamps == exit_time].index[0])
+                    entry_time = area.entries_exits[-1].entry_time
+                    end_idx = df.index.get_loc(df[timestamps == entry_time].index[0])
                 else:
                     end_idx = find_area_end_idx(start_idx, area, day_start_time, day_end_time)
                 x1 = [timestamps[start_idx].tz_convert(ny_tz), area.get_min_touch_time]

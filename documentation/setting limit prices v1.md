@@ -1,3 +1,15 @@
+## My question:
+I am using the Alpaca broker for backtesting and eventually real trading, using Python. i have already made lots of progress in my system so im just trying to refine it. currently i only use 1-minute bar data, which is critical for my algorithmic technical analysis, but I do have the retrieval of real-time quotes data set up. I focus on trading the most liquid stocks. I did put in safeguards such as not trading more than 1% of a moving average of market volume based on the 1-minute bars, but this does not react fast enough to fast changes compared to real-time quotes data.
+
+when using real-time level 1 quotes data (level 2 not available), how can i set effective limit prices that have the highest likelihood of fill (within up to 10 or even 50 seconds) while also not straying too far from the market price? consider both longs/shorts, and both buys/sells. keep in mind that the market data from Alpaca does not include "dark" or "undisplayed" liquidity so it does not fully represent the market but can be treated like a sample. 
+
+also keep in mind that it should be backtestable, which does have data constraints. for my strategy, i plan to place trade at beginning of every minute (at the most frequent), with GTC limit orders. that means i probably dont need ALL quotes data, perhaps only needing a few seconds of data before every minute (each second can contain upwards of hundreds of quotes in millisecond precision). this setup would be ideal for my backtesting needs (i retrieve and save historic bars and quotes into zipped csv's, then use the data for backtesting).
+
+the quotes data has these fields:  symbol (key), timestamp (key), bid_price, ask_price, bid_size, ask_size, bid_exchange, ask_exchange, conditions, tape
+
+
+## Answer from ChatGPT o1-preview: 
+
 To set effective limit prices that maximize the likelihood of fills within 10 to 50 seconds—without straying too far from the market price—you can adopt the following strategy, which is both practical for real trading and backtesting given your data constraints:
 
 ### 1. Utilize Current Best Bid and Ask Prices

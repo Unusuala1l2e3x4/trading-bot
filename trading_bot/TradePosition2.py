@@ -256,7 +256,7 @@ class TradePosition:
         self.log(f"Partial entry complete - Shares added: {shares_to_buy}, New total shares: {self.shares}, "
                  f"New cash committed: {self.cash_committed:.4f}", level=logging.DEBUG)
 
-        return cash_committed, fees, [shares_to_buy]
+        return cash_committed, fees, shares_to_buy
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         self.log(f"partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}", level=logging.DEBUG)
@@ -275,7 +275,7 @@ class TradePosition:
 
         self.log(f"Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}", level=logging.DEBUG)
 
-        return realized_pl, cash_released, fees, [shares_to_sell]
+        return realized_pl, cash_released, fees, shares_to_sell
 
     def update_stop_price(self, current_price: float, current_timestamp: datetime):
         self.area.update_bounds(current_timestamp)

@@ -74,6 +74,7 @@ class IntendedOrder:
     qty: int
     price: float
     position: TradePosition
+    fees: float
 
     def __copy__(self):
         return IntendedOrder(
@@ -82,7 +83,8 @@ class IntendedOrder:
             symbol=self.symbol,
             qty=self.qty,
             price=self.price,
-            position=self.position  # Passing TradePosition by reference
+            position=self.position,  # Passing TradePosition by reference
+            fees=self.fees
         )
     
 
@@ -141,6 +143,7 @@ class TradingStrategy:
     trades: List[TradePosition] = field(default_factory=list)
     terminated_area_ids: Dict[pd.Timestamp, List[int]] = field(default_factory=dict)
     trades_executed: int = 0
+    simultaneous_close_open: int = 0
     is_marginable: bool = field(init=False)
     is_etb: bool = field(init=False)
     next_position_id: int = 0
@@ -163,7 +166,8 @@ class TradingStrategy:
     def __post_init__(self):
         self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         self.timestamps = self.df.index.get_level_values('timestamp')
-        self.logger = self.setup_logger(logging.INFO)
+        # self.logger = self.setup_logger(logging.INFO)
+        self.logger = self.setup_logger(logging.WARNING)
         self.initialize_strategy()
 
     def setup_logger(self, log_level=logging.INFO):
@@ -290,13 +294,13 @@ class TradingStrategy:
 
         for position in self.open_positions:
             remaining_shares = position.shares
-            realized_pl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
-            self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees:.4f}",level=logging.INFO)
-            assert sum(shares_per_position) == remaining_shares, (shares_per_position, remaining_shares)
+            realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
+            self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
+            assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
             
             self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, exit_price)
             if not position.is_simulated:
-                self.day_accrued_fees += fees
+                self.day_accrued_fees += fees_expected
                 
             position.close(timestamp, exit_price)
             self.trades_executed += 1
@@ -305,15 +309,15 @@ class TradingStrategy:
             # position.area.terminate(self.touch_area_collection)
             self.touch_area_collection.terminate_area(position.area)
             
-            for shares in shares_per_position:
-                orders.append(IntendedOrder(
-                    action = 'close',
-                    side = OrderSide.SELL if position.is_long else OrderSide.BUY,
-                    symbol = self.touch_detection_areas.symbol,
-                    qty = shares,
-                    price = exit_price,
-                    position = position
-                ))
+            orders.append(IntendedOrder(
+                action = 'close',
+                side = OrderSide.SELL if position.is_long else OrderSide.BUY,
+                symbol = self.touch_detection_areas.symbol,
+                qty = qty_intended,
+                price = exit_price,
+                position = position,
+                fees = fees_expected
+            ))
 
             positions_to_remove.add(position)
 
@@ -325,7 +329,6 @@ class TradingStrategy:
 
     def calculate_position_details(self, is_long: bool, current_price: float, times_buying_power: float, 
                                 avg_volume: float, avg_trade_count: float, volume: float, max_volume_percentage: float, 
-                                # min_trade_count: int, existing_shares: Optional[np.ndarray] = np.array([]), 
                                 min_trade_count: int, existing_shares: Optional[int] = 0, 
                                 target_shares: Optional[int] = None):
         # Logic for calculating position details
@@ -347,7 +350,6 @@ class TradingStrategy:
         # Apply the times_buying_power constraint
         actual_margin_multiplier = min(times_buying_power, max_leverage)
         
-        # current_shares = np.sum(existing_shares) if existing_shares.size > 0 else 0
         current_shares = existing_shares
         max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
         
@@ -420,7 +422,7 @@ class TradingStrategy:
         return shares_change
     
     
-    def create_new_position(self, area: TouchArea, timestamp: datetime, data, prev_close: float) -> List[IntendedOrder]:
+    def create_new_position(self, area: TouchArea, timestamp: datetime, data, prev_close: float, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
         # Logic for placing a stop market buy order (similar to your original function)
         # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'central_value', 'is_res', 'shares_per_trade', 
         # 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'time', 'date']
@@ -511,13 +513,13 @@ class TradingStrategy:
         else:
             position.is_simulated = True
 
-        cash_needed, fees, shares_per_position = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
-        self.log(f"    cash_needed {cash_needed:.4f}, fees {fees:.4f}\t\tarea.get_buy_price={area.get_buy_price:.4f}",level=logging.INFO)
+        cash_needed, fees_expected, qty_intended = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
+        self.log(f"    cash_needed {cash_needed:.4f}, fees {fees_expected:.4f}\t\tarea.get_buy_price={area.get_buy_price:.4f}",level=logging.INFO)
         assert cash_needed == invest_amount, (cash_needed, invest_amount)
         assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
         assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
 
-        assert sum(shares_per_position) == position.shares, (shares_per_position, position.shares)
+        assert qty_intended == position.shares, (qty_intended, position.shares)
         
         self.next_position_id += 1
         
@@ -531,20 +533,18 @@ class TradingStrategy:
         
         self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power), close_price)
         if not position.is_simulated:
-            self.day_accrued_fees += fees
+            self.day_accrued_fees += fees_expected
         
         # return POSITION_OPENED
-        orders = []
-        for shares in shares_per_position:
-            orders.append(IntendedOrder(
-                action = 'open',
-                side = OrderSide.BUY if area.is_long else OrderSide.SELL,
-                symbol = self.touch_detection_areas.symbol,
-                qty = shares,
-                price = position.entry_price, # = execution_price
-                position = position
-            ))
-        return orders
+        return [IntendedOrder(
+            action = 'open',
+            side = OrderSide.BUY if area.is_long else OrderSide.SELL,
+            symbol = self.touch_detection_areas.symbol,
+            qty = qty_intended,
+            price = position.entry_price, # = execution_price
+            position = position,
+            fees = fees_expected
+        )]
 
 
     def update_positions(self, timestamp: datetime, data) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
@@ -665,23 +665,23 @@ class TradingStrategy:
                     )
                     
                     if shares_change > 0:
-                        realized_pl, cash_released, fees, shares_per_position = position.partial_exit(timestamp, price_at_action, shares_change, vwap, volume, avg_volume, self.params.slippage_factor)
-                        self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees:.4f}",level=logging.INFO)
-                        assert sum(shares_per_position) == shares_change, (shares_per_position, shares_change)
+                        realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(timestamp, price_at_action, shares_change, vwap, volume, avg_volume, self.params.slippage_factor)
+                        self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
+                        assert qty_intended == shares_change, (qty_intended, shares_change)
                         
                         self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, price_at_action)
                         if not position.is_simulated:
-                            self.day_accrued_fees += fees
+                            self.day_accrued_fees += fees_expected
                         
-                        for shares in shares_per_position:
-                            orders.append(IntendedOrder(
-                                action = 'close' if position.shares == 0 else 'partial_exit',
-                                side = OrderSide.SELL if position.is_long else OrderSide.BUY,
-                                symbol = self.touch_detection_areas.symbol,
-                                qty = shares,
-                                price = price_at_action,
-                                position = position
-                            ))
+                        orders.append(IntendedOrder(
+                            action = 'close' if position.shares == 0 else 'partial_exit',
+                            side = OrderSide.SELL if position.is_long else OrderSide.BUY,
+                            symbol = self.touch_detection_areas.symbol,
+                            qty = qty_intended,
+                            price = price_at_action,
+                            position = position,
+                            fees = fees_expected
+                        ))
                         if position.shares == 0:
                             perform_exit(position, price_at_action)
 
@@ -695,7 +695,6 @@ class TradingStrategy:
                 shares_to_adjust = target_shares - position.shares
                 if shares_to_adjust > 0:
 
-                    # existing_shares = np.array([sp.shares for sp in position.sub_positions if sp.shares > 0])
                     existing_shares = position.shares
                     total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement = self.calculate_position_details(
                         position.area.is_long, price_at_action, position.times_buying_power, avg_volume, avg_trade_count, volume,
@@ -710,27 +709,27 @@ class TradingStrategy:
                             self.count_entry_adjust += 1
                             
                         if not self.soft_end_triggered:
-                            cash_needed, fees, shares_per_position = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
-                            self.log(f"    cash_needed {cash_needed:.4f}, fees {fees:.4f}",level=logging.INFO)
+                            cash_needed, fees_expected, qty_intended = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
+                            self.log(f"    cash_needed {cash_needed:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                             assert cash_needed == invest_amount, (cash_needed, invest_amount)
                             assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
                             assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
-                            assert sum(shares_per_position) == shares_to_buy, (shares_per_position, shares_to_buy)
+                            assert qty_intended == shares_to_buy, (qty_intended, shares_to_buy)
                             
                             self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power), price_at_action)
                             if not position.is_simulated:
-                                self.day_accrued_fees += fees
+                                self.day_accrued_fees += fees_expected
                             
-                            for shares in shares_per_position:
-                                orders.append(IntendedOrder(
-                                    action = 'partial_entry',
-                                    side = OrderSide.BUY if position.is_long else OrderSide.SELL,
-                                    symbol = self.touch_detection_areas.symbol,
-                                    qty = shares,
-                                    price = price_at_action,
-                                    position = position
-                                ))
-                                
+                            orders.append(IntendedOrder(
+                                action = 'partial_entry',
+                                side = OrderSide.BUY if position.is_long else OrderSide.SELL,
+                                symbol = self.touch_detection_areas.symbol,
+                                qty = qty_intended,
+                                price = price_at_action,
+                                position = position,
+                                fees = fees_expected
+                            ))
+                            
                             position.max_shares = max(position.max_shares, position.shares) # Update max_shares after successful partial entry
                             assert position.shares == total_shares, (position.shares, total_shares)
                             
@@ -781,8 +780,8 @@ class TradingStrategy:
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
         
-        # for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
-        for i in range(1, len(timestamps)):
+        for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
+        # for i in range(1, len(timestamps)):
             current_time = timestamps[i].tz_convert(ny_tz)
             
             if self.current_date is None or current_time.date() != self.current_date:
@@ -811,7 +810,7 @@ class TradingStrategy:
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
-                    new_position_order = self.process_active_areas(current_time, data, prev_close)
+                    new_position_order = self.process_active_areas(current_time, data, prev_close, update_orders)
 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, i):
@@ -822,7 +821,7 @@ class TradingStrategy:
                 self.log(f"    terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
                 
                 # plot the used touch areas in the past day
-                plot_touch_detection_areas(self.touch_detection_areas, filter_date=self.current_date, filter_areas=self.terminated_area_ids)
+                # plot_touch_detection_areas(self.touch_detection_areas, filter_date=self.current_date, filter_areas=self.terminated_area_ids)
 
             else:
                 all_orders = []
@@ -851,7 +850,11 @@ class TradingStrategy:
         # TouchArea.print_areas_list(self.touch_area_collection.active_date_areas) # print if in log level
         # self.log(f"terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
         # TouchArea.print_areas_list(self.touch_area_collection.terminated_date_areas) # print if in log level
-            
+        
+        # plot_touch_detection_areas(self.touch_detection_areas, filter_areas=self.terminated_area_ids)
+        
+        print(f"simultaneous close and open count: {self.simultaneous_close_open}")
+        
         return self.generate_backtest_results()
 
     def process_live_data(self, current_time: datetime) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
@@ -888,7 +891,7 @@ class TradingStrategy:
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
-                    new_position_order = self.process_active_areas(current_time, data, prev_close)
+                    new_position_order = self.process_active_areas(current_time, data, prev_close, update_orders)
                 
                 all_orders = update_orders + new_position_order
             elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
@@ -968,9 +971,16 @@ class TradingStrategy:
             return current_time >= soft_end_time
         return False
 
-    def process_active_areas(self, current_time, data, prev_close) -> List[IntendedOrder]:
-        # if len(active_areas) > 0:
-        #     print(current_time, len(active_areas))
+    def process_active_areas(self, current_time: datetime, data, prev_close, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
+        
+        # # do not close then open at same time
+        # if pending_orders:
+        #     return []
+        
+        assert len(pending_orders) <= 1, len(pending_orders)
+        pending_long_close = any([a.action == 'close' and a.position.is_long for a in pending_orders])
+        pending_short_close = any([a.action == 'close' and not a.position.is_long for a in pending_orders])
+        
         for area in self.touch_area_collection.active_date_areas:
             if area.min_touches_time is None or area.min_touches_time > current_time:
                 continue
@@ -981,8 +991,26 @@ class TradingStrategy:
                 break
             if ((area.is_long and (self.params.do_longs or self.params.sim_longs)) or 
                 (not area.is_long and (self.params.do_shorts or self.params.sim_shorts))):
-                new_position_order = self.create_new_position(area, current_time, data, prev_close)
+                
+                
+                # do not close long then open short (or close short then open long) at same time
+                # reduces slippage
+                if not area.is_long and pending_long_close:
+                    continue
+                if area.is_long and pending_short_close:
+                    continue
+                
+                # # do not close long then open long (or close short then open short) at same time
+                # if area.is_long and pending_long_close:
+                #     continue
+                # if not area.is_long and pending_short_close:
+                #     continue
+                
+                    
+                new_position_order = self.create_new_position(area, current_time, data, prev_close, pending_orders)
                 if new_position_order:
+                    if pending_long_close or pending_short_close:
+                        self.simultaneous_close_open += 1
                     return new_position_order
         return []
 
@@ -1019,8 +1047,6 @@ class TradingStrategy:
         lose_longs = sum(1 for trade in trades if trade.is_long and trade.pl < 0)
         win_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl > 0)
         lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl < 0)
-        
-        # avg_sub_pos = np.mean([len(trade.sub_positions) for trade in trades])
         avg_transact = np.mean([len(trade.transactions) for trade in trades])
         
         assert self.trades_executed == len(self.trades)
@@ -1096,7 +1122,6 @@ class TradingStrategy:
         print(f"Margin Enabled: {'Yes' if self.params.use_margin else 'No'}")
         print(f"Max Buying Power: {self.params.times_buying_power}x")
         # print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in trades) / len(self.trades):.4f}x")
-        # print(f"Average Sub Positions per Position: {avg_sub_pos:.4f}")
         print(f"Average Transactions per Position: {avg_transact:.4f}")
         
         # # print(trades)
@@ -1107,11 +1132,10 @@ class TradingStrategy:
 
         # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
         #     win_trades / len(self.trades) * 100,  \
-        #     total_transaction_costs, avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
+        #     total_transaction_costs, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
         return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
             win_trades / len(self.trades) * 100, total_transaction_costs, \
                                avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
-                # avg_sub_pos, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
 
 
         

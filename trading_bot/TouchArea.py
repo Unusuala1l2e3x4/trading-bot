@@ -29,6 +29,12 @@ def log(message, level=logging.INFO):
     logger.log(level, message)
 
 
+@dataclass
+class EntryExit:
+    entry_time: datetime
+    entry_price: float
+    exit_time: datetime
+    exit_price: float
 
 @dataclass
 class TouchArea:
@@ -49,7 +55,7 @@ class TouchArea:
     multiplier: float
     calculate_bounds: Callable
     min_touches_time: datetime = field(init=False)
-    entries_exits: List[tuple] = field(default_factory=list)
+    entries_exits: List[EntryExit] = field(default_factory=list)
         
     def __post_init__(self):
         assert self.min_touches > 1, f'{self.min_touches} > 1'
@@ -73,7 +79,7 @@ class TouchArea:
 
     
     def record_entry_exit(self, entry_time: datetime, entry_price: float, exit_time: datetime, exit_price: float):
-        self.entries_exits.append((entry_time, entry_price, exit_time, exit_price))
+        self.entries_exits.append(EntryExit(entry_time, entry_price, exit_time, exit_price))
 
     @property
     def is_active(self) -> bool:
