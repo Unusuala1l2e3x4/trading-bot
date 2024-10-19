@@ -22,12 +22,18 @@ from zoneinfo import ZoneInfo
 from tqdm import tqdm
 
 from TouchArea import TouchArea
-# from MultiSymbolDataRetrieval import retrieve_quote_data, clean_quotes_data
+from MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data
+from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
 
 import logging
 import traceback
 
 import time as t2
+
+
+from dataclasses import dataclass, field
+from typing import Optional, Callable
+
 
 from dotenv import load_dotenv
 
@@ -68,9 +74,6 @@ logger = setup_logger(logging.WARNING)
 def log(message, level=logging.INFO):
     logger.log(level, message)
 
-
-from dataclasses import dataclass, field
-from typing import Optional, Callable
 
 
 def get_market_hours(dates: List[date]) -> Dict[date, Tuple[datetime, datetime]]:
@@ -156,64 +159,6 @@ def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
     df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
 
 
-def fill_missing_data(df):
-    """
-    Fill missing data in a multi-index DataFrame of stock market data.
-
-    This function processes a DataFrame with a multi-index of (symbol, timestamp),
-    filling in missing minutes between the first and last timestamp of each day
-    for each symbol. It forward-fills OHLC (Open, High, Low, Close) values and
-    fills volume and trade count with zeros.
-
-    Parameters:
-    df (pandas.DataFrame): A multi-index DataFrame with levels (symbol, timestamp)
-                           containing stock market data.
-
-    Returns:
-    pandas.DataFrame: A DataFrame with missing data filled, maintaining the
-                      original multi-index structure and timezone.
-    """
-    # Ensure the index is sorted
-    df = df.sort_index()
-
-    # Get the timezone
-    tz = df.index.get_level_values('timestamp').tz
-
-    # Group by symbol and date
-    grouped = df.groupby([df.index.get_level_values('symbol'),
-                          df.index.get_level_values('timestamp').date])
-
-    filled_dfs = []
-
-    for (symbol, date), group in grouped:
-        # Get min and max timestamps for the current date and symbol
-        min_time = group.index.get_level_values('timestamp').min()
-        max_time = group.index.get_level_values('timestamp').max()
-
-        # Create a complete range of timestamps for this date
-        full_idx = pd.date_range(start=min_time, end=max_time, freq='min', tz=tz)
-
-        # Reindex the group
-        filled_group = group.reindex(pd.MultiIndex.from_product([[symbol], full_idx],
-                                                                names=['symbol', 'timestamp']))
-
-        # Forward-fill OHLC values
-        filled_group[['open', 'high', 'low', 'close']] = filled_group[['open', 'high', 'low', 'close']].ffill()
-
-        # Fill volume and trade_count with 0
-        filled_group['volume'] = filled_group['volume'].fillna(0)
-        filled_group['trade_count'] = filled_group['trade_count'].fillna(0)
-        
-        # VWAP remains NaN where missing (may need to be calculated later if new functionality requires it)
-
-        filled_dfs.append(filled_group)
-
-    # Concatenate all filled groups
-    result = pd.concat(filled_dfs)
-
-    return result
-
-
 @dataclass
 class Level:
     id: int
@@ -222,15 +167,7 @@ class Level:
     level: float
     is_res: bool
     touches: List[datetime]
-    
-    
-@jit(nopython=True)
-def np_median(arr):
-    return np.median(arr)
 
-@jit(nopython=True)
-def np_mean(arr):
-    return np.mean(arr)
 
 @jit(nopython=True)
 def np_searchsorted(a,b): # only used in calculate_touch_area function
@@ -401,7 +338,9 @@ class TouchDetectionAreas:
     short_touch_area: List[TouchArea]
     market_hours: Dict[date, Tuple[datetime, datetime]]
     bars: pd.DataFrame
-    quotes: pd.DataFrame
+    bars_adjusted: pd.DataFrame
+    quotes_raw: pd.DataFrame
+    quotes_agg: pd.DataFrame
     mask: pd.Series
     min_touches: int
     start_time: Optional[time]
@@ -415,77 +354,20 @@ class TouchDetectionAreas:
             short_touch_area=data['short_touch_area'],
             market_hours=data['market_hours'],
             bars=data['bars'],
-            quotes=data['quotes'],
+            bars_adjusted=data['bars_adjusted'],
+            quotes_raw=data['quotes_raw'],
+            quotes_agg=data['quotes_agg'],
             mask=data['mask'],
             min_touches=data['min_touches'],
             start_time=data['start_time'],
             end_time=data['end_time']
         )
 
-    
-# @dataclass
-# class TouchDetectionParameters:
-#     symbol: str
-#     start_date: str
-#     end_date: str
-#     atr_period: int = 15
-#     level1_period: int = 15
-#     multiplier: float = 2.0
-#     min_touches: int = 3
-#     bid_buffer_pct: float = 0.005
-#     start_time: Optional[str] = None
-#     end_time: Optional[str] = None
-#     use_median: bool = False
-#     rolling_avg_decay_rate: float = 0.85
-#     touch_area_width_agg: Callable = np.median
-#     use_saved_bars: bool = False
-#     export_bars_path: Optional[str] = None
-
-@dataclass
-class BaseTouchDetectionParameters:
-    symbol: str
-    atr_period: int = 15
-    level1_period: int = 15
-    multiplier: float = 1.4
-    min_touches: int = 3
-    bid_buffer_pct: float = 0.005
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
-    use_median: bool = False
-    rolling_avg_decay_rate: float = 0.85
-    # touch_area_width_agg: Callable = np.median
-    touch_area_width_agg: Callable = np_median
-
-@dataclass
-# class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
-class BacktestTouchDetectionParameters():
-    symbol: str
-    start_date: datetime # | str
-    end_date: datetime # | str
-    atr_period: int = 15
-    level1_period: int = 15
-    multiplier: float = 1.4
-    min_touches: int = 3
-    bid_buffer_pct: float = 0.005
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
-    use_median: bool = False
-    rolling_avg_decay_rate: float = 0.85
-    # touch_area_width_agg: Callable = np.median
-    touch_area_width_agg: Callable = np_median
-    use_saved_bars: bool = False
-    export_bars_path: Optional[str] = None
-    export_quotes_path: Optional[str] = None
-
-@dataclass
-class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
-    pass  # This class doesn't need any additional parameters
-
 
 
 def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, data: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
-                                   current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}):
+                                   current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
     def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
             logger.log(level, message)
@@ -517,143 +399,26 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
     """
     if isinstance(params, BacktestTouchDetectionParameters):
         assert params.end_date > params.start_date
-        
-        # Convert datetime strings to datetime objects if they're strings
-        if isinstance(params.start_date, str):
-            params.start_date = pd.to_datetime(params.start_date).tz_localize(ny_tz)
-        if isinstance(params.end_date, str):
-            params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
 
         # Alpaca API setup
         client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
 
-        # Define the path to the zip file
-        if params.export_bars_path:
-            bars_zip_path = params.export_bars_path.replace('.csv', '.zip')
-            os.makedirs(os.path.dirname(params.export_bars_path), exist_ok=True)
-            
-        # Check if the ZIP file exists and read from it
-        if params.use_saved_bars and params.export_bars_path and os.path.isfile(bars_zip_path):
-            with zipfile.ZipFile(bars_zip_path, 'r') as zip_file:
-                with zip_file.open(os.path.basename(params.export_bars_path)) as csv_file:
-                    df = pd.read_csv(csv_file)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(ny_tz)
-                    df.set_index(['symbol', 'timestamp'], inplace=True)
-                    print(f'Retrieved bars from {bars_zip_path}')
+        # get bars data (2 dataframes)
+        df_adjusted, df = retrieve_bar_data(client, params)
+        
+        # get quotes data (2 dataframes)
+        minute_intervals = df.index.get_level_values('timestamp')
+        minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
+        minute_intervals_dict = {params.symbol: minute_intervals}
+        
+        quotes_data = retrieve_quote_data(client, [params.symbol], minute_intervals_dict, params)
+        
+        if isinstance(quotes_data[params.symbol]['raw'], pd.DataFrame) and isinstance(quotes_data[params.symbol]['agg'], pd.DataFrame):
+            raw_df = quotes_data[params.symbol]['raw']
+            aggregated_df = quotes_data[params.symbol]['agg']
         else:
-            # Request historical data
-            request_params = StockBarsRequest(
-                symbol_or_symbols=params.symbol,
-                timeframe=TimeFrame.Minute,
-                start=params.start_date.tz_convert('UTC'),
-                end=params.end_date.tz_convert('UTC'),
-                adjustment=Adjustment.ALL,
-            )
-            df = client.get_stock_bars(request_params).df
-            df.index = df.index.set_levels(
-                df.index.get_level_values('timestamp').tz_convert(ny_tz),
-                level='timestamp'
-            )
-            df.sort_index(inplace=True)
-            df = fill_missing_data(df)
-            
-            # Save the DataFrame to a CSV file inside a ZIP file
-            if params.export_bars_path:
-                with zipfile.ZipFile(bars_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-                    with zip_file.open(os.path.basename(params.export_bars_path), 'w') as csv_file:
-                        df.reset_index().to_csv(csv_file, index=False)
-                print(f'Saved bars to {bars_zip_path}')
-        
-        if params.export_quotes_path:
-            quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
-            os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
-        
-        
-        qdf = pd.DataFrame()
-        
-        # # Check if the ZIP file exists and read from it
-        # if params.use_saved_bars and params.export_quotes_path and os.path.isfile(quotes_zip_path):
-        #     with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
-        #         with zip_file.open(os.path.basename(params.export_quotes_path)) as csv_file:
-        #             qdf = pd.read_csv(csv_file)
-        #             qdf['timestamp'] = pd.to_datetime(qdf['timestamp'], utc=True).dt.tz_convert(ny_tz)
-        #             qdf.set_index(['symbol', 'timestamp'], inplace=True)
-        #             print(f'Retrieved quotes from {quotes_zip_path}')
-        # else:
-        #     # # Now, fetch quote data for each minute interval
-        #     minute_intervals = df.index.get_level_values('timestamp')
-        #     minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 31)) & (minute_intervals.time <= time(15,59))]
-            
-        #     qdf = pd.DataFrame() # placeholder
-            
-        #     # # retrieve_quote_data(client, [params.symbol], {params.symbol: minute_intervals}, params) # causes circular import
-        #     # raise ValueError("Quote data must be already saved for backtesting")
-            
-        #     # # Initialize an empty list to collect DataFrames
-        #     # quotes_dataframes = []
-            
-        #     # for minute in tqdm(minute_intervals, desc='minute_intervals'):
-        #     #     minute_end = minute + timedelta(seconds=1)
-                
-        #     #     # Fetch quote data
-        #     #     try:
-        #     #         i = 3
-        #     #         latest_before_earlier = pd.NaT
-        #     #         qdf0 = pd.DataFrame()
-        #     #         while pd.isna(latest_before_earlier) and i < 60:  # make sure i ends at 59 (3 + 4*14 = 59)
-        #     #             # Record start time
-        #     #             start_time = t2.time()
+            raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
-        #     #             minute_start = minute - timedelta(seconds=i) # search for latest datapoint before the minute
-
-        #     #             request_params = StockQuotesRequest(
-        #     #                 symbol_or_symbols=params.symbol,
-        #     #                 start=minute_start.tz_convert('UTC'),
-        #     #                 end=minute_end.tz_convert('UTC'),
-        #     #             )
-        #     #             qdf0 = client.get_stock_quotes(request_params).df
-
-        #     #             i += 4
-        #     #             if not qdf0.empty:
-        #     #                 qdf0 = clean_quotes_data(qdf0)
-        #     #                 t = qdf0.index.get_level_values('timestamp')
-        #     #                 latest_before_earlier = qdf0[t < minute].index.get_level_values('timestamp').max()
-        #     #                 if not pd.isna(latest_before_earlier):
-        #     #                     qdf0 = qdf0[t >= latest_before_earlier]
-
-        #     #             # Record end time and calculate elapsed time
-        #     #             elapsed_time = t2.time() - start_time
-
-        #     #             # Calculate remaining sleep time to maintain 0.3 seconds between requests
-        #     #             # 60/1000 = 0.06 sec if we have Elite Smart Router
-        #     #             # 60/10000 = 0.006 sec if we have Algo Trader Plus
-        #     #             remaining_sleep_time = max(0, 0.3 - elapsed_time)
-        #     #             t2.sleep(remaining_sleep_time)
-
-        #     #         if not qdf0.empty:
-        #     #             quotes_dataframes.append(qdf0)
-                    
-        #     #     except Exception as e:
-        #     #         print(f"Error fetching quotes for interval {minute_start} - {minute_end}: {e}")
-                    
-        #     #     # sleep(0.3)
-
-        #     # # Concatenate all the DataFrames
-        #     # if quotes_dataframes:
-        #     #     qdf = pd.concat(quotes_dataframes)
-        #     #     qdf.sort_index(inplace=True)
-        #     # else:
-        #     #     qdf = pd.DataFrame()
-
-        #     # # Save the DataFrame to a CSV file inside a ZIP file
-        #     # if params.export_quotes_path:
-        #     #     quotes_zip_path = params.export_quotes_path.replace('.csv', '.zip')
-        #     #     os.makedirs(os.path.dirname(params.export_quotes_path), exist_ok=True)
-        #     #     with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-        #     #         with zip_file.open(os.path.basename(params.export_quotes_path), 'w') as csv_file:
-        #     #             qdf.reset_index().to_csv(csv_file, index=False)
-        #     #     print(f'Saved quotes to {quotes_zip_path}')
-      
     elif isinstance(params, LiveTouchDetectionParameters):
         if data is None:
             raise ValueError("Data must be provided for live trading parameters")
@@ -836,7 +601,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'short_touch_area': short_touch_area,
             'market_hours': market_hours,
             'bars': df,
-            'quotes': qdf,
+            'bars_adjusted': df_adjusted,
+            'quotes_raw': raw_df,
+            'quotes_agg': aggregated_df,
             'mask': final_mask,
             # 'bid_buffer_pct': params.bid_buffer_pct,
             'min_touches': params.min_touches,
@@ -870,6 +637,7 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     short_touch_area = touch_detection_areas.short_touch_area
     market_hours = touch_detection_areas.market_hours
     df = touch_detection_areas.bars
+    df_adjusted = touch_detection_areas.bars_adjusted
     mask = touch_detection_areas.mask
     # bid_buffer_pct = touch_detection_areas.bid_buffer_pct
     min_touches = touch_detection_areas.min_touches

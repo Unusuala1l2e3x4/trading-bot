@@ -152,14 +152,18 @@ class TradingStrategy:
     count_entry_skip: int = 0
     count_exit_skip: int = 0
     day_accrued_fees: float = 0
-    current_date: Optional[pd.Timestamp] = None
-    market_open: Optional[pd.Timestamp] = None
-    market_close: Optional[pd.Timestamp] = None
-    day_start_time: Optional[pd.Timestamp] = None
-    day_end_time: Optional[pd.Timestamp] = None
-    day_soft_start_time: Optional[pd.Timestamp] = None
-    daily_data: Optional[pd.DataFrame] = None
-    daily_index: Optional[int] = None
+    current_date: pd.Timestamp = None
+    market_open: pd.Timestamp = field(init=False)
+    market_close: pd.Timestamp = field(init=False)
+    day_start_time: pd.Timestamp = field(init=False)
+    day_end_time: pd.Timestamp = field(init=False)
+    day_soft_start_time: pd.Timestamp = field(init=False)
+    daily_bars: pd.DataFrame = field(init=False)
+    daily_quotes_raw: pd.DataFrame = field(init=False)
+    daily_quotes_agg: pd.DataFrame = field(init=False)
+    daily_quotes_raw_indices: pd.Series = field(init=False)
+    daily_quotes_agg_indices: pd.Series = field(init=False)
+    daily_bars_index: int = field(init=False)
     soft_end_triggered: bool = False
     touch_area_collection: TouchAreaCollection = field(init=False)
     
@@ -399,7 +403,7 @@ class TradingStrategy:
         assert shares_to_exit > 0
         
         if not is_trading_allowed(self.total_equity, avg_trade_count, min_trade_count, avg_volume):
-            return 0, 0
+            return 0
         
         # when live, need to call is_security_marginable
         # Determine initial margin requirement and calculate max leverage
@@ -754,28 +758,63 @@ class TradingStrategy:
             self.day_start_time = self.day_end_time = self.day_soft_start_time = None
 
     def update_balance(self, new_balance):
-        if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
-        # if self.balance != new_balance:
+        # if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
+        if self.balance != new_balance:
             self.log(f"Updating balance from {self.balance:.2f} to {new_balance:.2f}")
         self.balance = new_balance
-    
+        
     def handle_new_trading_day(self, current_time):
         self.current_date = current_time.date()
         self.update_daily_parameters(self.current_date)
         self.next_position_id = 0
         self.soft_end_triggered = False
-        
         self.log(f"Starting balance on {self.current_date}: {self.balance}", level=logging.INFO)
         
-        if self.is_live_trading:
-            # self.daily_data = self.df  # In live trading, all data is "daily data"
-            # self.daily_index = len(self.daily_data) - 1  # Current index is always the last one in live trading
-            pass
+        if self.is_live_trading: # handled in FUNCTION: update_strategy
+            # self.daily_bars = self.df  # In live trading, all data is "daily data"
+            # self.daily_bars_index = len(self.daily_bars) - 1  # Current index is always the last one in live trading
+            daily_bars_minutes = self.df.index.get_level_values('timestamp').floor('min').tz_convert(ny_tz)
+            # pass
         else:
-            self.daily_data = self.df[self.df.index.get_level_values('timestamp').date == self.current_date]
-            self.daily_index = 1  # Start from index 1 in backtesting
+            # Filter the data for the current trading day based on timestamp
+            self.daily_bars = self.df[self.df.index.get_level_values('timestamp').date == self.current_date]
+            self.daily_bars_index = 1  # Start from index 1
+            daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').floor('min').tz_convert(ny_tz)
 
+        def get_quote_indices(all_data, indices, seconds_offset=0) -> Tuple[pd.DataFrame, np.ndarray]:
+            daily = all_data[all_data.index.get_level_values('timestamp').date == self.current_date].sort_index().reset_index()
+            daily['position'] = daily.index
+            times_df = pd.DataFrame({'adjusted_time': indices + pd.Timedelta(seconds=seconds_offset)}).sort_values('adjusted_time')
+            # Perform merge_asof to find the first quote at or after the adjusted time
+            merged = pd.merge_asof(times_df, daily, left_on='adjusted_time', right_on='timestamp', direction='forward')
+            return daily.drop(columns=['position']), merged['position'].values
+
+        # For raw quotes with an offset
+        self.daily_quotes_raw, self.daily_quotes_raw_indices = get_quote_indices(
+            self.touch_detection_areas.quotes_raw, daily_bars_minutes, seconds_offset = -30
+        )
+        # For aggregated quotes without an offset
+        self.daily_quotes_agg, self.daily_quotes_agg_indices = get_quote_indices(
+            self.touch_detection_areas.quotes_agg, daily_bars_minutes
+        )
+
+        # print(self.daily_quotes_raw_indices,'\n------------------------------')
+        # print(self.daily_quotes_agg_indices,'\n------------------------------')
+        
+        # print(self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices])
+        # print(self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices])
+        
+        # print(self.daily_bars.iloc[1])
+        # print(self.get_minute_quotes_raw(10))
+        # print(self.get_minute_quotes_agg(10))
+        
         assert not self.open_positions, self.open_positions
+
+    def get_minute_quotes_raw(self, ind):
+        return self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices[ind] : self.daily_quotes_raw_indices[ind + 1]]
+    
+    def get_minute_quotes_agg(self, ind):
+        return self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices[ind] : self.daily_quotes_agg_indices[ind + 1]]
         
     def run_backtest(self):
         timestamps = self.df.index.get_level_values('timestamp')
@@ -790,18 +829,18 @@ class TradingStrategy:
             if not self.market_open or not self.market_close:
                 continue
             
-            if self.daily_data.empty or len(self.daily_data) < 2: 
+            if self.daily_bars.empty or len(self.daily_bars) < 2: 
                 continue
             
-            data = self.daily_data.iloc[self.daily_index]
+            data = self.daily_bars.iloc[self.daily_bars_index]
             if current_time < data.name[1]: # data.name[1] is the timestamp in data
                 continue
             assert current_time == data.name[1], (current_time, data.name[1])
-            prev_close = self.daily_data.iloc[self.daily_index - 1].close
+            prev_close = self.daily_bars.iloc[self.daily_bars_index - 1].close
             
             self.log(f"{current_time.strftime("%H:%M")}, price {data.close:.4f}, H-L {data.high:.4f}-{data.low:.4f}:", level=logging.INFO)
 
-            if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_index, self.daily_data, i):
+            if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_bars_index, self.daily_bars, i):
                 if self.params.soft_end_time and not self.soft_end_triggered:
                     self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
                 
@@ -841,7 +880,7 @@ class TradingStrategy:
                 self.log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
                 self.day_accrued_fees = 0
                 
-            self.daily_index += 1
+            self.daily_bars_index += 1
         
         if current_time >= self.day_end_time:
             assert not self.open_positions, self.open_positions
@@ -894,7 +933,7 @@ class TradingStrategy:
                     new_position_order = self.process_active_areas(current_time, data, prev_close, update_orders)
                 
                 all_orders = update_orders + new_position_order
-            elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_index):
+            elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_bars_index):
                 self.touch_area_collection.get_active_areas(current_time)
                 for position in self.open_positions:
                     position.area = self.touch_area_collection.get_area(position.area) # find with hash/eq
@@ -914,15 +953,15 @@ class TradingStrategy:
                     self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
                          level=logging.INFO)
                     
-            if self.should_close_all_positions(current_time, self.day_end_time, self.daily_index) and self.day_accrued_fees != 0:
+            if self.should_close_all_positions(current_time, self.day_end_time, self.daily_bars_index) and self.day_accrued_fees != 0:
                 # sum up transaction costs from the day and subtract it from balance
                 self.rebalance(False, -self.day_accrued_fees)
                 self.log(f"After ${self.day_accrued_fees:.4f} fees: ${self.balance:.4f}", level=logging.INFO)
                 self.log(f"{current_time.strftime("%H:%M")}: Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
                 self.day_accrued_fees = 0
             
-            # assert self.daily_index == len(self.daily_data) - 1
-            # self.daily_index = len(self.daily_data) - 1  # Update daily_index for live trading
+            # assert self.daily_bars_index == len(self.daily_bars) - 1
+            # self.daily_bars_index = len(self.daily_bars) - 1  # Update daily_bars_index for live trading
 
             return all_orders, positions_to_remove1 | positions_to_remove2
             # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
@@ -957,12 +996,12 @@ class TradingStrategy:
         
         return day_start_time, day_end_time, day_soft_start_time
 
-    def is_trading_time(self, current_time: datetime, day_soft_start_time: datetime, day_end_time: datetime, daily_index, daily_data, i):
+    def is_trading_time(self, current_time: datetime, day_soft_start_time: datetime, day_end_time: datetime, daily_bars_index, daily_bars, i):
         if self.is_live_trading:
             return day_soft_start_time <= current_time < day_end_time
         else:
             return day_soft_start_time <= current_time < day_end_time \
-                and daily_index < len(daily_data) - 1 \
+                and daily_bars_index < len(daily_bars) - 1 \
                 and i < len(self.df) - 1
 
     def check_soft_end_time(self, current_time, current_date):

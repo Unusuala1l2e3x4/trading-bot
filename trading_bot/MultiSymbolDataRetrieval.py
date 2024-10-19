@@ -8,11 +8,12 @@ from alpaca.data.enums import Adjustment
 from datetime import datetime, time, timedelta
 from tqdm import tqdm
 import time as t2
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Callable
 import math
 import numpy as np
-from TouchDetection import BacktestTouchDetectionParameters, fill_missing_data
+from TouchDetectionParameters import BacktestTouchDetectionParameters
 
+from requests import Session
 import hashlib
 from numba import jit, prange
 
@@ -149,41 +150,119 @@ def concat_with_progress(dfs: List[pd.DataFrame], group_size: int = 10) -> pd.Da
         progress_bar = None
 
 
+def fill_missing_data(df):
+    """
+    Fill missing data in a multi-index DataFrame of stock market data.
 
-def retrieve_bar_data(client: StockHistoricalDataClient, symbol, params: BacktestTouchDetectionParameters):
-    directory = os.path.dirname(params.export_bars_path)
+    This function processes a DataFrame with a multi-index of (symbol, timestamp),
+    filling in missing minutes between the first and last timestamp of each day
+    for each symbol. It forward-fills OHLC (Open, High, Low, Close) values and
+    fills volume and trade count with zeros.
+
+    Parameters:
+    df (pandas.DataFrame): A multi-index DataFrame with levels (symbol, timestamp)
+                           containing stock market data.
+
+    Returns:
+    pandas.DataFrame: A DataFrame with missing data filled, maintaining the
+                      original multi-index structure and timezone.
+    """
+    # Ensure the index is sorted
+    df = df.sort_index()
+
+    # Get the timezone
+    tz = df.index.get_level_values('timestamp').tz
+
+    # Group by symbol and date
+    grouped = df.groupby([df.index.get_level_values('symbol'),
+                          df.index.get_level_values('timestamp').date])
+
+    filled_dfs = []
+
+    for (symbol, date), group in grouped:
+        # Get min and max timestamps for the current date and symbol
+        min_time = group.index.get_level_values('timestamp').min()
+        max_time = group.index.get_level_values('timestamp').max()
+
+        # Create a complete range of timestamps for this date
+        full_idx = pd.date_range(start=min_time, end=max_time, freq='min', tz=tz)
+
+        # Reindex the group
+        filled_group = group.reindex(pd.MultiIndex.from_product([[symbol], full_idx],
+                                                                names=['symbol', 'timestamp']))
+
+        # Forward-fill OHLC values
+        filled_group[['open', 'high', 'low', 'close']] = filled_group[['open', 'high', 'low', 'close']].ffill()
+
+        # Fill volume and trade_count with 0
+        filled_group['volume'] = filled_group['volume'].fillna(0)
+        filled_group['trade_count'] = filled_group['trade_count'].fillna(0)
+        
+        # VWAP remains NaN where missing (may need to be calculated later if new functionality requires it)
+
+        filled_dfs.append(filled_group)
+
+    # Concatenate all filled groups
+    result = pd.concat(filled_dfs)
+
+    return result
+
+
+def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDetectionParameters, symbol: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """_summary_
+
+    Args:
+        client (StockHistoricalDataClient): 
+        params (BacktestTouchDetectionParameters): 
+        symbol (str | None): If None, use params.symbol
+
+    Returns:
+        (pd.DataFrame, pd.DataFrame): adjusted bars for graphing, unadjusted bars for backtesting
+    """
+    if symbol is None:
+        symbol = params.symbol
+    
+    df, df_unadjusted = None, None
+    
     if isinstance(params.start_date, str):
         params.start_date = pd.to_datetime(params.start_date).tz_localize(ny_tz)
     if isinstance(params.end_date, str):
-        params.end_date = pd.to_datetime(params.end_date).tz_convert(ny_tz)
-    
-    bars_zip_path = os.path.join(directory, f'bars_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
-    os.makedirs(os.path.dirname(bars_zip_path), exist_ok=True)
+        params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
 
-    adjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '.csv')
-    unadjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '_unadjusted.csv')
-    split_adjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '_split_adjusted.csv')
-    dividend_adjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '_dividend_adjusted.csv')
-    adjustments_csv_name = os.path.basename(bars_zip_path).replace('.zip', '_adjustments.csv')
-
-    df, df_unadjusted, df_split_adjusted, df_dividend_adjusted = None, None, None, None
-    if params.use_saved_bars and os.path.isfile(bars_zip_path):
-        with zipfile.ZipFile(bars_zip_path, 'r') as zip_file:
-            file_list = zip_file.namelist()
+    if params.export_bars_path:
+        directory = os.path.dirname(params.export_bars_path)
+        bars_zip_path = os.path.join(directory, f'bars_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
+        assert directory == os.path.dirname(bars_zip_path)
+        os.makedirs(directory, exist_ok=True)
             
-            for df_name, csv_name in [('df', adjusted_csv_name), 
-                                      ('df_unadjusted', unadjusted_csv_name),
-                                      ('df_split_adjusted', split_adjusted_csv_name),
-                                      ('df_dividend_adjusted', dividend_adjusted_csv_name)
-                                      ]:
-                if csv_name in file_list:
-                    with zip_file.open(csv_name) as csv_file:
-                        df = pd.read_csv(csv_file)
-                        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(ny_tz)
-                        df.set_index(['symbol', 'timestamp'], inplace=True)
-                    locals()[df_name] = df
-                    log(f'Retrieved {df_name} from {bars_zip_path}')
-
+        adjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '.csv')
+        unadjusted_csv_name = os.path.basename(bars_zip_path).replace('.zip', '_unadjusted.csv')
+        
+        if os.path.isfile(bars_zip_path):
+            with zipfile.ZipFile(bars_zip_path, 'r') as zip_file:
+                file_list = zip_file.namelist()
+                if adjusted_csv_name in file_list:
+                    try:
+                        with zip_file.open(adjusted_csv_name) as csv_file:
+                            df = pd.read_csv(csv_file)
+                            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(ny_tz)
+                            df.set_index(['symbol', 'timestamp'], inplace=True)
+                            log(f'Retrieved {adjusted_csv_name} from {bars_zip_path}')
+                    except Exception as e:
+                        log(f"Error retrieving adjusted bars from file for {symbol}: {str(e)}", level=logging.ERROR)
+                        df = None
+                if unadjusted_csv_name in file_list:
+                    try:
+                        with zip_file.open(unadjusted_csv_name) as csv_file:
+                            df_unadjusted = pd.read_csv(csv_file)
+                            df_unadjusted['timestamp'] = pd.to_datetime(df_unadjusted['timestamp']).dt.tz_convert(ny_tz)
+                            df_unadjusted.set_index(['symbol', 'timestamp'], inplace=True)
+                            log(f'Retrieved {unadjusted_csv_name} from {bars_zip_path}')
+                    except Exception as e:
+                        log(f"Error retrieving unadjusted bars from file for {symbol}: {str(e)}", level=logging.ERROR)
+                        df_unadjusted = None
+                    
+                    
     def fetch_bars(adjustment):
         request_params = StockBarsRequest(
             symbol_or_symbols=symbol,
@@ -192,131 +271,33 @@ def retrieve_bar_data(client: StockHistoricalDataClient, symbol, params: Backtes
             end=params.end_date.tz_convert('UTC'),
             adjustment=adjustment,
         )
-        df = client.get_stock_bars(request_params).df
+        try:
+            df = get_data_with_retry(client, client.get_stock_bars, request_params)
+        except Exception as e:
+            log(f"Error requesting bars for {symbol}: {str(e)}", level=logging.ERROR)
         df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz), level='timestamp')
         df.sort_index(inplace=True)
         return fill_missing_data(df)
-
-    def calculate_adjustments(df, df_unadjusted, df_split_adjusted, df_dividend_adjusted):
-        # Calculate the difference between adjusted and unadjusted prices
-        price_diff = np.round(df['close'] - df_unadjusted['close'], 6)
-        
-        # Identify index values where the difference changes
-        change_indices = price_diff[price_diff.diff() != 0].index
-        # print(price_diff[price_diff.diff() != 0])
-        
-        # Create copies of the relevant parts of the dataframes
-        df_all_adj = df.loc[change_indices, 'close'].copy()
-        df_unadj = df_unadjusted.loc[change_indices, 'close'].copy()
-        df_split_adj = df_split_adjusted.loc[change_indices, 'close'].copy()
-        df_div_adj = df_dividend_adjusted.loc[change_indices, 'close'].copy()
-        
-        adjustments = []
-        prev_split_factor = 1.0
-        prev_dividend_amount = 0.0
-        
-        ind = list(reversed(change_indices))
-        # Iterate backwards through the change indices
-        for i, idx in tqdm(enumerate(ind), desc='calculate_adjustments'):
-            diff_orig = price_diff.loc[idx]
-            # all_adj_price = df_all_adj.loc[idx]
-            unadj_price = df_unadj.loc[idx]
-            split_adj_price = df_split_adj.loc[idx]
-            div_adj_price = df_div_adj.loc[idx]
-            
-            # Check for split
-            split_factor = split_adj_price / unadj_price
-            split_adjustment = None
-            if not np.isclose(split_factor, prev_split_factor):
-                split_adjustment = {
-                    'timestamp': idx[1],  # idx[1] is the timestamp in the MultiIndex
-                    'type': 'split',
-                    'factor': split_factor / prev_split_factor,  # Relative change in split factor
-                    'price_diff': diff_orig
-                }
-                prev_split_factor = split_factor
-            
-            # Check for dividend
-            dividend_amount = unadj_price - div_adj_price
-            dividend_adjustment = None
-            if not np.isclose(dividend_amount, prev_dividend_amount):
-                dividend_adjustment = {
-                    'timestamp': idx[1],  # idx[1] is the timestamp in the MultiIndex
-                    'type': 'dividend',
-                    'amount': dividend_amount - prev_dividend_amount,  # Relative change in dividend amount
-                    'price_diff': diff_orig
-                }
-                prev_dividend_amount = dividend_amount
-            
-            # Add adjustments in the correct order (split first, then dividend)
-            if split_adjustment:
-                adjustments.append(split_adjustment)
-            if dividend_adjustment:
-                adjustments.append(dividend_adjustment)
-            
-            # Adjust past close values
-            past_mask = change_indices.get_level_values('timestamp') < idx[1]
-            # past_mask = change_indices < idx
-            if split_adjustment and True in past_mask:
-                df_all_adj.loc[past_mask] /= split_factor
-                df_split_adj.loc[past_mask] /= split_factor
-            if dividend_adjustment and True in past_mask:
-                df_all_adj.loc[past_mask] += dividend_amount
-                df_div_adj.loc[past_mask] += dividend_amount
-                
-                
-                
-            # if split_adjustment and True in past_mask:
-            #     df_all_adj.loc[past_mask].iloc[-1] /= split_factor
-            #     df_split_adj.loc[past_mask].iloc[-1] /= split_factor
-            # if dividend_adjustment and True in past_mask:
-            #     df_all_adj.loc[past_mask].iloc[-1] += dividend_amount
-            #     df_div_adj.loc[past_mask].iloc[-1] += dividend_amount
-                
-                
-            # if split_adjustment and i < len(ind)-1:
-            #     df_all_adj.loc[ind[i+1]] /= split_factor
-            #     df_split_adj.loc[ind[i+1]] /= split_factor
-            # if dividend_adjustment and i < len(ind)-1:
-            #     df_all_adj.loc[ind[i+1]] += dividend_amount
-            #     df_div_adj.loc[ind[i+1]] += dividend_amount
-                
-        # Reverse the adjustments list to have them in chronological order
-        adjustments.reverse()
-        if len(adjustments) == 0:
-            return pd.DataFrame()
-        return pd.DataFrame(adjustments).set_index('timestamp')
 
     if df is None:
         df = fetch_bars(Adjustment.ALL)
         
     if df_unadjusted is None:
         df_unadjusted = fetch_bars(Adjustment.RAW)
-    if df_split_adjusted is None:
-        df_split_adjusted = fetch_bars(Adjustment.SPLIT)
-    if df_dividend_adjusted is None:
-        df_dividend_adjusted = fetch_bars(Adjustment.DIVIDEND)
-        
-    # Calculate adjustment factors
-    adjustment_factors = calculate_adjustments(df, df_unadjusted, df_split_adjusted, df_dividend_adjusted)
 
-    with zipfile.ZipFile(bars_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-        for df_name, csv_name in [('df', adjusted_csv_name), 
-                                  ('df_unadjusted', unadjusted_csv_name),
-                                  ('df_split_adjusted', split_adjusted_csv_name),
-                                  ('df_dividend_adjusted', dividend_adjusted_csv_name)
-                                  ]:
-            if csv_name not in zip_file.namelist():
-                with zip_file.open(csv_name, 'w') as csv_file:
-                    locals()[df_name].reset_index().to_csv(csv_file, index=False)
-                log(f'Saved {df_name} to {bars_zip_path}')
-        
-        # if adjustments_csv_name not in zip_file.namelist():
-        with zip_file.open(adjustments_csv_name, 'w') as csv_file:
-            adjustment_factors.to_csv(csv_file, index=True)
-        log(f'Saved adjustments to {bars_zip_path}')
-            
-    return df, adjustment_factors
+    # Only create or update the zip file if new data was fetched
+    if params.export_bars_path and (df is not None or df_unadjusted is not None):
+        mode = 'a' if os.path.isfile(bars_zip_path) else 'w'
+        with zipfile.ZipFile(bars_zip_path, mode, compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+            for df_name, csv_name in [('df', adjusted_csv_name), 
+                                    ('df_unadjusted', unadjusted_csv_name)]:
+                # print('bars save',locals()[df_name].index.get_level_values('timestamp'))
+                if locals()[df_name] is not None and csv_name not in zip_file.namelist():
+                    with zip_file.open(csv_name, 'w') as csv_file:
+                        locals()[df_name].reset_index().to_csv(csv_file, index=False)
+                    log(f'Saved {df_name} to {bars_zip_path}')
+
+    return df, df_unadjusted
 
 
 # Define aggregation functions
@@ -564,6 +545,39 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                         first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, group_size: int = 10):
     quotes_data = {symbol: {'raw': [], 'agg': [], 'last_minute': None, 'acc_carryover': 0} for symbol in symbols}
 
+    # retrieve data if it exists
+    ignore_symbols = set()
+    for symbol in symbols:
+        if params.export_quotes_path:
+            directory = os.path.dirname(params.export_quotes_path)
+            quotes_zip_path = os.path.join(directory, f'quotes_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
+            os.makedirs(directory, exist_ok=True)
+
+            if os.path.isfile(quotes_zip_path):
+                try:
+                    with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
+                        with zip_file.open(f'{symbol}_raw_quotes.csv') as csv_file:
+                            raw_df = pd.read_csv(csv_file)
+                            raw_df['timestamp'] = pd.to_datetime(raw_df['timestamp']).dt.tz_convert(ny_tz)
+                            raw_df.set_index(['symbol', 'timestamp'], inplace=True)
+                        with zip_file.open(f'{symbol}_aggregated_quotes.csv') as csv_file:
+                            aggregated_df = pd.read_csv(csv_file)
+                            aggregated_df['timestamp'] = pd.to_datetime(aggregated_df['timestamp']).dt.tz_convert(ny_tz)
+                            aggregated_df.set_index(['symbol', 'timestamp'], inplace=True)
+                    log(f'Retrieved quotes for {symbol} from {quotes_zip_path}')
+                    quotes_data[symbol]['raw'] = raw_df
+                    quotes_data[symbol]['agg'] = aggregated_df
+                    ignore_symbols.add(symbol)
+                    del quotes_data[symbol]['last_minute']
+                    del quotes_data[symbol]['acc_carryover']
+                except Exception as e:
+                    log(f"Error retrieving quotes from file for {symbol}: {str(e)}", level=logging.ERROR)
+                    # pass
+                    
+    symbols = [a for a in symbols if a not in ignore_symbols]
+    if len(symbols) == 0:
+        return quotes_data
+    
     def filter_first_and_last_seconds(symbol_df: pd.DataFrame) -> pd.DataFrame:
         seconds = symbol_df.index.get_level_values('timestamp').second
         first_end_idx = np.searchsorted(seconds, 1, side='left')
@@ -573,6 +587,7 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
         
         if len(first_seconds_data) > first_seconds_sample or len(last_seconds_data) > last_seconds_sample:
             rs = np.random.RandomState(seeds[symbol])
+            print(rs)
             if len(first_seconds_data) > first_seconds_sample:
                 first_indices = rs.choice(first_seconds_data.index, first_seconds_sample, replace=False)
                 first_seconds_data = first_seconds_data.loc[first_indices]
@@ -596,13 +611,26 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
             start=minute_start.tz_convert('UTC'),
             end=minute_end.tz_convert('UTC'),
         )
-        qdf0 = client.get_stock_quotes(request_params).df
         
+        try:
+            qdf0 = get_data_with_retry(client, client.get_stock_quotes, request_params)
+        except Exception as e:
+            log(f"Error retrieving quotes for {symbols} at {minute}: {str(e)}", level=logging.ERROR)
+            
         # log(f'---data fetched---')
 
         for symbol in symbols:
-            symbol_df = qdf0.xs(symbol, level='symbol', drop_level=False) if not qdf0.empty else pd.DataFrame()
-            symbol_df.drop(columns=drop_cols, inplace=True)
+            try:
+                if not qdf0.empty and symbol in qdf0.index.get_level_values('symbol'):
+                    symbol_df = qdf0.xs(symbol, level='symbol', drop_level=False).drop(columns=drop_cols)
+                else:
+                    symbol_df = pd.DataFrame()
+                    log(f"No data found for symbol {symbol} at {minute}.", level=logging.WARNING)
+            except Exception as e:
+                symbol_df = pd.DataFrame()
+                log(f"Error processing data for symbol {symbol} at {minute}: {str(e)}", level=logging.ERROR)
+
+            # symbol_df.drop(columns=drop_cols, inplace=True)
             symbol_df, new_carryover = clean_quotes_data(symbol_df, minute_start, minute_end)
 
             # log(f'---{symbol} cleaned---')
@@ -661,30 +689,29 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
             
             aggregated_data = aggregate_quotes_time_based(weighted_data)
             quotes_data[symbol]['agg'].append(aggregated_data)
+            
+            del quotes_data[symbol]['last_minute']
+            del quotes_data[symbol]['acc_carryover']
 
     # Concatenate DataFrames for each symbol
     for symbol in symbols:
         try:
             if quotes_data[symbol]['raw'] and quotes_data[symbol]['agg']:
                 log(f'{symbol} concat raw...')
-                raw_df = concat_with_progress(quotes_data[symbol]['raw'], group_size)
+                quotes_data[symbol]['raw'] = concat_with_progress(quotes_data[symbol]['raw'], group_size)
                 log(f'{symbol} concat agg...')
-                aggregated_df = concat_with_progress(quotes_data[symbol]['agg'], group_size)
-                log(f'...done (Raw: {raw_df.shape[0]} rows, Aggregated: {aggregated_df.shape[0]} rows)')
-                raw_df.sort_index(inplace=True)
-                aggregated_df.sort_index(inplace=True)
-                
-                # TODO: adjust quotes data for dividends/splits before saving 
-                
-                save_quote_data(symbol, raw_df, aggregated_df, params)
-                del quotes_data[symbol]
+                quotes_data[symbol]['agg'] = concat_with_progress(quotes_data[symbol]['agg'], group_size)
+                log(f'...done (Raw: {quotes_data[symbol]['raw'].shape[0]} rows, Aggregated: {quotes_data[symbol]['agg'].shape[0]} rows)')
+                quotes_data[symbol]['raw'].sort_index(inplace=True)
+                quotes_data[symbol]['agg'].sort_index(inplace=True)
+                save_quote_data(symbol, quotes_data[symbol]['raw'], quotes_data[symbol]['agg'], params)
             else:
                 log(f'{symbol} data not found')
         except Exception as e:
             log(f"{type(e).__qualname__}: {e}", level=logging.ERROR)
             raise e
         
-    # return quotes_data
+    return quotes_data
 
 def save_quote_data(symbol, raw_df: pd.DataFrame, aggregated_df: pd.DataFrame, params: BacktestTouchDetectionParameters):
     directory = os.path.dirname(params.export_quotes_path)
@@ -698,13 +725,58 @@ def save_quote_data(symbol, raw_df: pd.DataFrame, aggregated_df: pd.DataFrame, p
     os.makedirs(os.path.dirname(quotes_zip_path), exist_ok=True)
     
     with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-        with zip_file.open(f'{symbol}_raw_quotes.csv', 'w') as csv_file: # should replace existing
+        with zip_file.open(f'{symbol}_raw_quotes.csv', 'w') as csv_file:
+            orig_index = raw_df.index.copy()
+            raw_df.index = pd.MultiIndex.from_arrays([raw_df.index.get_level_values('symbol'), 
+                            raw_df.index.get_level_values('timestamp').strftime('%Y-%m-%d %H:%M:%S.%f%z').str.replace(r'(\d{2})(\d{2})$', r'\1:\2', regex=True)], 
+                            names=['symbol', 'timestamp'])
             raw_df.reset_index().to_csv(csv_file, index=False)
-        with zip_file.open(f'{symbol}_aggregated_quotes.csv', 'w') as csv_file: # should replace existing
+            raw_df.index = orig_index
+        with zip_file.open(f'{symbol}_aggregated_quotes.csv', 'w') as csv_file: # doesnt have formatting problem caused by microseconds
             aggregated_df.reset_index().to_csv(csv_file, index=False)
     log(f'Saved quotes to {quotes_zip_path}')
 
-def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols: List[str], first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, group_size: int = 10):
+def refresh_client(client):
+    """
+    Refresh the session of a StockHistoricalDataClient instance.
+    
+    Args:
+        client: An instance of StockHistoricalDataClient
+    """
+    if not isinstance(client, StockHistoricalDataClient):
+        raise TypeError("Client must be an instance of StockHistoricalDataClient")
+
+    # Refresh the session
+    if hasattr(client, '_session'):
+        client._session.close()
+        client._session = Session()
+        log(f"Session refreshed for {client.__class__.__name__}", level=logging.WARNING)
+        
+def get_data_with_retry(client: StockHistoricalDataClient, client_func: Callable, request_params: StockBarsRequest, max_retries=10, sleep_seconds=10) -> pd.DataFrame:
+    attempt = 0
+    while True:
+        try:
+            res = client_func(request_params)
+            return res.df  # Successfully retrieved data, exit the loop
+        except Exception as e:
+            attempt += 1
+            symbols = request_params.symbol_or_symbols
+            minute = request_params.start  # Assuming 'start' is the relevant timestamp
+            
+            log(f"Attempt {attempt}: Error retrieving data for {symbols} at {minute}: {str(e)}", level=logging.ERROR)
+            
+            if attempt >= max_retries:
+                log(f"Max retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
+                raise  # Re-raise the last exception
+            
+            log(f"Refreshing client session and retrying in {sleep_seconds} seconds...", level=logging.WARNING)
+            refresh_client(client)
+            t2.sleep(sleep_seconds)  # Sleep before retrying
+            
+            
+
+def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols: List[str], first_seconds_sample: int = np.inf, 
+                               last_seconds_sample: int = np.inf, group_size: int = 10):
     assert params.end_date > params.start_date
     
     if isinstance(params.start_date, str):
@@ -718,14 +790,13 @@ def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols
     minute_intervals_dict = {}
     for symbol in tqdm(symbols, desc="Retrieving bar data"):
         # start_time = t2.time()
-        df, adjustment_factors = retrieve_bar_data(client, symbol, params)
-        # df = retrieve_bar_data(client, symbol, params)
+        df_adjusted, df = retrieve_bar_data(client,params,symbol)
         # print(df)
         # print(adjustment_factors)
 
         
         minute_intervals = df.index.get_level_values('timestamp')
-        minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 31)) & (minute_intervals.time <= time(15, 59))]
+        minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
         minute_intervals_dict[symbol] = minute_intervals
         
         # elapsed_time = t2.time() - start_time
@@ -736,9 +807,10 @@ def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols
     assert len(set([a.size for a in minute_intervals_dict.values()])) <= 1 # make sure len(minute_intervals) are the same
 
     # Retrieve quote data
-    retrieve_quote_data(client, symbols, minute_intervals_dict, params, first_seconds_sample, last_seconds_sample, group_size)
+    quotes_data = retrieve_quote_data(client, symbols, minute_intervals_dict, params, first_seconds_sample, last_seconds_sample, group_size)
 
     log("Data retrieval complete for all symbols.")
+    return quotes_data
 
 
 if __name__=="__main__":    
@@ -753,8 +825,11 @@ if __name__=="__main__":
     # start_date = "2024-08-01 00:00:00"
     # end_date =   "2024-09-01 00:00:00"
 
-    # start_date = "2024-09-01 00:00:00"
-    # end_date =   "2024-10-01 00:00:00"
+    start_date = "2024-09-01 00:00:00"
+    end_date =   "2024-10-01 00:00:00"
+    
+    start_date = "2022-01-01 00:00:00" # test for GOOGL
+    end_date =   "2022-02-01 00:00:00"
     
     # start_date = "2024-09-03 00:00:00"
     # end_date =   "2024-09-04 00:00:00"
@@ -772,25 +847,35 @@ if __name__=="__main__":
         end_time='15:55',
         use_median=True,
         touch_area_width_agg=None,
-        use_saved_bars=True, # make False if dont want to save bar data
         rolling_avg_decay_rate=0.85,
         export_bars_path=f'bars/',
-        export_quotes_path=f'quotes2/'
+        export_quotes_path=f'quotes/'
     )
 
 
     # symbols = ['AAPL', 'GOOGL', 'NVDA']
-    symbols = ['AAPL','MSFT'] 
+    # symbols = ['AAPL','MSFT'] 
+    symbols = ['GOOGL']
     # symbols = ['NVDA'] 
     # symbols = ['AAPL'] 
     # NOTE: seems faster overall to do one at a time: for one day, 1 took ~1 minute, 3 took ~5 minutes
     
-    retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
+    # quotes_data = retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
+    quotes_data = retrieve_multi_symbol_data(params, symbols)
 
-    start_date = "2024-09-01 00:00:00"
-    end_date =   "2024-10-01 00:00:00"
+
+    symbols = ['AAPL'] 
+    quotes_data = retrieve_multi_symbol_data(params, symbols)
     
-    params.start_date = start_date
-    params.end_date = end_date
     
-    retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
+    # start_date = "2024-09-01 00:00:00"
+    # end_date =   "2024-10-01 00:00:00"
+    
+    # params.start_date = start_date
+    # params.end_date = end_date
+    
+    # retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
+    
+    
+    # print(quotes_data[symbols[0]]['raw'].index)
+    # print(quotes_data[symbols[0]]['agg'].index)
