@@ -11,7 +11,7 @@ import time as t2
 from typing import List, Tuple, Optional, Dict, Callable
 import math
 import numpy as np
-from TouchDetectionParameters import BacktestTouchDetectionParameters
+from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
 
 from requests import Session
 import hashlib
@@ -62,95 +62,7 @@ logger = setup_logger(logging.INFO)
 def log(message, level=logging.INFO):
     logger.log(level, message)
 
-
-# Global tqdm object
-progress_bar = None
-
-def get_segment_sizes(dfs: List[pd.DataFrame]) -> List[int]:
-    """
-    Calculate the size of each DataFrame in the list.
-    
-    :param dfs: List of DataFrames
-    :return: List of sizes (number of rows) for each DataFrame
-    """
-    return [df.shape[0] for df in dfs]
-
-def divide_segments(dfs: List[pd.DataFrame], sizes: List[int], num_groups: int) -> List[List[int]]:
-    """
-    Divide the segments into groups for concatenation.
-    
-    :param dfs: List of DataFrames
-    :param sizes: List of sizes for each DataFrame
-    :param num_groups: Number of groups to divide into
-    :return: List of lists containing indices for each group
-    """
-    total_size = sum(sizes)
-    target_size = total_size / num_groups if num_groups > 0 else 0
-    
-    groups = [[] for _ in range(num_groups)]
-    group_sizes = [0] * num_groups
-    current_group = 0
-    
-    for i, size in enumerate(sizes):
-        if current_group < num_groups - 1 and group_sizes[current_group] + size > target_size:
-            current_group += 1
-        groups[current_group].append(i)
-        group_sizes[current_group] += size
-    
-    return [group for group in groups if group]
-
-def custom_concat(dfs: List[pd.DataFrame], group_size: int = 10, total_rows: int = None) -> pd.DataFrame:
-    global progress_bar
-    
-    # Initialize progress bar if it's the first call
-    if progress_bar is None and total_rows is not None:
-        progress_bar = tqdm(total=total_rows, desc="Concatenating")
-    
-    # Handle edge cases
-    if len(dfs) == 0:
-        return pd.DataFrame()
-    elif len(dfs) == 1:
-        if progress_bar is not None:
-            progress_bar.update(dfs[0].shape[0])
-        return dfs[0]
-    elif len(dfs) <= group_size:
-        result = pd.concat(dfs, axis=0)
-        if progress_bar is not None:
-            progress_bar.update(result.shape[0])
-        return result
-    
-    sizes = get_segment_sizes(dfs)
-    num_groups = math.ceil(len(dfs) / group_size)
-    groups = divide_segments(dfs, sizes, num_groups)
-    
-    concatenated_groups = []
-    for group in groups:
-        group_dfs = [dfs[i] for i in group]
-        if group_dfs:
-            result = pd.concat(group_dfs, axis=0)
-            concatenated_groups.append(result)
-            if progress_bar is not None:
-                progress_bar.update(result.shape[0])
-    
-    if not concatenated_groups:
-        return pd.DataFrame()
-    elif len(concatenated_groups) == 1:
-        return concatenated_groups[0]
-    else:
-        return custom_concat(concatenated_groups, group_size)
-
-def concat_with_progress(dfs: List[pd.DataFrame], group_size: int = 10) -> pd.DataFrame:
-    global progress_bar
-    total_rows = sum(df.shape[0] for df in dfs)
-    try:
-        return custom_concat(dfs, group_size, total_rows)
-    finally:
-        if progress_bar is not None:
-            progress_bar.close()
-        progress_bar = None
-
-
-def fill_missing_data(df):
+def fill_missing_data(df: pd.DataFrame):
     """
     Fill missing data in a multi-index DataFrame of stock market data.
 
@@ -167,6 +79,9 @@ def fill_missing_data(df):
     pandas.DataFrame: A DataFrame with missing data filled, maintaining the
                       original multi-index structure and timezone.
     """
+    if df.empty:
+        return df
+    
     # Ensure the index is sorted
     df = df.sort_index()
 
@@ -275,6 +190,7 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
             df = get_data_with_retry(client, client.get_stock_bars, request_params)
         except Exception as e:
             log(f"Error requesting bars for {symbol}: {str(e)}", level=logging.ERROR)
+            return pd.DataFrame()
         df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz), level='timestamp')
         df.sort_index(inplace=True)
         return fill_missing_data(df)
@@ -300,52 +216,80 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
     return df, df_unadjusted
 
 
-# Define aggregation functions
-clean_quotes_data_agg_funcs = {
-    'bid_price': 'max',  # Keep the highest bid price
-    'ask_price': 'min',  # Keep the lowest ask price
-    'bid_size': 'max',   # Keep the largest bid size
-    'ask_size': 'max',   # Keep the largest ask size
-    # 'bid_exchange': 'first',  # Arbitrarily keep the first exchange
-    # 'ask_exchange': 'first',  # Same for ask exchange
-    # 'conditions': 'first',    # Arbitrarily keep the first condition
-    # 'tape': 'first'           # Same for tape
-}
+drop_cols = ['bid_exchange', 'ask_exchange', 'conditions', 'tape']
 
-def clean_quotes_data(df: pd.DataFrame, interval_start: pd.Timestamp, interval_end: pd.Timestamp):
+def clean_quotes_data(df: pd.DataFrame, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> Tuple[pd.DataFrame, float]:
     """
-    Clean and aggregate quote data, removing duplicates and calculating weighted average sizes.
-
-    Args:
-    - df (pd.DataFrame): A pandas DataFrame with a MultiIndex containing 'symbol' and 'timestamp'.
-      The DataFrame should have columns: 'bid_price', 'ask_price', 'bid_size', 'ask_size',
-      'bid_exchange', 'ask_exchange', 'conditions', and 'tape'.
-    - interval_end (pd.Timestamp): The end time of the interval, used for the last duration calculation.
-
-    Returns:
-    - pd.DataFrame: A cleaned DataFrame with weighted average sizes for consecutive price pairs.
+    Clean quotes data and calculate intra-timestamp changes with improved efficiency.
     """
+    # assert only 1 distinct symbol
+    assert len(pd.unique(df.index.get_level_values('symbol'))) == 1, list(pd.unique(df.index.get_level_values('symbol')))
+    
     if df.empty:
         return df, (interval_end - interval_start).total_seconds()
 
-    # Step 1: Remove duplicate timestamps
-    df = df.groupby(level=['symbol', 'timestamp']).agg(clean_quotes_data_agg_funcs)
+    # Drop unnecessary columns, sort index
+    df = df.drop(columns=drop_cols, errors='ignore').sort_index(level=['symbol','timestamp'])
+    
+    # Efficient calculation of intra-timestamp changes
+    for col in ['bid_price', 'ask_price', 'bid_size', 'ask_size']:
+        df[f'{col}_intra_change'] = df.groupby(level='timestamp')[col].diff()
+        df[f'{col}_intra_pos'] = df[f'{col}_intra_change'].clip(lower=0)
+        df[f'{col}_intra_neg'] = df[f'{col}_intra_change'].clip(upper=0)
+
+    # Optimized aggregation
+    agg_dict = {
+        'bid_price': ['first', 'max', 'min', 'last'],
+        'bid_price_intra_pos': 'sum',
+        'bid_price_intra_neg': 'sum',
+        'ask_price': ['first', 'max', 'min', 'last'],
+        'ask_price_intra_pos': 'sum',
+        'ask_price_intra_neg': 'sum',
+        'bid_size': ['first', 'max', 'min', 'last'],
+        'bid_size_intra_pos': 'sum',
+        'bid_size_intra_neg': 'sum',
+        'ask_size': ['first', 'max', 'min', 'last'],
+        'ask_size_intra_pos': 'sum',
+        'ask_size_intra_neg': 'sum'
+    }
+    
+    df = df.groupby(level=['symbol', 'timestamp']).agg(agg_dict)
+    df.columns = ['_'.join(col).strip() for col in df.columns.values]
+
+    # Handle timezone and sorting
+    timestamps = df.index.get_level_values('timestamp')
     df.index = df.index.set_levels(
-        df.index.get_level_values('timestamp').tz_convert(ny_tz),
+        timestamps.tz_localize(ny_tz) if timestamps.tz is None else timestamps.tz_convert(ny_tz),
         level='timestamp'
     )
-    df.sort_index(level='timestamp',inplace=True) # MUST BE SORTED for steps needing the returned dataframe
+    # df.sort_index(level=['symbol', 'timestamp'], inplace=True) # already sorted
     
-    # Calculate the duration until the next quote
-    df['duration'] = df.index.get_level_values('timestamp').to_series().diff().shift(-1).values
+    # print(list(df.columns))
+    # print(df.loc[:, [a for a in df.columns if a.endswith('_sum')]])
     
-    if df.empty:
-        return df, (interval_end - interval_start).total_seconds()
+    # sec = pd.to_datetime(df.index.get_level_values('timestamp')).map(lambda x: x.microsecond / 1000)
+    # df.insert(loc=0,column='microsec',value=sec)
+    # sec = pd.to_datetime(df.index.get_level_values('timestamp')).map(lambda x: x.second + x.microsecond / 1_000_000)
+    # df.insert(loc=0,column='sec',value=sec)
+    # # print(df)
     
-    # Set the duration for the last quote to the time until interval_end
-    df.loc[df.index[-1], 'duration'] = interval_end - df.index[-1][1]
-    carryover = (df.index[0][1] - interval_start).total_seconds() # for adding back to previously processed interval
-    df['duration'] = df['duration'].dt.total_seconds()
+    # Calculate durations
+    timestamps = df.index.get_level_values('timestamp').to_numpy()
+    duration_arr = np.empty(len(timestamps))
+    duration_arr[:-1] = np.diff(timestamps).astype('timedelta64[ns]').astype(np.float64) * 1e-9
+    duration_arr[-1] = (interval_end - timestamps[-1]).total_seconds()
+    df['duration'] = duration_arr
+    
+    # Validate no zero durations exist
+    assert not np.any(duration_arr[:-1] <= 0), ("Zero or negative durations found after processing\n",df.loc[df['duration'] <= 0])
+    
+    assert interval_start <= timestamps[0], (interval_start, timestamps[0])
+    carryover = (timestamps[0] - interval_start).total_seconds()
+    
+    # print(carryover)
+    # print(df['duration'])
+    # df.reset_index(drop=False).to_csv('test.csv',index=False) # csv test
+    
     return df, carryover
 
 
@@ -376,27 +320,24 @@ def compute_weighted_sizes(group_indices, group_counts, bid_sizes, ask_sizes, du
     return result_bid_sizes, result_ask_sizes
 
 def apply_grouping_and_weighting(df: pd.DataFrame):
-    df = df.reset_index(drop=False)
-    df['price_pair'] = df['bid_price'].astype(str) + '_' + df['ask_price'].astype(str)
+    pairs = df['bid_price_last'].astype(str) + '_' + df['ask_price_last'].astype(str)
     
     # Identify groups
-    group_changes = (df['price_pair'] != df['price_pair'].shift()).cumsum().values
+    group_changes = (pairs != pairs.shift()).cumsum().values
     _, group_indices, group_counts = np.unique(group_changes, return_index=True, return_counts=True)
     
     # Prepare arrays
-    symbols = df['symbol'].values
-    bid_prices = df['bid_price'].values
-    ask_prices = df['ask_price'].values
-    bid_sizes = df['bid_size'].values
-    ask_sizes = df['ask_size'].values
-    timestamps = df['timestamp'].values
+    symbols = df.index.get_level_values('symbol').values
+    timestamps = df.index.get_level_values('timestamp').values
+    bid_prices = df['bid_price_last'].values
+    ask_prices = df['ask_price_last'].values
+    bid_sizes = df['bid_size_last'].values
+    ask_sizes = df['ask_size_last'].values
     durations = df['duration'].values
     
     # Calculate results
-    result_symbols = symbols[group_indices]
     result_bid_prices = bid_prices[group_indices]
     result_ask_prices = ask_prices[group_indices]
-    result_timestamps = timestamps[group_indices]
     result_durations = np.add.reduceat(durations, group_indices)
     
     # Compute weighted averages using Numba
@@ -406,20 +347,22 @@ def apply_grouping_and_weighting(df: pd.DataFrame):
     
     # Create result DataFrame
     result = pd.DataFrame({
-        'symbol': result_symbols,
-        'timestamp': pd.to_datetime(result_timestamps, utc=True).tz_convert(ny_tz),
         'bid_price': result_bid_prices,
         'ask_price': result_ask_prices,
         'spread': result_ask_prices - result_bid_prices,
         'bid_size': result_bid_sizes,
         'ask_size': result_ask_sizes,
         'duration': result_durations
-    })
-    return result.set_index(['symbol', 'timestamp'])
+    }, index=pd.MultiIndex.from_arrays([
+        symbols[group_indices], 
+        pd.to_datetime(timestamps[group_indices], utc=True).tz_convert(ny_tz)
+    ], names=['symbol', 'timestamp']))
+
+    return result
 
 
 @jit(nopython=True)
-def compute_weighted_sizes_single(prices, sizes, durations):
+def compute_weighted_sizes_single(prices, sizes, durations) -> np.ndarray:
     n = len(prices)
     result_sizes = np.empty(n, dtype=np.float64)
     current_price = prices[0]
@@ -444,7 +387,7 @@ def compute_weighted_sizes_single(prices, sizes, durations):
     return result_sizes
 
 @jit(nopython=True)
-def aggregate_data(prices, sizes, durations, unique_timestamps, indices):
+def aggregate_data(prices: np.ndarray, sizes: np.ndarray, durations: np.ndarray, unique_timestamps: np.ndarray, indices: np.ndarray):
     n = len(prices)
     m = len(unique_timestamps)
     max_prices = np.empty(m, dtype=prices.dtype)
@@ -498,10 +441,8 @@ def aggregate_spread_data(spreads, durations, unique_timestamps, indices):
     return min_spreads, max_spreads, weighted_spreads
 
 def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
-    df = df.reset_index(drop=False)
-    timestamps = df['timestamp'].values.astype(np.int64) // 10**9
-    
-    symbols = df['symbol'].values
+    timestamps = df.index.get_level_values('timestamp').values.astype(np.int64) // 10**9
+    symbols = df.index.get_level_values('symbol').values
     bid_prices = df['bid_price'].values
     ask_prices = df['ask_price'].values
     bid_sizes = df['bid_size'].values
@@ -524,8 +465,6 @@ def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
     
     # Combine results
     result = pd.DataFrame({
-        'symbol': symbols[indices],
-        'timestamp': pd.to_datetime(unique_timestamps, unit='s', utc=True).tz_convert(ny_tz),
         'max_bid_price': bid_max,
         'min_ask_price': ask_min,
         'wm_bid_price': bid_wm,
@@ -537,22 +476,42 @@ def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
         'min_spread': min_spreads,
         'max_spread': max_spreads,
         'wm_spread': weighted_spreads
-    })
-    return result.set_index(['symbol', 'timestamp'])
+    }, index=pd.MultiIndex.from_arrays([
+        symbols[indices], 
+        pd.to_datetime(unique_timestamps, unit='s', utc=True).tz_convert(ny_tz)
+    ], names=['symbol', 'timestamp']))
+    return result
 
+def get_quotes_zip_path(symbol, params: BacktestTouchDetectionParameters):
+   directory = os.path.dirname(params.export_quotes_path)
+   return os.path.join(directory, f'quotes_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+def fetch_next_minute_data(client: StockHistoricalDataClient, symbols: List[str], minute_start: datetime, minute_end: datetime):
+    request_params = StockQuotesRequest(
+        symbol_or_symbols=symbols,
+        start=minute_start.tz_convert('UTC'),
+        end=minute_end.tz_convert('UTC'),
+    )
+    try:
+        return get_data_with_retry(client, client.get_stock_quotes, request_params)
+    except Exception as e:
+        log(f"Error retrieving quotes for {symbols} at {minute_start}: {str(e)}", level=logging.ERROR)
+        return pd.DataFrame()
 
 def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], minute_intervals_dict: Dict[str, pd.Index], params: BacktestTouchDetectionParameters, 
-                        first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, group_size: int = 10):
-    quotes_data = {symbol: {'raw': [], 'agg': [], 'last_minute': None, 'acc_carryover': 0} for symbol in symbols}
-
-    # retrieve data if it exists
+                        first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, return_data=True) -> Dict | None:
+    quotes_data = {symbol: {'raw': None, 'agg': None} for symbol in symbols}
+    
+    # Try retrieving saved data first
     ignore_symbols = set()
     for symbol in symbols:
         if params.export_quotes_path:
-            directory = os.path.dirname(params.export_quotes_path)
-            quotes_zip_path = os.path.join(directory, f'quotes_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
-            os.makedirs(directory, exist_ok=True)
-
+            quotes_zip_path = get_quotes_zip_path(symbol, params)
+            os.makedirs(os.path.dirname(quotes_zip_path), exist_ok=True)
+            
             if os.path.isfile(quotes_zip_path):
                 try:
                     with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
@@ -568,11 +527,8 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                     quotes_data[symbol]['raw'] = raw_df
                     quotes_data[symbol]['agg'] = aggregated_df
                     ignore_symbols.add(symbol)
-                    del quotes_data[symbol]['last_minute']
-                    del quotes_data[symbol]['acc_carryover']
                 except Exception as e:
                     log(f"Error retrieving quotes from file for {symbol}: {str(e)}", level=logging.ERROR)
-                    # pass
                     
     symbols = [a for a in symbols if a not in ignore_symbols]
     if len(symbols) == 0:
@@ -583,11 +539,18 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
         first_end_idx = np.searchsorted(seconds, 1, side='left')
         last_start_idx = np.searchsorted(seconds, 58, side='left')
         first_seconds_data = symbol_df.iloc[:first_end_idx]
-        last_seconds_data = symbol_df.iloc[last_start_idx:]
+        last_seconds_data = symbol_df.iloc[last_start_idx:] if last_start_idx < len(symbol_df) else pd.DataFrame()
+        
+        # Ensure last_seconds_data has at least 1 row
+        if last_seconds_data.empty:
+            last_row = symbol_df.iloc[[-1]]
+            if not first_seconds_data.empty and last_row.index[-1] == first_seconds_data.index[-1]:
+                last_seconds_data = pd.DataFrame()  # Make it empty if last row is in first_seconds_data
+            else:
+                last_seconds_data = last_row  # Otherwise, use the last row
         
         if len(first_seconds_data) > first_seconds_sample or len(last_seconds_data) > last_seconds_sample:
             rs = np.random.RandomState(seeds[symbol])
-            print(rs)
             if len(first_seconds_data) > first_seconds_sample:
                 first_indices = rs.choice(first_seconds_data.index, first_seconds_sample, replace=False)
                 first_seconds_data = first_seconds_data.loc[first_indices]
@@ -596,145 +559,192 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                 last_seconds_data = last_seconds_data.loc[last_indices]
         return pd.concat([first_seconds_data, last_seconds_data])
 
-    drop_cols = ['bid_exchange', 'ask_exchange', 'conditions', 'tape']
-    
-    for minute in tqdm(minute_intervals_dict[symbols[0]], desc='Fetching quotes'):
-        # log(f'---{minute}---')
-        
-        minute_start = minute
-        minute_end = minute + timedelta(minutes=1)
-        
-        seeds = {symbol: get_seed(symbol, minute) for symbol in symbols}
-
-        request_params = StockQuotesRequest(
-            symbol_or_symbols=symbols,
-            start=minute_start.tz_convert('UTC'),
-            end=minute_end.tz_convert('UTC'),
-        )
-        
-        try:
-            qdf0 = get_data_with_retry(client, client.get_stock_quotes, request_params)
-        except Exception as e:
-            log(f"Error retrieving quotes for {symbols} at {minute}: {str(e)}", level=logging.ERROR)
-            
-        # log(f'---data fetched---')
-
-        for symbol in symbols:
-            try:
-                if not qdf0.empty and symbol in qdf0.index.get_level_values('symbol'):
-                    symbol_df = qdf0.xs(symbol, level='symbol', drop_level=False).drop(columns=drop_cols)
-                else:
-                    symbol_df = pd.DataFrame()
-                    log(f"No data found for symbol {symbol} at {minute}.", level=logging.WARNING)
-            except Exception as e:
-                symbol_df = pd.DataFrame()
-                log(f"Error processing data for symbol {symbol} at {minute}: {str(e)}", level=logging.ERROR)
-
-            # symbol_df.drop(columns=drop_cols, inplace=True)
-            symbol_df, new_carryover = clean_quotes_data(symbol_df, minute_start, minute_end)
-
-            # log(f'---{symbol} cleaned---')
-            
-            if not symbol_df.empty:
-                # Process the previous minute's data
-                if quotes_data[symbol]['last_minute'] is not None:
-                    last_minute_df = quotes_data[symbol]['last_minute']
-                    if not last_minute_df.empty:
-                        last_index = last_minute_df.index[-1]
-                        last_minute_df.loc[last_index, 'duration'] += quotes_data[symbol]['acc_carryover'] + new_carryover
-
-                    # Apply grouping and weighting to the previous minute's data
-                    weighted_data = apply_grouping_and_weighting(last_minute_df)
-                    # log(f'---{symbol} grouped + weighted---')
-
-                    # Extract raw data for the previous minute
-                    filtered_data = filter_first_and_last_seconds(weighted_data)
-                    filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
-                    # print(filtered_data)
-                    quotes_data[symbol]['raw'].append(filtered_data.drop(columns=['spread','duration']))
-                    
-                    # log(f'---{symbol} raw---')
-                    
-                    aggregated_data = aggregate_quotes_time_based(weighted_data)
-                    # print(aggregated_data)
-                    quotes_data[symbol]['agg'].append(aggregated_data)
-                    
-                    # log(f'---{symbol} agg---')
-                
-                # Reset accumulated carryover as it's been applied
-                quotes_data[symbol]['acc_carryover'] = 0
-
-                # Store the current minute's data for processing in the next iteration
-                quotes_data[symbol]['last_minute'] = symbol_df
-                
-            else:
-                # Accumulate carryover when there's no activity
-                quotes_data[symbol]['acc_carryover'] += new_carryover
-
-    # Process the last minute's data for each symbol
+    # Initialize temporary files for each symbol
+    temp_files = {}
     for symbol in symbols:
-        if quotes_data[symbol]['last_minute'] is not None:
-            last_minute_df = quotes_data[symbol]['last_minute']
+        if params.export_quotes_path:
+            directory = os.path.dirname(params.export_quotes_path)
+            temp_files[symbol] = {
+                'raw': os.path.join(directory, f'temp_{symbol}_raw_quotes.csv'),
+                'agg': os.path.join(directory, f'temp_{symbol}_aggregated_quotes.csv')
+            }
+
+    def append_quote_segment(temp_path, df: pd.DataFrame, is_first: bool, index_format=True, max_retries=240, sleep_seconds=0.3):
+        if temp_path is not None:
+            if index_format:
+                orig_index = df.index.copy()
+                df.index = pd.MultiIndex.from_arrays([df.index.get_level_values('symbol'), 
+                                df.index.get_level_values('timestamp').strftime('%Y-%m-%d %H:%M:%S.%f%z').str.replace(r'(\d{2})(\d{2})$', r'\1:\2', regex=True)], 
+                                names=['symbol', 'timestamp'])
+            attempt = 0
+            while True:
+                try:
+                    # Write data, with headers only on first append
+                    df.to_csv(temp_path, mode='w' if is_first else 'a', header=is_first)
+                except Exception as e:
+                    attempt += 1
+                    if attempt == 1:
+                        log(f"Attempt {attempt}: Error appending to file for {symbol} at {current_minute}: {str(e)}\nRetrying...", level=logging.ERROR)
+                    if attempt >= max_retries:
+                        log(f"Attempt {attempt}: Error appending to file for {symbol} at {current_minute}: {str(e)}", level=logging.ERROR)
+                        log(f"Max retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
+                        break
+                        # raise  # Re-raise the last exception
+                    t2.sleep(sleep_seconds)
+                    continue
+                if attempt > 1:
+                    log(f"Successful after {attempt} retries", level=logging.DEBUG)
+                break
+            
+            if index_format:
+                df.index = orig_index
+    
+    last_minute_data = {symbol: None for symbol in symbols}
+    acc_carryover = {symbol: 0 for symbol in symbols}
+    first_append = {symbol: True for symbol in symbols}
+    
+    # Get iterator for minutes
+    minutes = minute_intervals_dict[symbols[0]]
+    minutes_iter = iter(minutes)
+    
+    # Start first request
+    try:
+        current_minute = next(minutes_iter)
+        current_minute_start = current_minute
+        current_minute_end = current_minute + timedelta(minutes=1)
+    except StopIteration:
+        return quotes_data
+        
+    with ThreadPoolExecutor(max_workers=1) as executor, tqdm(total=len(minutes), desc='Fetching quotes') as pbar:
+        # Start first request
+        future = executor.submit(fetch_next_minute_data, client, symbols, current_minute_start, current_minute_end)
+        
+        while True:
+            # Get current minute's data
+            qdf0 = future.result()
+            
+            # Start next request if there are more minutes
+            try:
+                next_minute = next(minutes_iter)
+                next_minute_start = next_minute
+                next_minute_end = next_minute + timedelta(minutes=1)
+                future = executor.submit(fetch_next_minute_data, client, symbols, next_minute_start, next_minute_end)
+            except StopIteration:
+                future = None
+            
+            # Process current minute's data
+            seeds = {symbol: get_seed(symbol, current_minute) for symbol in symbols}
+            
+            for symbol in symbols:
+                try:
+                    if not qdf0.empty and symbol in qdf0.index.get_level_values('symbol'):
+                        symbol_df = qdf0.xs(symbol, level='symbol', drop_level=False)
+                    else:
+                        symbol_df = pd.DataFrame()
+                        log(f"No data found for symbol {symbol} at {current_minute}.", level=logging.WARNING)
+                except Exception as e:
+                    symbol_df = pd.DataFrame()
+                    log(f"Error processing data for symbol {symbol} at {current_minute}: {str(e)}", level=logging.ERROR)
+
+                symbol_df, new_carryover = clean_quotes_data(symbol_df, current_minute_start, current_minute_end)
+
+                if not symbol_df.empty:
+                    # Process the previous minute's data
+                    if last_minute_data[symbol] is not None:
+                        last_minute_df = last_minute_data[symbol]
+                        if not last_minute_df.empty:
+                            last_index = last_minute_df.index[-1]
+                            last_minute_df.loc[last_index, 'duration'] += acc_carryover[symbol] + new_carryover
+
+                        # weighted_data = apply_grouping_and_weighting(last_minute_df)
+                        # filtered_data = filter_first_and_last_seconds(weighted_data)
+                        # filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
+                        # filtered_data = filtered_data.drop(columns=['spread','duration'])
+                        filtered_data = filter_first_and_last_seconds(last_minute_df)
+                        
+                        weighted_data = apply_grouping_and_weighting(last_minute_df)
+                        aggregated_data = aggregate_quotes_time_based(weighted_data)
+                        
+                        if params.export_quotes_path:
+                            append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration']), is_first=first_append[symbol], index_format=True)
+                            append_quote_segment(temp_files[symbol]['agg'], aggregated_data, is_first=first_append[symbol], index_format=False)
+                            if first_append[symbol]:
+                                first_append[symbol] = False
+                            
+                    acc_carryover[symbol] = 0
+                    last_minute_data[symbol] = symbol_df
+                    
+                else:
+                    acc_carryover[symbol] += new_carryover
+            # Update progress bar
+            pbar.update(1)
+            if future is None:  # No more minutes to process
+                break
+                
+            current_minute = next_minute
+            current_minute_start = next_minute_start
+            current_minute_end = next_minute_end
+
+    # Process the last minute's data
+    for symbol in symbols:
+        if last_minute_data[symbol] is not None:
+            last_minute_df = last_minute_data[symbol]
             if not last_minute_df.empty:
                 last_index = last_minute_df.index[-1]
-                last_minute_df.loc[last_index, 'duration'] += quotes_data[symbol]['acc_carryover']
+                last_minute_df.loc[last_index, 'duration'] += acc_carryover[symbol]
             
-            # Apply grouping and weighting to the last minute's data
+            # weighted_data = apply_grouping_and_weighting(last_minute_df)
+            # filtered_data = filter_first_and_last_seconds(weighted_data)
+            # filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
+            # filtered_data = filtered_data.drop(columns=['spread','duration'])
+            filtered_data = filter_first_and_last_seconds(last_minute_df)
+            
             weighted_data = apply_grouping_and_weighting(last_minute_df)
-            
-            # Extract raw data for the last minute
-            filtered_data = filter_first_and_last_seconds(weighted_data)
-            filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
-            quotes_data[symbol]['raw'].append(filtered_data.drop(columns=['spread','duration']))
-            
             aggregated_data = aggregate_quotes_time_based(weighted_data)
-            quotes_data[symbol]['agg'].append(aggregated_data)
             
-            del quotes_data[symbol]['last_minute']
-            del quotes_data[symbol]['acc_carryover']
-
-    # Concatenate DataFrames for each symbol
+            if params.export_quotes_path:
+                append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration']), is_first=first_append[symbol], index_format=True)
+                append_quote_segment(temp_files[symbol]['agg'], aggregated_data, is_first=first_append[symbol], index_format=False)
+                if first_append[symbol]:
+                    first_append[symbol] = False
+                  
+    # Create final zip files from temp files and load data for return
     for symbol in symbols:
-        try:
-            if quotes_data[symbol]['raw'] and quotes_data[symbol]['agg']:
-                log(f'{symbol} concat raw...')
-                quotes_data[symbol]['raw'] = concat_with_progress(quotes_data[symbol]['raw'], group_size)
-                log(f'{symbol} concat agg...')
-                quotes_data[symbol]['agg'] = concat_with_progress(quotes_data[symbol]['agg'], group_size)
-                log(f'...done (Raw: {quotes_data[symbol]['raw'].shape[0]} rows, Aggregated: {quotes_data[symbol]['agg'].shape[0]} rows)')
-                quotes_data[symbol]['raw'].sort_index(inplace=True)
-                quotes_data[symbol]['agg'].sort_index(inplace=True)
-                save_quote_data(symbol, quotes_data[symbol]['raw'], quotes_data[symbol]['agg'], params)
-            else:
-                log(f'{symbol} data not found')
-        except Exception as e:
-            log(f"{type(e).__qualname__}: {e}", level=logging.ERROR)
-            raise e
-        
-    return quotes_data
+        if params.export_quotes_path:
+            quotes_zip_path = get_quotes_zip_path(symbol, params)
+            with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+                for suffix in ['raw_quotes', 'aggregated_quotes']:
+                    temp_path = temp_files[symbol]['raw' if 'raw' in suffix else 'agg']
+                    with open(temp_path, 'r') as temp_file:
+                        with zip_file.open(f'{symbol}_{suffix}.csv', 'w') as zip_csv:
+                            zip_csv.write(temp_file.read().encode())
+                    os.remove(temp_path)  # Clean up temp file
 
-def save_quote_data(symbol, raw_df: pd.DataFrame, aggregated_df: pd.DataFrame, params: BacktestTouchDetectionParameters):
-    directory = os.path.dirname(params.export_quotes_path)
-    
-    if isinstance(params.start_date, str):
-        params.start_date = pd.to_datetime(params.start_date).tz_localize(ny_tz)
-    if isinstance(params.end_date, str):
-        params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
-    
-    quotes_zip_path = os.path.join(directory, f'quotes_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
-    os.makedirs(os.path.dirname(quotes_zip_path), exist_ok=True)
-    
-    with zipfile.ZipFile(quotes_zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
-        with zip_file.open(f'{symbol}_raw_quotes.csv', 'w') as csv_file:
-            orig_index = raw_df.index.copy()
-            raw_df.index = pd.MultiIndex.from_arrays([raw_df.index.get_level_values('symbol'), 
-                            raw_df.index.get_level_values('timestamp').strftime('%Y-%m-%d %H:%M:%S.%f%z').str.replace(r'(\d{2})(\d{2})$', r'\1:\2', regex=True)], 
-                            names=['symbol', 'timestamp'])
-            raw_df.reset_index().to_csv(csv_file, index=False)
-            raw_df.index = orig_index
-        with zip_file.open(f'{symbol}_aggregated_quotes.csv', 'w') as csv_file: # doesnt have formatting problem caused by microseconds
-            aggregated_df.reset_index().to_csv(csv_file, index=False)
-    log(f'Saved quotes to {quotes_zip_path}')
+            if not return_data:
+                continue
+            # Read data for return
+            try:
+                with zipfile.ZipFile(quotes_zip_path, 'r') as zip_file:
+                    with zip_file.open(f'{symbol}_raw_quotes.csv') as csv_file:
+                        raw_df = pd.read_csv(csv_file)
+                        # print(pd.to_datetime(raw_df['timestamp']))
+                        raw_df['timestamp'] = pd.to_datetime(raw_df['timestamp']).dt.tz_convert(ny_tz)
+                        raw_df.set_index(['symbol', 'timestamp'], inplace=True)
+                        # print(raw_df.index.get_level_values('timestamp'))
+                    with zip_file.open(f'{symbol}_aggregated_quotes.csv') as csv_file:
+                        aggregated_df = pd.read_csv(csv_file)
+                        # print(pd.to_datetime(aggregated_df['timestamp']))
+                        aggregated_df['timestamp'] = pd.to_datetime(aggregated_df['timestamp']).dt.tz_convert(ny_tz)
+                        aggregated_df.set_index(['symbol', 'timestamp'], inplace=True)
+                        # print(aggregated_df.index.get_level_values('timestamp'))
+                quotes_data[symbol]['raw'] = raw_df
+                quotes_data[symbol]['agg'] = aggregated_df
+            except Exception as e:
+                log(f"Error reading saved quotes for {symbol}: {str(e)}", level=logging.ERROR)
+    if return_data:
+        return quotes_data
+    else:
+        return None
 
 def refresh_client(client):
     """
@@ -766,17 +776,18 @@ def get_data_with_retry(client: StockHistoricalDataClient, client_func: Callable
             log(f"Attempt {attempt}: Error retrieving data for {symbols} at {minute}: {str(e)}", level=logging.ERROR)
             
             if attempt >= max_retries:
-                log(f"Max retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
-                raise  # Re-raise the last exception
-            
-            log(f"Refreshing client session and retrying in {sleep_seconds} seconds...", level=logging.WARNING)
+                log(f"Attempt {attempt}: Error retrieving data for {symbols} at {minute}: {str(e)}", level=logging.ERROR)
+                log(f"Max retries reached. Giving up.", level=logging.ERROR)
+                return pd.DataFrame()
+                # raise e  # Re-raise the last exception
+            log(f"Refreshing client session and retrying in {sleep_seconds} seconds...", level=logging.ERROR)
             refresh_client(client)
-            t2.sleep(sleep_seconds)  # Sleep before retrying
+            t2.sleep(sleep_seconds)
             
             
 
 def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols: List[str], first_seconds_sample: int = np.inf, 
-                               last_seconds_sample: int = np.inf, group_size: int = 10):
+                               last_seconds_sample: int = np.inf, return_data=True) -> Dict | None:
     assert params.end_date > params.start_date
     
     if isinstance(params.start_date, str):
@@ -807,7 +818,7 @@ def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols
     assert len(set([a.size for a in minute_intervals_dict.values()])) <= 1 # make sure len(minute_intervals) are the same
 
     # Retrieve quote data
-    quotes_data = retrieve_quote_data(client, symbols, minute_intervals_dict, params, first_seconds_sample, last_seconds_sample, group_size)
+    quotes_data = retrieve_quote_data(client, symbols, minute_intervals_dict, params, first_seconds_sample, last_seconds_sample, return_data)
 
     log("Data retrieval complete for all symbols.")
     return quotes_data
@@ -828,8 +839,11 @@ if __name__=="__main__":
     start_date = "2024-09-01 00:00:00"
     end_date =   "2024-10-01 00:00:00"
     
-    start_date = "2022-01-01 00:00:00" # test for GOOGL
+    start_date = "2022-01-01 00:00:00"
     end_date =   "2022-02-01 00:00:00"
+    
+    start_date = "2022-01-12 00:00:00"
+    end_date =   "2022-01-13 00:00:00"
     
     # start_date = "2024-09-03 00:00:00"
     # end_date =   "2024-09-04 00:00:00"
@@ -854,18 +868,18 @@ if __name__=="__main__":
 
 
     # symbols = ['AAPL', 'GOOGL', 'NVDA']
-    # symbols = ['AAPL','MSFT'] 
-    symbols = ['GOOGL']
+    symbols = ['AAPL'] 
+    # symbols = ['GOOGL']
     # symbols = ['NVDA'] 
-    # symbols = ['AAPL'] 
+    # symbols = ['AAPL','GOOGL'] 
     # NOTE: seems faster overall to do one at a time: for one day, 1 took ~1 minute, 3 took ~5 minutes
     
     # quotes_data = retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
     quotes_data = retrieve_multi_symbol_data(params, symbols)
 
 
-    symbols = ['AAPL'] 
-    quotes_data = retrieve_multi_symbol_data(params, symbols)
+    # symbols = ['AAPL'] 
+    # quotes_data = retrieve_multi_symbol_data(params, symbols)
     
     
     # start_date = "2024-09-01 00:00:00"

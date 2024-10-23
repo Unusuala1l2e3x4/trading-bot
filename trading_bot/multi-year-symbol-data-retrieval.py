@@ -43,7 +43,7 @@ def retrieve_multi_year_symbol_data(symbols: List[str], years: List[int], symbol
                 try:
                     print(f"Retrieving data from {params.start_date} to {params.end_date}")
                     # Retrieve quote data for the current batch of symbols
-                    retrieve_multi_symbol_data(params, symbol_batch, first_seconds_sample=first_seconds_sample, last_seconds_sample=last_seconds_sample)
+                    retrieve_multi_symbol_data(params, symbol_batch, first_seconds_sample=first_seconds_sample, last_seconds_sample=last_seconds_sample, return_data=False)
                 except Exception as e:
                     print(f"multi-year-symbol-data-retrieval - Error retrieving data for {symbol_batch} from {params.start_date} to {params.end_date}: {str(e)}")
 
