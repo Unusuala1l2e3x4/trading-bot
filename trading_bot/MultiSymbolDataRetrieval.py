@@ -10,6 +10,7 @@ from tqdm import tqdm
 import time as t2
 from typing import List, Tuple, Optional, Dict, Callable
 import math
+import copy
 import numpy as np
 from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
 
@@ -35,11 +36,9 @@ API_KEY = config[livepaper]['key']
 API_SECRET = config[livepaper]['secret']
 
 
-
 # SLEEP_TIME = 0.3 # 60/200 = 0.3 second if we're using free account
 # SLEEP_TIME = 0.06 # 60/1000 = 0.06 sec if we have Elite Smart Router
 SLEEP_TIME = 0.006 # 60/10000 = 0.006 sec if we have Algo Trader Plus
-
 
 import logging
 def setup_logger(log_level=logging.INFO):
@@ -216,271 +215,190 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
     return df, df_unadjusted
 
 
+def count_changes(series: pd.Series) -> int:
+    """Count the number of actual changes in values, excluding consecutive repeats."""
+    return (series != series.shift()).sum()
+count_changes.__name__ = 'changes'
+
 drop_cols = ['bid_exchange', 'ask_exchange', 'conditions', 'tape']
+intra_cols = ['bid_price', 'ask_price', 'bid_size', 'ask_size', 'spread']
+
+# Create separate aggregation dicts for different use cases
+aggregation_dict = {
+    'bid_price': ['first', 'max', 'min', 'last'],
+    'bid_price_intra_pos': 'sum',
+    'bid_price_intra_neg': 'sum',
+    'ask_price': ['first', 'max', 'min', 'last'],
+    'ask_price_intra_pos': 'sum',
+    'ask_price_intra_neg': 'sum',
+    'bid_size': ['first', 'max', 'min', 'last'],
+    'bid_size_intra_pos': 'sum',
+    'bid_size_intra_neg': 'sum',
+    'ask_size': ['first', 'max', 'min', 'last'],
+    'ask_size_intra_pos': 'sum',
+    'ask_size_intra_neg': 'sum',
+    'spread': ['first', 'max', 'min', 'last', 'mean']
+}
+
+def prepare_quote_data(df: pd.DataFrame, grouping_cols: list) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Common preprocessing steps for quote data.
+    """
+    df = df.drop(columns=drop_cols, errors='ignore').sort_index(level=['symbol', 'timestamp'])
+    df['spread'] = (df['ask_price'] - df['bid_price']).round(4)
+    
+    # Calculate all diffs at once
+    diff_df = df.groupby(level=grouping_cols)[intra_cols].diff()
+    
+    # Add intra columns efficiently
+    for col in intra_cols:
+        changes = diff_df[col].round(4)
+        df[f'{col}_intra_pos'] = changes.clip(lower=0)
+        df[f'{col}_intra_neg'] = changes.clip(upper=0)
+
+    group_sizes = df.groupby(level=grouping_cols).size()
+    return df, group_sizes
+
+@jit(nopython=True)
+def calculate_time_weighted_spread(spreads: np.ndarray, timestamps: np.ndarray, 
+                                 interval_start: float, interval_end: float) -> float:
+    """
+    Calculate time-weighted average spread using numba for optimization.
+    All timestamps should be in unix timestamp format (seconds).
+    """
+    if len(spreads) == 0:
+        return 0.0
+    
+    # Initialize arrays for duration calculations
+    durations = np.empty(len(spreads))
+    
+    # Handle first duration (from interval_start)
+    durations[0] = timestamps[0] - interval_start
+    
+    # Calculate intermediate durations
+    durations[1:] = timestamps[1:] - timestamps[:-1]
+    
+    # Adjust last duration to extend to interval_end
+    durations[-1] = interval_end - timestamps[-1]
+    
+    # Calculate time-weighted average
+    total_duration = interval_end - interval_start
+    weighted_sum = np.sum(spreads * durations)
+    
+    return weighted_sum / total_duration
+
+def calculate_group_twap(group: pd.DataFrame) -> float:
+    """
+    Calculate time-weighted average spread for a group of quotes.
+    For use with pandas apply.
+    """
+    second_start = group.index.get_level_values('second')[0]
+    second_end = second_start + pd.Timedelta(seconds=1)
+    
+    # Convert to numpy array of timestamps in seconds
+    timestamps = np.array(group.index.get_level_values('timestamp').astype(np.int64)) / 1e9
+    interval_start_ts = second_start.timestamp()
+    interval_end_ts = second_end.timestamp()
+    spreads = group['spread'].values
+    
+    return calculate_time_weighted_spread(
+        spreads, 
+        timestamps, 
+        interval_start_ts, 
+        interval_end_ts
+    )
+
 
 def clean_quotes_data(df: pd.DataFrame, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> Tuple[pd.DataFrame, float]:
     """
     Clean quotes data and calculate intra-timestamp changes with improved efficiency.
     """
-    # assert only 1 distinct symbol
-    assert len(pd.unique(df.index.get_level_values('symbol'))) == 1, list(pd.unique(df.index.get_level_values('symbol')))
-    
+    assert len(pd.unique(df.index.get_level_values('symbol'))) == 1, \
+           list(pd.unique(df.index.get_level_values('symbol')))
+
     if df.empty:
         return df, (interval_end - interval_start).total_seconds()
-
-    # Drop unnecessary columns, sort index
-    df = df.drop(columns=drop_cols, errors='ignore').sort_index(level=['symbol','timestamp'])
     
-    # Efficient calculation of intra-timestamp changes
-    for col in ['bid_price', 'ask_price', 'bid_size', 'ask_size']:
-        df[f'{col}_intra_change'] = df.groupby(level='timestamp')[col].diff()
-        df[f'{col}_intra_pos'] = df[f'{col}_intra_change'].clip(lower=0)
-        df[f'{col}_intra_neg'] = df[f'{col}_intra_change'].clip(upper=0)
-
-    # Optimized aggregation
-    agg_dict = {
-        'bid_price': ['first', 'max', 'min', 'last'],
-        'bid_price_intra_pos': 'sum',
-        'bid_price_intra_neg': 'sum',
-        'ask_price': ['first', 'max', 'min', 'last'],
-        'ask_price_intra_pos': 'sum',
-        'ask_price_intra_neg': 'sum',
-        'bid_size': ['first', 'max', 'min', 'last'],
-        'bid_size_intra_pos': 'sum',
-        'bid_size_intra_neg': 'sum',
-        'ask_size': ['first', 'max', 'min', 'last'],
-        'ask_size_intra_pos': 'sum',
-        'ask_size_intra_neg': 'sum'
-    }
+    # Prepare data
+    grouping_cols = ['symbol', 'timestamp']
+    df, group_sizes = prepare_quote_data(df, grouping_cols)
     
-    df = df.groupby(level=['symbol', 'timestamp']).agg(agg_dict)
+    # Aggregate based on repeating timestamps (each group has the same timestamp)
+    df = df.groupby(level=grouping_cols).agg(aggregation_dict)
     df.columns = ['_'.join(col).strip() for col in df.columns.values]
+    df.insert(0, 'count', group_sizes)
 
-    # Handle timezone and sorting
+    # Handle timezone
     timestamps = df.index.get_level_values('timestamp')
     df.index = df.index.set_levels(
         timestamps.tz_localize(ny_tz) if timestamps.tz is None else timestamps.tz_convert(ny_tz),
         level='timestamp'
     )
-    # df.sort_index(level=['symbol', 'timestamp'], inplace=True) # already sorted
-    
-    # print(list(df.columns))
-    # print(df.loc[:, [a for a in df.columns if a.endswith('_sum')]])
-    
-    # sec = pd.to_datetime(df.index.get_level_values('timestamp')).map(lambda x: x.microsecond / 1000)
-    # df.insert(loc=0,column='microsec',value=sec)
-    # sec = pd.to_datetime(df.index.get_level_values('timestamp')).map(lambda x: x.second + x.microsecond / 1_000_000)
-    # df.insert(loc=0,column='sec',value=sec)
-    # # print(df)
-    
-    # Calculate durations
+
+    # Calculate durations using vectorized operations
     timestamps = df.index.get_level_values('timestamp').to_numpy()
     duration_arr = np.empty(len(timestamps))
     duration_arr[:-1] = np.diff(timestamps).astype('timedelta64[ns]').astype(np.float64) * 1e-9
     duration_arr[-1] = (interval_end - timestamps[-1]).total_seconds()
     df['duration'] = duration_arr
     
-    # Validate no zero durations exist
-    assert not np.any(duration_arr[:-1] <= 0), ("Zero or negative durations found after processing\n",df.loc[df['duration'] <= 0])
-    
+    # Validations
+    assert not np.any(duration_arr[:-1] <= 0), \
+           ("Zero or negative durations found after processing\n", df.loc[df['duration'] <= 0])
     assert interval_start <= timestamps[0], (interval_start, timestamps[0])
+    
     carryover = (timestamps[0] - interval_start).total_seconds()
-    
-    # print(carryover)
-    # print(df['duration'])
-    # df.reset_index(drop=False).to_csv('test.csv',index=False) # csv test
-    
     return df, carryover
+
+def aggregate_by_second(df: pd.DataFrame, carryover_quote: pd.DataFrame, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> pd.DataFrame:
+    """
+    Aggregate quote data by second intervals with time-weighted spread calculation.
+    """
+    if df.empty:
+        return df
+
+    # Calculate time-weighted spread
+    if carryover_quote is not None:
+        assert carryover_quote.iloc[-1].name[1] <= interval_start.tz_convert('UTC')
+        carryover_quote.index = pd.MultiIndex.from_tuples([(carryover_quote.iloc[-1].name[0], interval_start.tz_convert('UTC'))], names=carryover_quote.index.names)
+        df = pd.concat([carryover_quote, df])
+
+    # Add seconds index efficiently
+    df = df.assign(
+        second=df.index.get_level_values('timestamp').floor('s')
+    ).set_index('second', append=True)
+    
+    # Prepare data
+    grouping_cols = ['symbol', 'second']
+    df, group_sizes = prepare_quote_data(df, grouping_cols)
+    
+    # Aggregate based on repeating timestamps (each group has the same whole-number second value)
+    if carryover_quote is not None:
+        df_agg = df.iloc[1:].groupby(level=grouping_cols).agg(aggregation_dict)
+    else:
+        df_agg = df.groupby(level=grouping_cols).agg(aggregation_dict)
+    df_agg.columns = ['_'.join(col).strip() for col in df_agg.columns.values]
+    df_agg.insert(0, 'count', group_sizes)
+
+    # Calculate TWAP using apply
+    df_agg['spread_twap'] = df.groupby(level=grouping_cols).apply(calculate_group_twap)
+    
+    # Handle timezone
+    timestamps = df_agg.index.get_level_values('second')
+    df_agg.index = df_agg.index.set_levels(
+        timestamps.tz_localize(ny_tz) if timestamps.tz is None else timestamps.tz_convert(ny_tz),
+        level='second'
+    )
+    
+    df_agg.index = df_agg.index.rename('timestamp', level='second')
+    return df_agg
+
+
 
 
 SEED_DIV = 2**32
 def get_seed(symbol: str, minute: datetime) -> int:
     return int(hashlib.sha256(f"{symbol}_{minute}".encode()).hexdigest(), 16) % SEED_DIV
-
-# parallelization doesnt seem to speed it up. using parallel=False for now.
-@jit(nopython=True, parallel=False)
-def compute_weighted_sizes(group_indices, group_counts, bid_sizes, ask_sizes, durations):
-    n = len(group_indices)
-    result_bid_sizes = np.empty(n, dtype=np.float64)
-    result_ask_sizes = np.empty(n, dtype=np.float64)
-    for i in prange(n):
-        start = group_indices[i]
-        end = start + group_counts[i]
-        group_durations = durations[start:end]
-        group_bid_sizes = bid_sizes[start:end]
-        group_ask_sizes = ask_sizes[start:end]
-        
-        total_duration = np.sum(group_durations)
-        if total_duration == 0:
-            result_bid_sizes[i] = group_bid_sizes[0]
-            result_ask_sizes[i] = group_ask_sizes[0]
-        else:
-            result_bid_sizes[i] = np.sum(group_bid_sizes * group_durations) / total_duration
-            result_ask_sizes[i] = np.sum(group_ask_sizes * group_durations) / total_duration
-    return result_bid_sizes, result_ask_sizes
-
-def apply_grouping_and_weighting(df: pd.DataFrame):
-    pairs = df['bid_price_last'].astype(str) + '_' + df['ask_price_last'].astype(str)
-    
-    # Identify groups
-    group_changes = (pairs != pairs.shift()).cumsum().values
-    _, group_indices, group_counts = np.unique(group_changes, return_index=True, return_counts=True)
-    
-    # Prepare arrays
-    symbols = df.index.get_level_values('symbol').values
-    timestamps = df.index.get_level_values('timestamp').values
-    bid_prices = df['bid_price_last'].values
-    ask_prices = df['ask_price_last'].values
-    bid_sizes = df['bid_size_last'].values
-    ask_sizes = df['ask_size_last'].values
-    durations = df['duration'].values
-    
-    # Calculate results
-    result_bid_prices = bid_prices[group_indices]
-    result_ask_prices = ask_prices[group_indices]
-    result_durations = np.add.reduceat(durations, group_indices)
-    
-    # Compute weighted averages using Numba
-    result_bid_sizes, result_ask_sizes = compute_weighted_sizes(
-        group_indices, group_counts, bid_sizes, ask_sizes, durations
-    )
-    
-    # Create result DataFrame
-    result = pd.DataFrame({
-        'bid_price': result_bid_prices,
-        'ask_price': result_ask_prices,
-        'spread': result_ask_prices - result_bid_prices,
-        'bid_size': result_bid_sizes,
-        'ask_size': result_ask_sizes,
-        'duration': result_durations
-    }, index=pd.MultiIndex.from_arrays([
-        symbols[group_indices], 
-        pd.to_datetime(timestamps[group_indices], utc=True).tz_convert(ny_tz)
-    ], names=['symbol', 'timestamp']))
-
-    return result
-
-
-@jit(nopython=True)
-def compute_weighted_sizes_single(prices, sizes, durations) -> np.ndarray:
-    n = len(prices)
-    result_sizes = np.empty(n, dtype=np.float64)
-    current_price = prices[0]
-    start_idx = 0
-    
-    for i in range(1, n + 1):
-        if i == n or prices[i] != current_price:
-            end_idx = i
-            group_durations = durations[start_idx:end_idx]
-            group_sizes = sizes[start_idx:end_idx]
-            total_duration = np.sum(group_durations)
-            if total_duration == 0:
-                weighted_size = group_sizes[0]
-            else:
-                weighted_size = np.sum(group_sizes * group_durations) / total_duration
-            
-            result_sizes[start_idx:end_idx] = weighted_size
-            
-            if i < n:
-                current_price = prices[i]
-                start_idx = i
-    return result_sizes
-
-@jit(nopython=True)
-def aggregate_data(prices: np.ndarray, sizes: np.ndarray, durations: np.ndarray, unique_timestamps: np.ndarray, indices: np.ndarray):
-    n = len(prices)
-    m = len(unique_timestamps)
-    max_prices = np.empty(m, dtype=prices.dtype)
-    min_prices = np.empty(m, dtype=prices.dtype)
-    wm_prices = np.empty(m, dtype=prices.dtype)
-    max_sizes = np.empty(m, dtype=sizes.dtype)
-    sum_sizes = np.empty(m, dtype=sizes.dtype)
-    
-    for i in range(m):
-        start = indices[i]
-        end = indices[i+1] if i < m-1 else n
-        
-        group_prices = prices[start:end]
-        group_sizes = sizes[start:end]
-        group_durations = durations[start:end]
-        
-        max_prices[i] = np.max(group_prices)
-        min_prices[i] = np.min(group_prices)
-        max_sizes[i] = np.max(group_sizes)
-        sum_sizes[i] = np.sum(group_sizes)
-        
-        total_duration = np.sum(group_durations)
-        if total_duration == 0:
-            wm_prices[i] = group_prices[0]
-        else:
-            wm_prices[i] = np.sum(group_prices * group_durations) / total_duration
-    
-    return max_prices, min_prices, wm_prices, max_sizes, sum_sizes
-
-@jit(nopython=True)
-def aggregate_spread_data(spreads, durations, unique_timestamps, indices):
-    n = len(spreads)
-    m = len(unique_timestamps)
-    min_spreads = np.empty(m, dtype=spreads.dtype)
-    max_spreads = np.empty(m, dtype=spreads.dtype)
-    weighted_spreads = np.empty(m, dtype=spreads.dtype)
-    for i in range(m):
-        start = indices[i]
-        end = indices[i+1] if i < m-1 else n
-        group_spreads = spreads[start:end]
-        group_durations = durations[start:end]
-        total_duration = np.sum(group_durations)
-        
-        min_spreads[i] = np.min(group_spreads)
-        max_spreads[i] = np.max(group_spreads)
-        
-        if total_duration == 0:
-            weighted_spreads[i] = group_spreads[0]
-        else:
-            weighted_spreads[i] = np.sum(group_spreads * group_durations) / total_duration
-    return min_spreads, max_spreads, weighted_spreads
-
-def aggregate_quotes_time_based(df: pd.DataFrame, interval_seconds=1):
-    timestamps = df.index.get_level_values('timestamp').values.astype(np.int64) // 10**9
-    symbols = df.index.get_level_values('symbol').values
-    bid_prices = df['bid_price'].values
-    ask_prices = df['ask_price'].values
-    bid_sizes = df['bid_size'].values
-    ask_sizes = df['ask_size'].values
-    durations = df['duration'].values
-    spreads = df['spread'].values
-    
-    floored_timestamps = (timestamps // interval_seconds) * interval_seconds
-    unique_timestamps, indices = np.unique(floored_timestamps, return_index=True)
-    
-    # Aggregate spread data
-    min_spreads, max_spreads, weighted_spreads = aggregate_spread_data(spreads, durations, unique_timestamps, indices)
-    
-    # Re-weight bid and ask sizes
-    bid_sizes = compute_weighted_sizes_single(bid_prices, bid_sizes, durations)
-    ask_sizes = compute_weighted_sizes_single(ask_prices, ask_sizes, durations)
-
-    bid_max, _, bid_wm, bid_size_max, bid_size_sum = aggregate_data(bid_prices, bid_sizes, durations, unique_timestamps, indices)
-    _, ask_min, ask_wm, ask_size_max, ask_size_sum = aggregate_data(ask_prices, ask_sizes, durations, unique_timestamps, indices)
-    
-    # Combine results
-    result = pd.DataFrame({
-        'max_bid_price': bid_max,
-        'min_ask_price': ask_min,
-        'wm_bid_price': bid_wm,
-        'wm_ask_price': ask_wm,
-        'max_bid_size': np.floor(bid_size_max),
-        'max_ask_size': np.floor(ask_size_max),
-        'total_bid_size': np.floor(bid_size_sum),
-        'total_ask_size': np.floor(ask_size_sum),
-        'min_spread': min_spreads,
-        'max_spread': max_spreads,
-        'wm_spread': weighted_spreads
-    }, index=pd.MultiIndex.from_arrays([
-        symbols[indices], 
-        pd.to_datetime(unique_timestamps, unit='s', utc=True).tz_convert(ny_tz)
-    ], names=['symbol', 'timestamp']))
-    return result
 
 def get_quotes_zip_path(symbol, params: BacktestTouchDetectionParameters):
    directory = os.path.dirname(params.export_quotes_path)
@@ -534,16 +452,16 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
     if len(symbols) == 0:
         return quotes_data
     
-    def filter_first_and_last_seconds(symbol_df: pd.DataFrame) -> pd.DataFrame:
-        seconds = symbol_df.index.get_level_values('timestamp').second
+    def filter_first_and_last_seconds(df: pd.DataFrame) -> pd.DataFrame:
+        seconds = df.index.get_level_values('timestamp').second
         first_end_idx = np.searchsorted(seconds, 1, side='left')
         last_start_idx = np.searchsorted(seconds, 58, side='left')
-        first_seconds_data = symbol_df.iloc[:first_end_idx]
-        last_seconds_data = symbol_df.iloc[last_start_idx:] if last_start_idx < len(symbol_df) else pd.DataFrame()
+        first_seconds_data = df.iloc[:first_end_idx]
+        last_seconds_data = df.iloc[last_start_idx:] if last_start_idx < len(df) else pd.DataFrame()
         
         # Ensure last_seconds_data has at least 1 row
-        if last_seconds_data.empty:
-            last_row = symbol_df.iloc[[-1]]
+        if last_seconds_data.empty and not df.empty:
+            last_row = df.iloc[[-1]]
             if not first_seconds_data.empty and last_row.index[-1] == first_seconds_data.index[-1]:
                 last_seconds_data = pd.DataFrame()  # Make it empty if last row is in first_seconds_data
             else:
@@ -581,27 +499,30 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                 try:
                     # Write data, with headers only on first append
                     df.to_csv(temp_path, mode='w' if is_first else 'a', header=is_first)
+                    if attempt >= 1:
+                        log(f"Successful after {attempt} retries", level=logging.INFO)
                 except Exception as e:
                     attempt += 1
                     if attempt == 1:
-                        log(f"Attempt {attempt}: Error appending to file for {symbol} at {current_minute}: {str(e)}\nRetrying...", level=logging.ERROR)
-                    if attempt >= max_retries:
                         log(f"Attempt {attempt}: Error appending to file for {symbol} at {current_minute}: {str(e)}", level=logging.ERROR)
-                        log(f"Max retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
+                    if attempt >= max_retries:
+                        log(f"Attempt {attempt}: Error appending to file for {symbol} at {current_minute}: {str(e)}\nMax retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
                         break
                         # raise  # Re-raise the last exception
                     t2.sleep(sleep_seconds)
                     continue
-                if attempt > 1:
-                    log(f"Successful after {attempt} retries", level=logging.DEBUG)
                 break
             
             if index_format:
                 df.index = orig_index
     
-    last_minute_data = {symbol: None for symbol in symbols}
+    prev_raw_data = {symbol: None for symbol in symbols}
+    
+    prev_quote = {symbol: None for symbol in symbols} # use for time-weighted aggregations
+    
     acc_carryover = {symbol: 0 for symbol in symbols}
-    first_append = {symbol: True for symbol in symbols}
+    first_append_raw = {symbol: True for symbol in symbols}
+    first_append_agg = {symbol: True for symbol in symbols}
     
     # Get iterator for minutes
     minutes = minute_intervals_dict[symbols[0]]
@@ -621,7 +542,10 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
         
         while True:
             # Get current minute's data
+            # timer_start = datetime.now()
             qdf0 = future.result()
+            # timer_end = datetime.now()
+            # log(f'wait time {timer_end - timer_start}')
             
             # Start next request if there are more minutes
             try:
@@ -638,41 +562,52 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
             for symbol in symbols:
                 try:
                     if not qdf0.empty and symbol in qdf0.index.get_level_values('symbol'):
-                        symbol_df = qdf0.xs(symbol, level='symbol', drop_level=False)
+                        qdf = qdf0.xs(symbol, level='symbol', drop_level=False)
                     else:
-                        symbol_df = pd.DataFrame()
+                        qdf = pd.DataFrame()
                         log(f"No data found for symbol {symbol} at {current_minute}.", level=logging.WARNING)
                 except Exception as e:
-                    symbol_df = pd.DataFrame()
+                    qdf = pd.DataFrame()
                     log(f"Error processing data for symbol {symbol} at {current_minute}: {str(e)}", level=logging.ERROR)
 
-                symbol_df, new_carryover = clean_quotes_data(symbol_df, current_minute_start, current_minute_end)
 
-                if not symbol_df.empty:
-                    # Process the previous minute's data
-                    if last_minute_data[symbol] is not None:
-                        last_minute_df = last_minute_data[symbol]
-                        if not last_minute_df.empty:
-                            last_index = last_minute_df.index[-1]
-                            last_minute_df.loc[last_index, 'duration'] += acc_carryover[symbol] + new_carryover
 
-                        # weighted_data = apply_grouping_and_weighting(last_minute_df)
-                        # filtered_data = filter_first_and_last_seconds(weighted_data)
-                        # filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
-                        # filtered_data = filtered_data.drop(columns=['spread','duration'])
-                        filtered_data = filter_first_and_last_seconds(last_minute_df)
+                raw_df, new_carryover = clean_quotes_data(qdf, current_minute_start, current_minute_end)
+                agg_df = aggregate_by_second(qdf, prev_quote[symbol], current_minute_start, current_minute_end)
+                
+                if not qdf.empty:
+                    prev_quote[symbol] = qdf.iloc[[-1]]
+                # if prev_quote[symbol] is not None: # set index to exact start of interval
+                #     prev_quote[symbol].name = (symbol, current_minute_end.tz_convert('UTC'))
+                # print(prev_quote[symbol])
+
+                if not agg_df.empty:
+                    if params.export_quotes_path:
+                        # print(list(agg_df.columns))
                         
-                        weighted_data = apply_grouping_and_weighting(last_minute_df)
-                        aggregated_data = aggregate_quotes_time_based(weighted_data)
+                        append_quote_segment(temp_files[symbol]['agg'], agg_df.drop(columns=['duration'], errors='ignore'), is_first=first_append_agg[symbol], index_format=False)
+                    
+                    if first_append_agg[symbol]:
+                        first_append_agg[symbol] = False
+
+                if not raw_df.empty:
+                    # Process the previous minute's data
+                    if prev_raw_data[symbol] is not None:
+                        prev_raw_df = prev_raw_data[symbol]
+                        if not prev_raw_df.empty:
+                            last_index = prev_raw_df.index[-1]
+                            prev_raw_df.loc[last_index, 'duration'] += acc_carryover[symbol] + new_carryover
+
+                        filtered_data = filter_first_and_last_seconds(prev_raw_df)
                         
                         if params.export_quotes_path:
-                            append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration']), is_first=first_append[symbol], index_format=True)
-                            append_quote_segment(temp_files[symbol]['agg'], aggregated_data, is_first=first_append[symbol], index_format=False)
-                            if first_append[symbol]:
-                                first_append[symbol] = False
+                            append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration'], errors='ignore'), is_first=first_append_raw[symbol], index_format=True)
+                            # print(list(filtered_data.drop(columns=['duration'], errors='ignore').columns))
+                            if first_append_raw[symbol]:
+                                first_append_raw[symbol] = False
                             
                     acc_carryover[symbol] = 0
-                    last_minute_data[symbol] = symbol_df
+                    prev_raw_data[symbol] = raw_df
                     
                 else:
                     acc_carryover[symbol] += new_carryover
@@ -687,26 +622,18 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
 
     # Process the last minute's data
     for symbol in symbols:
-        if last_minute_data[symbol] is not None:
-            last_minute_df = last_minute_data[symbol]
-            if not last_minute_df.empty:
-                last_index = last_minute_df.index[-1]
-                last_minute_df.loc[last_index, 'duration'] += acc_carryover[symbol]
-            
-            # weighted_data = apply_grouping_and_weighting(last_minute_df)
-            # filtered_data = filter_first_and_last_seconds(weighted_data)
-            # filtered_data[['bid_size','ask_size']] = filtered_data[['bid_size','ask_size']].apply(np.floor)
-            # filtered_data = filtered_data.drop(columns=['spread','duration'])
-            filtered_data = filter_first_and_last_seconds(last_minute_df)
-            
-            weighted_data = apply_grouping_and_weighting(last_minute_df)
-            aggregated_data = aggregate_quotes_time_based(weighted_data)
+        if prev_raw_data[symbol] is not None:
+            prev_raw_df = prev_raw_data[symbol]
+            if not prev_raw_df.empty:
+                last_index = prev_raw_df.index[-1]
+                prev_raw_df.loc[last_index, 'duration'] += acc_carryover[symbol]
+
+            filtered_data = filter_first_and_last_seconds(prev_raw_df)
             
             if params.export_quotes_path:
-                append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration']), is_first=first_append[symbol], index_format=True)
-                append_quote_segment(temp_files[symbol]['agg'], aggregated_data, is_first=first_append[symbol], index_format=False)
-                if first_append[symbol]:
-                    first_append[symbol] = False
+                append_quote_segment(temp_files[symbol]['raw'], filtered_data.drop(columns=['duration'], errors='ignore'), is_first=first_append_raw[symbol], index_format=True)
+                if first_append_raw[symbol]:
+                    first_append_raw[symbol] = False
                   
     # Create final zip files from temp files and load data for return
     for symbol in symbols:
@@ -743,8 +670,6 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                 log(f"Error reading saved quotes for {symbol}: {str(e)}", level=logging.ERROR)
     if return_data:
         return quotes_data
-    else:
-        return None
 
 def refresh_client(client):
     """
@@ -838,12 +763,15 @@ if __name__=="__main__":
 
     start_date = "2024-09-01 00:00:00"
     end_date =   "2024-10-01 00:00:00"
+
+    # start_date = "2024-09-04 00:00:00"
+    # end_date =   "2024-09-05 00:00:00"
     
-    start_date = "2022-01-01 00:00:00"
-    end_date =   "2022-02-01 00:00:00"
+    # start_date = "2022-01-01 00:00:00"
+    # end_date =   "2022-02-01 00:00:00"
     
-    start_date = "2022-01-12 00:00:00"
-    end_date =   "2022-01-13 00:00:00"
+    # start_date = "2022-01-12 00:00:00"
+    # end_date =   "2022-01-13 00:00:00"
     
     # start_date = "2024-09-03 00:00:00"
     # end_date =   "2024-09-04 00:00:00"
@@ -861,21 +789,38 @@ if __name__=="__main__":
         end_time='15:55',
         use_median=True,
         touch_area_width_agg=None,
-        rolling_avg_decay_rate=0.85,
+        
+        ema_span=15,
+        price_ema_span=26,
+        
         export_bars_path=f'bars/',
         export_quotes_path=f'quotes/'
     )
 
 
     # symbols = ['AAPL', 'GOOGL', 'NVDA']
-    symbols = ['AAPL'] 
+    # symbols = ['AAPL'] 
     # symbols = ['GOOGL']
     # symbols = ['NVDA'] 
     # symbols = ['AAPL','GOOGL'] 
     # NOTE: seems faster overall to do one at a time: for one day, 1 took ~1 minute, 3 took ~5 minutes
     
     # quotes_data = retrieve_multi_symbol_data(params, symbols, first_seconds_sample=100, last_seconds_sample=200)
-    quotes_data = retrieve_multi_symbol_data(params, symbols)
+    # quotes_data = retrieve_multi_symbol_data(params, symbols)
+    
+    
+    
+    symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA']
+    for symbol in symbols:
+        retrieve_multi_symbol_data(params, [symbol], return_data=False)
+
+
+    params.start_date = "2024-09-04 00:00:00"
+    params.end_date =   "2024-09-05 00:00:00"
+    # symbols = ['AAPL']
+    for symbol in symbols:
+        retrieve_multi_symbol_data(params, [symbol], return_data=False)
+
 
 
     # symbols = ['AAPL'] 
