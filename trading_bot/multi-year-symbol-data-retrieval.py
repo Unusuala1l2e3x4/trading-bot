@@ -50,10 +50,11 @@ def retrieve_multi_year_symbol_data(symbols: List[str], years: List[int], symbol
 if __name__=="__main__":
     # Example usage:
     symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA']
+    # symbols = ['NVDA', 'GOOGL', 'AAPL', 'AMZN', 'MSFT', 'META'] # ordered  by quotes activity, roughly
     # symbols = ['AAPL', 'GOOGL', 'NVDA', 'META']
     years = [2022, 2023]
     symbols_batch_size = 1 #
-    interval_months = 3
+    interval_months = 4
 
     # Usage example (most params are just placeholders for this module):
     params = BacktestTouchDetectionParameters(
@@ -68,7 +69,10 @@ if __name__=="__main__":
         end_time='15:55',
         use_median=True,
         touch_area_width_agg=None,
-        rolling_avg_decay_rate=0.85,
+        
+        ema_span=15,
+        price_ema_span=26,
+        
         export_bars_path=f'bars/',
         export_quotes_path=f'quotes/'
     )

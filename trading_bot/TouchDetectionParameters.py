@@ -18,25 +18,8 @@ def np_mean(arr):
     return np.mean(arr)
 
 
-# @dataclass
-# class TouchDetectionParameters:
-#     symbol: str
-#     start_date: str
-#     end_date: str
-#     atr_period: int = 15
-#     level1_period: int = 15
-#     multiplier: float = 2.0
-#     min_touches: int = 3
-#     bid_buffer_pct: float = 0.005
-#     start_time: Optional[str] = None
-#     end_time: Optional[str] = None
-#     use_median: bool = False
-#     rolling_avg_decay_rate: float = 0.85
-#     touch_area_width_agg: Callable = np.median
-#     export_bars_path: Optional[str] = None
-
 @dataclass
-class BaseTouchDetectionParameters:
+class LiveTouchDetectionParameters:
     symbol: str
     atr_period: int = 15
     level1_period: int = 15
@@ -46,30 +29,15 @@ class BaseTouchDetectionParameters:
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     use_median: bool = False
-    rolling_avg_decay_rate: float = 0.85
     # touch_area_width_agg: Callable = np.median
     touch_area_width_agg: Callable = np_median
 
+    ema_span: float = 12
+    price_ema_span: float = 26
+    
 @dataclass
-# class BacktestTouchDetectionParameters(BaseTouchDetectionParameters):
-class BacktestTouchDetectionParameters():
-    symbol: str
-    start_date: datetime # | str
-    end_date: datetime # | str
-    atr_period: int = 15
-    level1_period: int = 15
-    multiplier: float = 1.4
-    min_touches: int = 3
-    bid_buffer_pct: float = 0.005
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
-    use_median: bool = False
-    rolling_avg_decay_rate: float = 0.85
-    # touch_area_width_agg: Callable = np.median
-    touch_area_width_agg: Callable = np_median
+class BacktestTouchDetectionParameters(LiveTouchDetectionParameters):
+    start_date: datetime = field(default_factory=lambda: datetime.combine(datetime.now(), time.min)-timedelta(weeks=1)), # default to previous week
+    end_date: datetime = field(default_factory=lambda: datetime.combine(datetime.now(), time.min)),
     export_bars_path: Optional[str] = None
     export_quotes_path: Optional[str] = None
-
-@dataclass
-class LiveTouchDetectionParameters(BaseTouchDetectionParameters):
-    pass  # This class doesn't need any additional parameters

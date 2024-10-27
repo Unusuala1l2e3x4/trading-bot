@@ -152,12 +152,37 @@ def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
     halflife_str = f"{halflife}min"
 
     df['central_value'] = df['close'].ewm(
-        halflife=halflife_str,
-        times=df.index.get_level_values('timestamp'),
-        adjust=True
+        # halflife=halflife_str,
+        span=span,
+        # times=df.index.get_level_values('timestamp'),
+        # adjust=True
+        adjust=False
     ).mean()
-    df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
+    # df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
 
+def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: int = None, adjust=True):
+    """
+    A generic EMA calculation function with an optional cutoff.
+    
+    Parameters:
+    df (pd.DataFrame): Input dataframe with the necessary fields.
+    field (str): The column on which to apply the EMA.
+    span (int): Span for the EMA calculation.
+    window (int, optional): The number of periods to use as a cutoff. If None, no cutoff is applied.
+    adjust (bool): Adjust parameter for the .ewm function (default True).
+    
+    Returns:
+    pd.Series: EMA values for the specified field.
+    """
+    if window:
+        # Apply cutoff to only consider the last `window` rows
+        return df[field].rolling(window=window, min_periods=1).apply(
+            lambda x: x.ewm(span=span, adjust=adjust).mean().iloc[-1]
+        )
+    else:
+        # If no cutoff is provided, apply .ewm without restrictions
+        return df[field].ewm(span=span, adjust=adjust).mean()
+    
 
 @dataclass
 class Level:
@@ -172,24 +197,6 @@ class Level:
 @jit(nopython=True)
 def np_searchsorted(a,b): # only used in calculate_touch_area function
     return np.searchsorted(a,b)
-
-
-
-# Create exponential weights function
-def create_weights(window_size, decay_rate):
-    weights = np.array([decay_rate**i for i in range(window_size)][::-1], dtype=np.float64)
-    return weights / weights.sum()
-
-# Define the rolling weighted mean function
-weighted_mean = lambda x, weights: np.dot(x, weights)
-
-# Define the rolling weighted median function
-def weighted_median(values, weights):
-    sorted_indices = np.argsort(values)
-    sorted_values = values[sorted_indices]
-    sorted_weights = weights[sorted_indices]
-    cumulative_weights = np.cumsum(sorted_weights)
-    return sorted_values[np.searchsorted(cumulative_weights, 0.5)]
 
 
 @jit(nopython=True)
@@ -243,8 +250,8 @@ def process_touches(touches, prices, atrs, level, lmin, lmax, is_long, min_touch
         prev_price = price
     return np.empty(0, dtype=np.int64), touch_area_low, touch_area_high
 
-def calculate_touch_area(levels_by_date, is_long, df, symbol, market_hours, min_touches, bid_buffer_pct, use_median, touch_area_width_agg, multiplier, 
-                         start_time, end_time, current_timestamp=None):
+def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, df: pd.DataFrame, symbol, market_hours: Dict[date, Tuple[datetime, datetime]], min_touches, \
+    bid_buffer_pct, use_median, touch_area_width_agg: Callable, multiplier, start_time: datetime, end_time: datetime, current_timestamp: datetime=None):
     touch_areas = []
     widths = []
 
@@ -365,7 +372,7 @@ class TouchDetectionAreas:
 
 
 
-def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, data: Optional[pd.DataFrame] = None, 
+def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, live_bars: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
                                    current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
     def log_live(message, level=logging.INFO):
@@ -420,9 +427,12 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
     elif isinstance(params, LiveTouchDetectionParameters):
-        if data is None:
-            raise ValueError("Data must be provided for live trading parameters")
-        df = data
+        if live_bars is None:
+            raise ValueError("Live bars data must be provided for live trading parameters")
+        df = live_bars
+        df_adjusted = None
+        raw_df = None
+        aggregated_df = None
     else:
         raise ValueError("Invalid parameter type")
     
@@ -436,7 +446,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # print(df)
         
         # calculate_dynamic_central_value(df, ema_short=9, ema_long=30) # default
-        calculate_dynamic_central_value(df)
+        # calculate_dynamic_central_value(df)
+        
+        df['central_value'] = (df['vwap'] + calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span) * 2) / 3
         df['is_res'] = df['close'] >= df['central_value']
 
         # Calculate True Range (TR)
@@ -445,14 +457,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         df['L-PC'] = np.abs(df['low'] - df['close'].shift(1))
         df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
         
-        # apply time decay for certain aggregations
-        weights = create_weights(window_size=params.atr_period, decay_rate=params.rolling_avg_decay_rate)
         
-        # df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
-        df['ATR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # seems better
-
-        df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True) # seems better
-        # df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: weighted_median(x, weights), raw=True)
+        df['ATR'] = calculate_ema_with_cutoff(df, 'TR', span=params.ema_span) # , window=params.atr_period
+        df['MTR'] = df['TR'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
         
         log_live('ATR and MTR calculated')
 
@@ -462,17 +469,11 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         # Calculate rolling average volume and trade count
         df['shares_per_trade'] = df['volume'] / df['trade_count']
-        
-        
-        df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
-        # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
-        # df['avg_volume'] = df['volume'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
-
-        df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: weighted_mean(x, weights), raw=True) # tapering doesn't have a large impact
-        # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.median(x), raw=True)
-        # df['avg_trade_count'] = df['trade_count'].rolling(window=params.atr_period).apply(lambda x: np.mean(x), raw=True)
+        df['avg_volume'] = calculate_ema_with_cutoff(df, 'volume', span=params.ema_span) # , window=params.level1_period
+        df['avg_trade_count'] = calculate_ema_with_cutoff(df, 'trade_count', span=params.ema_span) # , window=params.level1_period
         
         # df['avg_shares_per_trade'] = df['shares_per_trade'].rolling(window=params.level1_period).mean()
+        # df['avg_shares_per_trade'] = calculate_ema_with_cutoff(df, 'shares_per_trade', span=params.ema_span, window=params.level1_period) 
         
         log_live('rolling averages calculated')
         
