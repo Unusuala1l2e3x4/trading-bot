@@ -4,6 +4,7 @@ __pycache__/
 *.toml
 *.url
 *.csv
+*.xlsx
 *.zip
 *.txt
 *.png
@@ -12,4 +13,5 @@ __pycache__/
 bars
 quotes
 quotes2
+documentation/outdated docs
 trading_bot/reject
