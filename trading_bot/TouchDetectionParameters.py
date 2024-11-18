@@ -28,7 +28,7 @@ class LiveTouchDetectionParameters:
     bid_buffer_pct: float = 0.005
     start_time: Optional[time] = None
     end_time: Optional[time] = None
-    use_median: bool = False
+    use_median: bool = True
     # touch_area_width_agg: Callable = np.median
     touch_area_width_agg: Callable = np_median
 

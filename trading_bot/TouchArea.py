@@ -26,7 +26,7 @@ def setup_logger(log_level=logging.INFO):
 logger = setup_logger(logging.INFO)
 
 def log(message, level=logging.INFO):
-    logger.log(level, message)
+    logger.log(level, message, exc_info=level >= logging.ERROR)
 
 
 @dataclass

@@ -55,17 +55,6 @@ def is_security_marginable(symbol: str) -> bool:
         return False
 
 
-@jit(nopython=True)
-def is_trading_allowed(total_equity, avg_trade_count, min_trade_count, avg_volume) -> bool:
-    # if total_equity < 25000: # pdt_threshold
-    #     return False
-    return avg_trade_count >= min_trade_count and avg_volume >= min_trade_count # at least 1 share per trade
-
-@jit(nopython=True)
-def calculate_max_trade_size(avg_volume: float, max_volume_percentage: float) -> int:
-    return math.floor(avg_volume * max_volume_percentage)
-
-
 @dataclass
 class IntendedOrder:
     action: str
@@ -86,45 +75,32 @@ class IntendedOrder:
             position=self.position,  # Passing TradePosition by reference
             fees=self.fees
         )
+
+from TradingStrategyParameters import *
+
+
+def filter_df_by_timerange(df: pd.DataFrame, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+    """
+    Filter DataFrame to only include rows between start_time and end_time (inclusive).
+    Uses DatetimeIndex's searchsorted for efficient index searching.
     
-
-@dataclass
-class StrategyParameters:
-    initial_investment: float = 10_000
-    max_investment: float = float("inf")
-    do_longs: bool = True
-    do_shorts: bool = True
-    sim_longs: bool = True
-    sim_shorts: bool = True
-    use_margin: bool = False
-    times_buying_power: float = 4
-    min_stop_dist_relative_change_for_partial: Optional[float] = 0
-    soft_start_time: Optional[time] = None
-    soft_end_time: Optional[time] = None
-    max_volume_percentage: float = 0.01
-    min_trade_count: int = 100
-    slippage_factor: Optional[float] = 0.001
-    slippage_factor: Optional[float] = 0.02
-    beta:  Optional[float] = 0.95
+    Args:
+        df: DataFrame with MultiIndex including 'timestamp'
+        start_time: Start of time range (inclusive)
+        end_time: End of time range (inclusive)
     
-    def __post_init__(self):
-        assert 0 < self.times_buying_power <= 4
-        assert self.do_longs or self.do_shorts
-        assert 0 <= self.min_stop_dist_relative_change_for_partial <= 1
-        if self.soft_start_time:
-            if not isinstance(self.soft_start_time, time):
-                self.soft_start_time = pd.to_datetime(self.soft_start_time, format='%H:%M').time()
-            assert self.soft_start_time.second == 0 and self.soft_start_time.microsecond == 0
+    Returns:
+        Filtered DataFrame
+    """
+    timestamps = df.index.get_level_values('timestamp')
+    
+    # Use DatetimeIndex's native searchsorted method
+    left_pos = timestamps.searchsorted(start_time, side='left')
+    right_pos = timestamps.searchsorted(end_time, side='right')
+    
+    # Return filtered DataFrame
+    return df.iloc[left_pos:right_pos]
 
-        if self.soft_end_time:
-            if not isinstance(self.soft_end_time, time):
-                self.soft_end_time = pd.to_datetime(self.soft_end_time, format='%H:%M').time()
-            assert self.soft_end_time.second == 0 and self.soft_end_time.microsecond == 0   
-
-    def copy(self, **changes):
-        new_params = deepcopy(asdict(self))
-        new_params.update(changes)
-        return StrategyParameters(**new_params)
 
 @dataclass
 class TradingStrategy:
@@ -135,8 +111,7 @@ class TradingStrategy:
     is_live_trading: bool = False
 
     # Fields with default values
-    df: pd.DataFrame = field(init=False)
-    timestamps: pd.Index = field(init=False)
+    all_bars: pd.DataFrame = field(init=False)
     logger: logging.Logger = field(init=False)
     balance: float = field(init=False)
     open_positions: Set[TradePosition] = field(default_factory=set)
@@ -157,19 +132,35 @@ class TradingStrategy:
     market_close: pd.Timestamp = field(init=False)
     day_start_time: pd.Timestamp = field(init=False)
     day_end_time: pd.Timestamp = field(init=False)
+    now_time: pd.Timestamp = field(init=False)
+    current_timestamp: pd.Timestamp = field(init=False)
+    lookback_before_latest_quote: timedelta = timedelta(seconds=1)
+    latest_quote_time: pd.Timestamp = field(init=False)
     day_soft_start_time: pd.Timestamp = field(init=False)
     daily_bars: pd.DataFrame = field(init=False)
     daily_quotes_raw: pd.DataFrame = field(init=False)
     daily_quotes_agg: pd.DataFrame = field(init=False)
     daily_quotes_raw_indices: pd.Series = field(init=False)
     daily_quotes_agg_indices: pd.Series = field(init=False)
+    now_quotes_raw: pd.DataFrame = field(init=False)
+    now_quotes_agg: pd.DataFrame = field(init=False)
+    now_bid_price: float = field(init=False)
+    now_ask_price: float = field(init=False)
     daily_bars_index: int = field(init=False)
     soft_end_triggered: bool = False
     touch_area_collection: TouchAreaCollection = field(init=False)
     
+    # record stats
+    pressure_scalars: List[float] = field(default_factory=list)
+    spread_scalars: List[float] = field(default_factory=list)
+    final_scalars: List[float] = field(default_factory=list)
+    max_trade_size_adjustments: List[float] = field(default_factory=list)
+    max_trade_sizes: List[float] = field(default_factory=list)
+    trade_size_reductions: List[float] = field(default_factory=list)
+    
+    
     def __post_init__(self):
-        self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
-        self.timestamps = self.df.index.get_level_values('timestamp')
+        self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         # self.logger = self.setup_logger(logging.INFO)
         self.logger = self.setup_logger(logging.WARNING)
         self.initialize_strategy()
@@ -190,7 +181,7 @@ class TradingStrategy:
         return logger
 
     def log(self, message, level=logging.INFO):
-        self.logger.log(level, message)
+        self.logger.log(level, message, exc_info=level >= logging.ERROR)
         
     def initialize_strategy(self):
         self.balance = self.params.initial_investment
@@ -214,9 +205,7 @@ class TradingStrategy:
 
     def update_strategy(self, touch_detection_areas: TouchDetectionAreas):
         self.touch_detection_areas = touch_detection_areas
-        self.df = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
-        if self.df is not None and not self.df.empty:
-            self.timestamps = self.df.index.get_level_values('timestamp')
+        self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         self.initialize_touch_areas()
 
     @property
@@ -291,25 +280,26 @@ class TradingStrategy:
         # del self.open_positions[position]
         self.open_positions.remove(position)
         
-    def close_all_positions(self, timestamp: datetime, exit_price: float, vwap: float, volume: float, avg_volume: float) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
+    def close_all_positions(self, current_timestamp: datetime, price_at_action: float, vwap: float, volume: float, avg_volume: float) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
         # Logic for closing all positions (similar to your original function)
         orders = []
         positions_to_remove = set()
 
         for position in self.open_positions:
+            price_at_action = self.get_price_at_action(position.is_long, False)
             remaining_shares = position.shares
-            realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(timestamp, exit_price, position.shares, vwap, volume, avg_volume, self.params.slippage_factor)
+            realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(current_timestamp, price_at_action, position.shares, vwap, volume, avg_volume, self.params.slippage.slippage_factor)
             self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
             assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
             
-            self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, exit_price)
+            self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, price_at_action)
             if not position.is_simulated:
                 self.day_accrued_fees += fees_expected
                 
-            position.close(timestamp, exit_price)
+            position.close(current_timestamp, price_at_action)
             self.trades_executed += 1
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
-                                            timestamp, exit_price)
+                                            current_timestamp, price_at_action)
             # position.area.terminate(self.touch_area_collection)
             self.touch_area_collection.terminate_area(position.area)
             
@@ -318,7 +308,7 @@ class TradingStrategy:
                 side = OrderSide.SELL if position.is_long else OrderSide.BUY,
                 symbol = self.touch_detection_areas.symbol,
                 qty = qty_intended,
-                price = exit_price,
+                price = price_at_action,
                 position = position,
                 fees = fees_expected
             ))
@@ -332,12 +322,19 @@ class TradingStrategy:
         return orders, positions_to_remove # set([position.area.id for position in positions_to_remove])
 
     def calculate_position_details(self, is_long: bool, current_price: float, times_buying_power: float, 
-                                avg_volume: float, avg_trade_count: float, volume: float, max_volume_percentage: float, 
-                                min_trade_count: int, existing_shares: Optional[int] = 0, 
+                                avg_volume: float, avg_trade_count: float, volume: float,
+                                trade_count_mult: Optional[float] = 1.0, existing_shares: Optional[int] = 0, 
                                 target_shares: Optional[int] = None):
-        # Logic for calculating position details
-        if not is_trading_allowed(self.total_equity, avg_trade_count, min_trade_count, avg_volume):
+        # # Logic for calculating position details
+        
+        # TODO: make sure now_quotes_raw is filtered to before cutoff
+        if not self.params.ordersizing.is_trading_allowed(self.total_equity, avg_trade_count, avg_volume, self.now_quotes_raw, 
+                                                          self.latest_quote_time - self.lookback_before_latest_quote, self.now_time, trade_count_mult):
             return 0, 0, 0, 0, 0, 0, 0, 0
+
+        
+        # NOTE: micro_quote_count may need to be normalized to 1 second average count, or filtered to last second only
+        
         
         # when live, need to call is_security_marginable
         # Determine initial margin requirement and calculate max leverage
@@ -355,7 +352,16 @@ class TradingStrategy:
         actual_margin_multiplier = min(times_buying_power, max_leverage)
         
         current_shares = existing_shares
-        max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
+        max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)
+        
+        max_trade_size, pressure_scaling, spread_scaling, final_scaling = self.params.ordersizing.adjust_max_trade_size(self.current_timestamp, max_trade_size_by_volume, self.now_quotes_raw, self.now_quotes_agg, is_long, 
+                                                                        self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
+                                                                        # self.now_time - self.lookback_before_latest_quote, self.now_time)
+        
+        self.pressure_scalars.append(pressure_scaling)
+        self.spread_scalars.append(spread_scaling)
+        self.final_scalars.append(final_scaling)
+        self.max_trade_sizes.append(max_trade_size)
         
         # Adjust available balance based on current position
         available_balance = min(self.balance, self.params.max_investment) * actual_margin_multiplier
@@ -366,12 +372,20 @@ class TradingStrategy:
         if target_shares is not None:
             # Ensure target_shares is greater than current_shares for entries
             assert target_shares > current_shares, (target_shares, current_shares)
-            shares_change = min(target_shares - current_shares, max_additional_shares_by_balance)
+            shares_change_unadjusted = min(target_shares - current_shares, max_additional_shares_by_balance)
         else:
-            shares_change = max_additional_shares_by_balance
+            shares_change_unadjusted = max_additional_shares_by_balance
         
-        shares_change = min(shares_change, max_volume_shares - current_shares)
+        # shares_change = min(shares_change_unadjusted, max_trade_size - current_shares)
+        shares_change = min(shares_change_unadjusted, max_trade_size)
         shares_change = max(0, shares_change)
+        
+        if max_trade_size != max_trade_size_by_volume:
+            self.max_trade_size_adjustments.append(max_trade_size_by_volume - max_trade_size)
+        
+        if shares_change != shares_change_unadjusted:
+            assert shares_change_unadjusted > shares_change
+            self.trade_size_reductions.append(shares_change_unadjusted - shares_change)
 
         total_shares = current_shares + shares_change
         invest_amount = shares_change * current_price
@@ -399,10 +413,12 @@ class TradingStrategy:
         return total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement
 
 
-    def calculate_exit_details(self, times_buying_power: float, shares_to_exit: int, volume: float, avg_volume: float, avg_trade_count: float, max_volume_percentage: float, min_trade_count: int):
+    def calculate_exit_details(self, is_long: bool, times_buying_power: float, shares_to_exit: int, volume: float, avg_volume: float, avg_trade_count: float, trade_count_mult: Optional[float] = 1.0):
         assert shares_to_exit > 0
-        
-        if not is_trading_allowed(self.total_equity, avg_trade_count, min_trade_count, avg_volume):
+
+        # TODO: make sure now_quotes_raw is filtered to before cutoff
+        if not self.params.ordersizing.is_trading_allowed(self.total_equity, avg_trade_count, avg_volume, self.now_quotes_raw, 
+                                                          self.latest_quote_time - self.lookback_before_latest_quote, self.now_time, trade_count_mult):
             return 0
         
         # when live, need to call is_security_marginable
@@ -421,20 +437,36 @@ class TradingStrategy:
         actual_margin_multiplier = min(times_buying_power, max_leverage)
         
         # Calculate max shares that can be exited based on volume
-        max_volume_shares = calculate_max_trade_size(avg_volume, max_volume_percentage)
-        shares_change = min(shares_to_exit, max_volume_shares)
+        max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)
+        
+        max_trade_size, pressure_scaling, spread_scaling, final_scaling = self.params.ordersizing.adjust_max_trade_size(self.current_timestamp, max_trade_size_by_volume, self.now_quotes_raw, self.now_quotes_agg, not is_long, 
+                                                                        self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
+                                                                        # self.now_time - self.lookback_before_latest_quote, self.now_time)
+        
+        self.pressure_scalars.append(pressure_scaling)
+        self.spread_scalars.append(spread_scaling)
+        self.final_scalars.append(final_scaling)
+        self.max_trade_sizes.append(max_trade_size)
+                                                                        
+        shares_change = min(shares_to_exit, max_trade_size)
+        shares_change = max(0, shares_change)
+        
+        if max_trade_size != max_trade_size_by_volume:
+            self.max_trade_size_adjustments.append(max_trade_size_by_volume - max_trade_size)
+            
+        if shares_change != shares_to_exit:
+            assert shares_to_exit > shares_change
+            self.trade_size_reductions.append(shares_to_exit - shares_change)
+            
         return shares_change
     
     
-    def create_new_position(self, area: TouchArea, timestamp: datetime, data, prev_close: float, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
+    def create_new_position(self, area: TouchArea, current_timestamp: datetime, now_bar, prev_close: float, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
         # Logic for placing a stop market buy order (similar to your original function)
         # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'central_value', 'is_res', 'shares_per_trade', 
         # 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'time', 'date']
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
-            data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
-        
-        if not is_trading_allowed(self.total_equity, avg_trade_count, self.params.min_trade_count, avg_volume):
-            return NO_POSITION_OPENED
+            now_bar.open, now_bar.high, now_bar.low, now_bar.close, now_bar.volume, now_bar.trade_count, now_bar.vwap, now_bar.avg_volume, now_bar.avg_trade_count
         
         if self.open_positions or self.balance <= 0:
             return NO_POSITION_OPENED
@@ -442,7 +474,7 @@ class TradingStrategy:
         # debug_print(f"Attempting order: {'Long' if area.is_long else 'Short'} at {area.get_buy_price:.4f}")
         # debug_print(f"  Balance: {balance:.4f}, Total Account Value: {total_equity:.4f}")
         
-        area.update_bounds(timestamp)
+        area.update_bounds(current_timestamp)
 
         # Check if the stop buy would have executed based on high/low.
         if area.is_long:
@@ -464,60 +496,65 @@ class TradingStrategy:
             # if close_price > area.get_buy_price: # biggest decrease in performance
             #     return NO_POSITION_OPENED
 
-        # execution_price = area.get_buy_price # Stop buy (placed at time of min_touches) would have executed
-        # execution_price = np.mean([area.get_buy_price, close_price]) # balanced approach, may account for slippage
-        execution_price = close_price # if not using stop buys
+        # price_at_action = area.get_buy_price # Stop buy (placed at time of min_touches) would have executed
+        # price_at_action = np.mean([area.get_buy_price, close_price]) # balanced approach, may account for slippage
+        # price_at_action = close_price # if not using stop buys
+        # debug3_print(f"Execution price: {price_at_action:.4f}")
+        price_at_action = self.get_price_at_action(area.is_long, True)
         
-        
-        
-        # debug3_print(f"Execution price: {execution_price:.4f}")
 
         # Calculate position size, etc...
-        total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement = self.calculate_position_details(
-            area.is_long, execution_price, self.params.times_buying_power, avg_volume, avg_trade_count, volume,
-            self.params.max_volume_percentage, self.params.min_trade_count
-        )
+        total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement \
+            = self.calculate_position_details(
+                area.is_long, price_at_action, self.params.times_buying_power, avg_volume, avg_trade_count, volume
+            )
         assert total_shares == shares_change
-
+        
+        if shares_change == 0:
+            return NO_POSITION_OPENED
+        
         if actual_cash_used + estimated_entry_cost > self.balance:
             return NO_POSITION_OPENED
         
         # Create the position
         position = TradePosition(
-            date=timestamp.date(),
+            date=current_timestamp.date(),
             id=self.next_position_id,
             area=area,
             is_long=area.is_long,
-            entry_time=timestamp,
+            entry_time=current_timestamp,
             initial_balance=actual_cash_used,
             initial_shares=total_shares,
-            entry_price=execution_price,
+            entry_price=price_at_action,
+            bar_price_at_entry=close_price,
             use_margin=self.params.use_margin,
             is_marginable=self.is_marginable, # when live, need to call is_security_marginable
             times_buying_power=actual_margin_multiplier,
             
-            # # Use execution_price for initial peak-stop
-            # current_stop_price=execution_price - area.get_range if area.is_long else execution_price + area.get_range,
-            # max_price=execution_price if area.is_long else None,
-            # min_price=execution_price if not area.is_long else None
+            # # Use price_at_action for initial peak-stop
+            # current_stop_price=price_at_action - area.get_range if area.is_long else price_at_action + area.get_range,
+            # max_price=price_at_action if area.is_long else None,
+            # min_price=price_at_action if not area.is_long else None
             
             # Use H-L prices for initial peak-stop (seems to have better results - certain trades exit earlier)
             current_stop_price=high_price - area.get_range if area.is_long else low_price + area.get_range,
             max_price=high_price if area.is_long else None,
             min_price=low_price if not area.is_long else None,
+            
+            # TODO: consider using high prices and low prices determined by macro quotes data, thus affecting initial current_stop_price, max_price, and min_price.
 
         )
         
-        # print(list(data.index))
-        # print(list(data.values))
-        # print(data.iat[0], data.iat[1])
+        # print(list(now_bar.index))
+        # print(list(now_bar.values))
+        # print(now_bar.iat[0], now_bar.iat[1])
     
         if (area.is_long and self.params.do_longs) or (not area.is_long and self.params.do_shorts and self.is_etb):  # if conditions not met, simulate position only.
             position.is_simulated = False
         else:
             position.is_simulated = True
 
-        cash_needed, fees_expected, qty_intended = position.initial_entry(vwap, volume, avg_volume, self.params.slippage_factor)
+        cash_needed, fees_expected, qty_intended = position.initial_entry(vwap, volume, avg_volume, self.params.slippage.slippage_factor)
         self.log(f"    cash_needed {cash_needed:.4f}, fees {fees_expected:.4f}\t\tarea.get_buy_price={area.get_buy_price:.4f}",level=logging.INFO)
         assert cash_needed == invest_amount, (cash_needed, invest_amount)
         assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
@@ -526,10 +563,6 @@ class TradingStrategy:
         assert qty_intended == position.shares, (qty_intended, position.shares)
         
         self.next_position_id += 1
-        
-        
-        # # test
-        # position.max_shares = int(position.max_shares / 2)
         
         # Add to open positions (regardless if real or simulated)
         self.open_positions.add(position)
@@ -545,28 +578,28 @@ class TradingStrategy:
             side = OrderSide.BUY if area.is_long else OrderSide.SELL,
             symbol = self.touch_detection_areas.symbol,
             qty = qty_intended,
-            price = position.entry_price, # = execution_price
+            price = position.entry_price, # = price_at_action
             position = position,
             fees = fees_expected
         )]
 
 
-    def update_positions(self, timestamp: datetime, data) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
+    def update_positions(self, current_timestamp: datetime, now_bar: pd.Series) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
         # Logic for updating positions (similar to your original function)
         # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'central_value', 'is_res', 'shares_per_trade', 
         # 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'time', 'date']
         open_price, high_price, low_price, close_price, volume, trade_count, vwap, avg_volume, avg_trade_count = \
-            data.open, data.high, data.low, data.close, data.volume, data.trade_count, data.vwap, data.avg_volume, data.avg_trade_count
+            now_bar.open, now_bar.high, now_bar.low, now_bar.close, now_bar.volume, now_bar.trade_count, now_bar.vwap, now_bar.avg_volume, now_bar.avg_trade_count
         
         positions_to_remove = set()
 
         # if using trailing stops, exit_price = None
         def perform_exit(position, exit_price=None):
             price = position.current_stop_price if exit_price is None else exit_price
-            position.close(timestamp, price)
+            position.close(current_timestamp, price)
             self.trades_executed += 1
             position.area.record_entry_exit(position.entry_time, position.entry_price, 
-                                            timestamp, price)
+                                            current_timestamp, price)
             # position.area.terminate(self.touch_area_collection)
             self.touch_area_collection.terminate_area(position.area)
             positions_to_remove.add(position)
@@ -580,6 +613,14 @@ class TradingStrategy:
             target_pct = min(max(0, price_movement / position.area.get_range),  1.0)
             target_shares = math.floor(target_pct * position.max_shares)
             return target_shares
+        
+        def get_price_at_action_from_shares_diff(current_shares, target_shares, is_long):
+            if target_shares < current_shares:
+                return self.get_price_at_action(is_long, False)
+            elif target_shares > current_shares:
+                return self.get_price_at_action(is_long, True)
+            else:
+                return None
 
         orders = []
         
@@ -592,7 +633,7 @@ class TradingStrategy:
             # UNLESS theres built-in functionality to wait until close
             
             # if not price_at_action:
-            #     should_exit = position.update_stop_price(open_price, timestamp)
+            #     should_exit = position.update_stop_price(open_price, current_timestamp)
             #     target_shares = calculate_target_shares(position, open_price)
             #     if should_exit or target_shares == 0:
             #         perform_exit(area_id, position) # DO NOT pass price into function since order would have executed at current_stop_price.
@@ -600,7 +641,7 @@ class TradingStrategy:
             
             # # If not stopped out at open, simulate intra-minute price movement
             # if not price_at_action:
-            #     should_exit = position.update_stop_price(high_price, timestamp)
+            #     should_exit = position.update_stop_price(high_price, current_timestamp)
             #     target_shares = calculate_target_shares(position, high_price)
             #     if not position.is_long and (should_exit or target_shares == 0):
             #         # For short positions, the stop is crossed if high price increases past it
@@ -608,7 +649,7 @@ class TradingStrategy:
             #         price_at_action = high_price
             
             # if not price_at_action:
-            #     should_exit = position.update_stop_price(low_price, timestamp)
+            #     should_exit = position.update_stop_price(low_price, current_timestamp)
             #     target_shares = calculate_target_shares(position, low_price)
             #     if position.is_long and (should_exit or target_shares == 0):
             #         # For long positions, the stop is crossed if low price decreases past it
@@ -617,12 +658,14 @@ class TradingStrategy:
             
             
             if not price_at_action:
-                should_exit, should_exit_2 = position.update_stop_price(close_price, timestamp)
-                target_shares = calculate_target_shares(position, close_price)
+                should_exit, should_exit_2 = position.update_stop_price(close_price, None, current_timestamp) # NOTE: continue using bar price here
+                target_shares = calculate_target_shares(position, close_price) # NOTE: continue using bar price here
+                
                 # print(target_shares, position.max_shares, should_exit)
                 if should_exit or target_shares == 0:
                     assert target_shares == 0, target_shares
-                    price_at_action = close_price
+                    # price_at_action = close_price
+                    price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
                     
                     # if using stop market order safeguard, use this:
                     # price_at_action = position.current_stop_price_2 if should_exit_2 else close_price
@@ -637,7 +680,8 @@ class TradingStrategy:
                 assert target_shares == 0, target_shares
             
             if not price_at_action:
-                price_at_action = close_price
+                # price_at_action = close_price
+                price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
             
             # Partial exit and entry logic
             assert target_shares <= position.max_shares, (target_shares, position.max_shares)
@@ -659,17 +703,17 @@ class TradingStrategy:
                 if shares_to_adjust > 0:
 
                     shares_change = self.calculate_exit_details(
+                        position.is_long,
                         position.times_buying_power,
                         shares_to_adjust,
                         volume,
                         avg_volume,
                         avg_trade_count,
-                        self.params.max_volume_percentage,
-                        math.floor(self.params.min_trade_count * (shares_to_adjust / position.max_shares))
+                        # trade_count_mult=(shares_to_adjust / position.max_shares)
                     )
                     
                     if shares_change > 0:
-                        realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(timestamp, price_at_action, shares_change, vwap, volume, avg_volume, self.params.slippage_factor)
+                        realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(current_timestamp, price_at_action, shares_change, vwap, volume, avg_volume, self.params.slippage.slippage_factor)
                         self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                         assert qty_intended == shares_change, (qty_intended, shares_change)
                         
@@ -702,7 +746,7 @@ class TradingStrategy:
                     existing_shares = position.shares
                     total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement = self.calculate_position_details(
                         position.area.is_long, price_at_action, position.times_buying_power, avg_volume, avg_trade_count, volume,
-                        self.params.max_volume_percentage, math.floor(self.params.min_trade_count * (shares_to_adjust / position.max_shares)), 
+                        # trade_count_mult=(shares_to_adjust / position.max_shares), 
                         existing_shares=existing_shares, target_shares=target_shares
                     )
                     
@@ -713,7 +757,7 @@ class TradingStrategy:
                             self.count_entry_adjust += 1
                             
                         if not self.soft_end_triggered:
-                            cash_needed, fees_expected, qty_intended = position.partial_entry(timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage_factor)
+                            cash_needed, fees_expected, qty_intended = position.partial_entry(current_timestamp, price_at_action, shares_to_buy, vwap, volume, avg_volume, self.params.slippage.slippage_factor)
                             self.log(f"    cash_needed {cash_needed:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                             assert cash_needed == invest_amount, (cash_needed, invest_amount)
                             assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
@@ -734,17 +778,17 @@ class TradingStrategy:
                                 fees = fees_expected
                             ))
                             
-                            position.max_shares = max(position.max_shares, position.shares) # Update max_shares after successful partial entry
+                            position.increase_max_shares(position.shares) # Entry possible. Increase max_shares.
                             assert position.shares == total_shares, (position.shares, total_shares)
                             
                         else:
-                            position.max_shares = max(position.max_shares, position.shares + shares_to_buy)
+                            position.increase_max_shares(position.shares + shares_to_buy) # Entry possible but soft end triggered. Increase max_shares regardless.
                             assert position.shares + shares_to_buy == total_shares, (position.shares, shares_to_buy, total_shares)
       
                     else:
                         self.count_entry_skip += 1
-                        position.max_shares = min(position.max_shares, position.shares) # Update max_shares when entry is skipped                       
-
+                        position.decrease_max_shares(position.shares) # Entry not possible. Decrease max_shares.
+                        
         for position in positions_to_remove:
             self.exit_action(position)
 
@@ -763,68 +807,145 @@ class TradingStrategy:
             self.log(f"Updating balance from {self.balance:.2f} to {new_balance:.2f}")
         self.balance = new_balance
         
-    def handle_new_trading_day(self, current_time):
-        self.current_date = current_time.date()
+        
+    def get_quote_indices(self, all_data: pd.DataFrame, indices: pd.DatetimeIndex, seconds_offset=0) -> Tuple[pd.DataFrame, np.ndarray]:
+        # Extract the timestamps from all_data
+        start_date = pd.Timestamp(self.current_date, tz=ny_tz)
+        end_date = start_date + pd.Timedelta(days=1)
+
+        # Slice the daily data for the current date
+        daily = filter_df_by_timerange(all_data, start_date, end_date) # all_data.iloc[start_pos:end_pos]
+        daily_timestamps = daily.index.get_level_values('timestamp')
+
+        # Adjust the indices by the seconds_offset
+        adjusted_indices = (indices + pd.Timedelta(seconds=seconds_offset))
+
+        # Use searchsorted to find positions without converting to NumPy
+        positions = daily_timestamps.searchsorted(adjusted_indices, side='left')
+
+        # Handle positions that are out of bounds
+        positions = positions.clip(0, len(daily) - 1)
+        return daily, positions
+
+    def handle_new_trading_day(self, current_timestamp):
+        # self.log(f"handle_new_trading_day start", level=logging.WARNING)
+        self.current_date = current_timestamp.date()
         self.update_daily_parameters(self.current_date)
         self.next_position_id = 0
         self.soft_end_triggered = False
         self.log(f"Starting balance on {self.current_date}: {self.balance}", level=logging.INFO)
-        
+
         if self.is_live_trading: # handled in FUNCTION: update_strategy
-            # self.daily_bars = self.df  # In live trading, all data is "daily data"
-            # self.daily_bars_index = len(self.daily_bars) - 1  # Current index is always the last one in live trading
-            daily_bars_minutes = self.df.index.get_level_values('timestamp').floor('min').tz_convert(ny_tz)
+            self.daily_bars = self.all_bars  # In live trading, all data is "daily data"
+            self.daily_bars_index = len(self.daily_bars) - 1  # Current index is always the last one in live trading
+            # self.daily_bars_index = len(self.all_bars) - 1
+            # daily_bars_minutes = self.all_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
+            # daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
             # pass
+            
+            self.daily_quotes_raw = self.touch_detection_areas.quotes_raw
+            self.daily_quotes_agg = self.touch_detection_areas.quotes_agg
         else:
+            # Use searchsorted to find start and end positions for daily_bars
+            start_date = pd.Timestamp(self.current_date, tz=ny_tz)
+            end_date = start_date + pd.Timedelta(days=1)
+
             # Filter the data for the current trading day based on timestamp
-            self.daily_bars = self.df[self.df.index.get_level_values('timestamp').date == self.current_date]
-            self.daily_bars_index = 1  # Start from index 1
-            daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').floor('min').tz_convert(ny_tz)
+            self.daily_bars = filter_df_by_timerange(self.all_bars, start_date, end_date) # self.all_bars.iloc[start_pos:end_pos]
+            self.daily_bars_index = 1  # Start from index 1 (exclude opening minute)
+            # daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
+            
+            daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
+            assert len(pd.unique(daily_bars_minutes.date)) == 1, pd.unique(daily_bars_minutes.date)
 
-        def get_quote_indices(all_data, indices, seconds_offset=0) -> Tuple[pd.DataFrame, np.ndarray]:
-            daily = all_data[all_data.index.get_level_values('timestamp').date == self.current_date].sort_index().reset_index()
-            daily['position'] = daily.index
-            times_df = pd.DataFrame({'adjusted_time': indices + pd.Timedelta(seconds=seconds_offset)}).sort_values('adjusted_time')
-            # Perform merge_asof to find the first quote at or after the adjusted time
-            merged = pd.merge_asof(times_df, daily, left_on='adjusted_time', right_on='timestamp', direction='forward')
-            return daily.drop(columns=['position']), merged['position'].values
+            # For raw quotes with an offset
+            self.daily_quotes_raw, self.daily_quotes_raw_indices = self.get_quote_indices(
+                # self.touch_detection_areas.quotes_raw, daily_bars_minutes, seconds_offset = -30
+                self.touch_detection_areas.quotes_raw, daily_bars_minutes, seconds_offset = -59 # NOTE: -59 respects raw quote data boundary in each minute
+            )
+            # For aggregated quotes without an offset
+            self.daily_quotes_agg, self.daily_quotes_agg_indices = self.get_quote_indices(
+                self.touch_detection_areas.quotes_agg, daily_bars_minutes, seconds_offset = -59
+            )
+            assert not self.open_positions, self.open_positions # intraday only. should not have any open positions held overnight from previous day
 
-        # For raw quotes with an offset
-        self.daily_quotes_raw, self.daily_quotes_raw_indices = get_quote_indices(
-            self.touch_detection_areas.quotes_raw, daily_bars_minutes, seconds_offset = -30
-        )
-        # For aggregated quotes without an offset
-        self.daily_quotes_agg, self.daily_quotes_agg_indices = get_quote_indices(
-            self.touch_detection_areas.quotes_agg, daily_bars_minutes
-        )
+    def get_quotes_raw(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
+        # NOTE: MAKE SURE self.handle_new_trading_day got the matching raw quotes data 
+        assert self.touch_detection_areas.quotes_raw is not None
+        assert self.daily_quotes_raw is not None
+        assert self.daily_bars_index is not None
+            
+        if self.is_live_trading:
+            # raise NotImplementedError('get_quotes_raw not implemented for live trading')
 
-        # print(self.daily_quotes_raw_indices,'\n------------------------------')
-        # print(self.daily_quotes_agg_indices,'\n------------------------------')
+            self.now_time = datetime.now()
+            delay = self.now_time - current_timestamp
+            assert timedelta(0) <= delay < timedelta(seconds=1), f"Delay of {delay} after {current_timestamp}. In normal circumstances, delay should be < 1 second."
+            self.latest_quote_time = self.daily_quotes_raw.index.get_level_values('timestamp')[-1]
+            self.now_bid_price = self.daily_quotes_raw.iloc[-1]['bid_price_last'].item()
+            self.now_ask_price = self.daily_quotes_raw.iloc[-1]['ask_price_last'].item()
+            return filter_df_by_timerange(self.daily_quotes_raw, self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
+        else:
+            if self.daily_bars_index >= len(self.daily_quotes_raw_indices)-1:
+                return None
+            
+            ret = self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices[self.daily_bars_index] : self.daily_quotes_raw_indices[self.daily_bars_index + 1]]
+            dqr_timestamps = ret.index.get_level_values('timestamp')
+            
+            # NOTE: assuming a constant delay when backtesting
+            self.now_time = current_timestamp + timedelta(seconds=0.4)
+            # self.now_time = current_timestamp
+            pos = dqr_timestamps.searchsorted(self.now_time, side='right')  # Use 'right' to include the cutoff
+            if pos == 0:
+                self.latest_quote_time = None  # Or some default value indicating no valid timestamp
+                return ret.iloc[:0]
+            
+            self.latest_quote_time = dqr_timestamps[pos-1] # -1 since side='right'
+            self.now_bid_price = ret.iloc[pos-1]['bid_price_last'].item()
+            self.now_ask_price = ret.iloc[pos-1]['ask_price_last'].item()
+            return filter_df_by_timerange(ret.iloc[:pos], self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
         
-        # print(self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices])
-        # print(self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices])
+    def get_quotes_agg(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
+        # NOTE: MAKE SURE self.handle_new_trading_day got the matching raw quotes data 
+        assert self.touch_detection_areas.quotes_agg is not None
+        assert self.daily_quotes_agg is not None
+        assert self.daily_bars_index is not None
         
-        # print(self.daily_bars.iloc[1])
-        # print(self.get_minute_quotes_raw(10))
-        # print(self.get_minute_quotes_agg(10))
-        
-        assert not self.open_positions, self.open_positions
-
-    def get_minute_quotes_raw(self, ind):
-        return self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices[ind] : self.daily_quotes_raw_indices[ind + 1]]
+        if self.is_live_trading:
+            # raise NotImplementedError('get_quotes_agg not implemented for live trading')
+            ret = self.daily_quotes_agg
+        else:
+            # NOTE: excludes any delay after bar timestamp
+            if self.daily_bars_index >= len(self.daily_quotes_agg_indices)-1:
+                return None
+            ret = self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices[self.daily_bars_index] : self.daily_quotes_agg_indices[self.daily_bars_index + 1]]
+            
+        ret_latest = ret.index.get_level_values('timestamp')[-1]
+        bars_latest = self.daily_bars.iloc[self.daily_bars_index].name[1]
+        assert ret_latest <= bars_latest, (ret_latest, bars_latest)
+        if ret_latest < bars_latest:
+            self.log(f"Missing aggregated quotes data in last second before {current_timestamp.time()} bar. Latest at {ret_latest.time()}.",level=logging.INFO)
+        return ret
     
-    def get_minute_quotes_agg(self, ind):
-        return self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices[ind] : self.daily_quotes_agg_indices[ind + 1]]
+    def get_price_at_action(self, is_long, is_entry):
+        if (is_long and is_entry) or (not is_long and not is_entry): # buy
+            return self.now_ask_price
+        else: # sell
+            return self.now_bid_price
+            
         
     def run_backtest(self):
-        timestamps = self.df.index.get_level_values('timestamp')
+        assert not self.is_live_trading
         
-        for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
-        # for i in range(1, len(timestamps)):
-            current_time = timestamps[i].tz_convert(ny_tz)
+        timestamps = self.all_bars.index.get_level_values('timestamp')
+        
+        # for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
+        for i in range(1, len(timestamps)):
+            current_timestamp = timestamps[i].tz_convert(ny_tz)
+            self.current_timestamp = current_timestamp
             
-            if self.current_date is None or current_time.date() != self.current_date:
-                self.handle_new_trading_day(current_time)
+            if self.current_date is None or current_timestamp.date() != self.current_date:
+                self.handle_new_trading_day(current_timestamp)
             
             if not self.market_open or not self.market_close:
                 continue
@@ -832,29 +953,43 @@ class TradingStrategy:
             if self.daily_bars.empty or len(self.daily_bars) < 2: 
                 continue
             
-            data = self.daily_bars.iloc[self.daily_bars_index]
-            if current_time < data.name[1]: # data.name[1] is the timestamp in data
+            now_bar = self.daily_bars.iloc[self.daily_bars_index]
+
+            # NOTE: quotes raw data should be passed into touch_detection_areas
+            self.now_quotes_agg = self.get_quotes_agg(current_timestamp)
+            self.now_quotes_raw = self.get_quotes_raw(current_timestamp)
+            
+            # print(self.now_bid_price, self.now_ask_price, now_bar.close)
+
+            # print(current_timestamp)
+            # print(now_bar)
+            # print(self.now_quotes_raw.index.get_level_values('timestamp'))
+            # print(self.now_quotes_agg.index.get_level_values('timestamp'))
+            # print()
+
+                
+            if current_timestamp < now_bar.name[1]: # now_bar.name[1] is the timestamp in now_bar
                 continue
-            assert current_time == data.name[1], (current_time, data.name[1])
+            assert current_timestamp == now_bar.name[1], (current_timestamp, now_bar.name[1])
             prev_close = self.daily_bars.iloc[self.daily_bars_index - 1].close
             
-            self.log(f"{current_time.strftime("%H:%M")}, price {data.close:.4f}, H-L {data.high:.4f}-{data.low:.4f}:", level=logging.INFO)
+            self.log(f"{current_timestamp.strftime("%H:%M")}, price {now_bar.close:.4f}, H-L {now_bar.high:.4f}-{now_bar.low:.4f}:", level=logging.INFO)
 
-            if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, self.daily_bars_index, self.daily_bars, i):
+            if self.now_quotes_raw is not None and self.now_quotes_agg is not None and self.is_trading_time(current_timestamp, self.day_soft_start_time, self.day_end_time, self.daily_bars_index, self.daily_bars, i):
                 if self.params.soft_end_time and not self.soft_end_triggered:
-                    self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
+                    self.soft_end_triggered = self.check_soft_end_time(current_timestamp, self.current_date)
                 
-                self.touch_area_collection.get_active_areas(current_time)
-                update_orders, _ = self.update_positions(current_time, data)
+                self.touch_area_collection.get_active_areas(current_timestamp)
+                update_orders, _ = self.update_positions(current_timestamp, now_bar)
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
-                    new_position_order = self.process_active_areas(current_time, data, prev_close, update_orders)
+                    new_position_order = self.process_active_areas(current_timestamp, now_bar, prev_close, update_orders)
 
                 all_orders = update_orders + new_position_order
-            elif self.should_close_all_positions(current_time, self.day_end_time, i):
-                self.touch_area_collection.get_active_areas(current_time)
-                all_orders, _ = self.close_all_positions(current_time, data.close, data.vwap, data.volume, data.avg_volume)
+            elif self.should_close_all_positions(current_timestamp, self.day_end_time, i):
+                self.touch_area_collection.get_active_areas(current_timestamp)
+                all_orders, _ = self.close_all_positions(current_timestamp, now_bar.close, now_bar.vwap, now_bar.volume, now_bar.avg_volume)
                 
                 self.terminated_area_ids[self.current_date] = sorted([x.id for x in self.touch_area_collection.terminated_date_areas])
                 self.log(f"    terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
@@ -873,7 +1008,7 @@ class TradingStrategy:
                     self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
                          level=logging.INFO)
                     
-            if self.should_close_all_positions(current_time, self.day_end_time, i) and self.day_accrued_fees != 0:
+            if self.should_close_all_positions(current_timestamp, self.day_end_time, i) and self.day_accrued_fees != 0:
                 # sum up transaction costs from the day and subtract it from balance
                 self.rebalance(False, -self.day_accrued_fees)
                 self.log(f"    Fees accrued on {self.current_date}: ${self.day_accrued_fees:.4f}", level=logging.INFO)
@@ -882,65 +1017,83 @@ class TradingStrategy:
                 
             self.daily_bars_index += 1
         
-        if current_time >= self.day_end_time:
+        if current_timestamp >= self.day_end_time:
             assert not self.open_positions, self.open_positions
 
-        # self.log(f"Printing areas for {current_time.date()}", level=logging.INFO)
+        # self.log(f"Printing areas for {current_timestamp.date()}", level=logging.INFO)
         # TouchArea.print_areas_list(self.touch_area_collection.active_date_areas) # print if in log level
         # self.log(f"terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
         # TouchArea.print_areas_list(self.touch_area_collection.terminated_date_areas) # print if in log level
         
         # plot_touch_detection_areas(self.touch_detection_areas, filter_areas=self.terminated_area_ids)
         
-        print(f"simultaneous close and open count: {self.simultaneous_close_open}")
+        
         
         return self.generate_backtest_results()
 
-    def process_live_data(self, current_time: datetime) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
+    def process_live_data(self, current_timestamp: datetime, new_timer_start: datetime = None) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
+        self.current_timestamp = current_timestamp
+        
+        assert self.is_live_trading
+        # NOTE: quotes_raw is updated in LiveTrader
+        assert self.touch_detection_areas.bars is not None
+        assert self.touch_detection_areas.quotes_raw is not None
+        assert self.touch_detection_areas.quotes_agg is not None
+        
         try:
-            if self.current_date is None or current_time.date() != self.current_date:
-                self.handle_new_trading_day(current_time)
+            if self.current_date is None or current_timestamp.date() != self.current_date:
+                self.handle_new_trading_day(current_timestamp)
             
             if not self.market_open or not self.market_close:
                 return [], set()
             
-            if self.df.empty or len(self.df) < 2: 
+            if self.daily_bars.empty or len(self.daily_bars) < 2: 
                 return [], set()
             
-            data = self.df.iloc[-1]
-            if current_time < data.name[1]: # < end time, just in case misaligned
+            assert self.daily_bars_index == len(self.daily_bars)-1
+            now_bar = self.daily_bars.iloc[self.daily_bars_index]
+            self.now_quotes_agg = self.get_quotes_agg(current_timestamp)
+            self.now_quotes_raw = self.get_quotes_raw(current_timestamp)
+            
+            # check equality by memory location
+            assert self.daily_bars is self.all_bars
+            assert self.now_quotes_raw is self.daily_quotes_raw is self.touch_detection_areas.quotes_raw
+            assert self.now_quotes_agg is self.daily_quotes_agg is self.touch_detection_areas.quotes_agg
+            
+
+            if current_timestamp < now_bar.name[1]: # < end time, just in case misaligned
                 return [], set()
-            elif current_time > data.name[1]: # > end time
+            elif current_timestamp > now_bar.name[1]: # > end time
                 return [], set()
-            assert current_time == data.name[1], (current_time, data.name[1])
-            prev_close = self.df.iloc[-2].close
+            assert current_timestamp == now_bar.name[1], (current_timestamp, now_bar.name[1])
+            prev_close = self.daily_bars.iloc[self.daily_bars_index - 1].close
             
             positions_to_remove1, positions_to_remove2 = set(), set()
 
-            if self.is_trading_time(current_time, self.day_soft_start_time, self.day_end_time, None, None, None):
+            if self.now_quotes_raw is not None and self.now_quotes_agg is not None and self.is_trading_time(current_timestamp, self.day_soft_start_time, self.day_end_time, None, None, None):
                 if self.params.soft_end_time and not self.soft_end_triggered:
-                    self.soft_end_triggered = self.check_soft_end_time(current_time, self.current_date)
+                    self.soft_end_triggered = self.check_soft_end_time(current_timestamp, self.current_date)
 
-                self.touch_area_collection.get_active_areas(current_time)
+                self.touch_area_collection.get_active_areas(current_timestamp)
                 for position in self.open_positions:
                     position.area = self.touch_area_collection.get_area(position.area) # find with hash/eq
                     assert position.area is not None
                 
-                update_orders, positions_to_remove1 = self.update_positions(current_time, data)
+                update_orders, positions_to_remove1 = self.update_positions(current_timestamp, now_bar)
                 
                 new_position_order = []
                 if not self.soft_end_triggered:
-                    new_position_order = self.process_active_areas(current_time, data, prev_close, update_orders)
+                    new_position_order = self.process_active_areas(current_timestamp, now_bar, prev_close, update_orders)
                 
                 all_orders = update_orders + new_position_order
-            elif self.should_close_all_positions(current_time, self.day_end_time, self.daily_bars_index):
-                self.touch_area_collection.get_active_areas(current_time)
+            elif self.should_close_all_positions(current_timestamp, self.day_end_time, self.daily_bars_index):
+                self.touch_area_collection.get_active_areas(current_timestamp)
                 for position in self.open_positions:
                     position.area = self.touch_area_collection.get_area(position.area) # find with hash/eq
                     assert position.area is not None
                         
-                all_orders, positions_to_remove2 = self.close_all_positions(current_time, data.close, data.vwap, 
-                                                    data.volume, data.avg_volume)
+                all_orders, positions_to_remove2 = self.close_all_positions(current_timestamp, now_bar.close, now_bar.vwap, 
+                                                    now_bar.volume, now_bar.avg_volume)
                     
             else:
                 all_orders = []
@@ -953,11 +1106,11 @@ class TradingStrategy:
                     self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
                          level=logging.INFO)
                     
-            if self.should_close_all_positions(current_time, self.day_end_time, self.daily_bars_index) and self.day_accrued_fees != 0:
+            if self.should_close_all_positions(current_timestamp, self.day_end_time, self.daily_bars_index) and self.day_accrued_fees != 0:
                 # sum up transaction costs from the day and subtract it from balance
                 self.rebalance(False, -self.day_accrued_fees)
                 self.log(f"After ${self.day_accrued_fees:.4f} fees: ${self.balance:.4f}", level=logging.INFO)
-                self.log(f"{current_time.strftime("%H:%M")}: Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
+                self.log(f"{current_timestamp.strftime("%H:%M")}: Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
                 self.day_accrued_fees = 0
             
             # assert self.daily_bars_index == len(self.daily_bars) - 1
@@ -969,16 +1122,16 @@ class TradingStrategy:
             
 
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in process_live_data at {current_time}: {e}", logging.ERROR)
+            self.log(f"{type(e).__qualname__} in process_live_data at {current_timestamp}: {e}", logging.ERROR)
             raise Exception( e.args )
             
 
-    def should_close_all_positions(self, current_time: datetime, day_end_time: datetime, df_index: int) -> bool:
+    def should_close_all_positions(self, current_timestamp: datetime, day_end_time: datetime, df_index: int) -> bool:
         if self.is_live_trading:
-            return current_time >= day_end_time
+            return current_timestamp >= day_end_time
         else:
-            return current_time >= day_end_time \
-                or df_index >= len(self.df) - 1
+            return current_timestamp >= day_end_time \
+                or df_index >= len(self.all_bars) - 1
 
 
     def calculate_day_times(self, current_date, market_open, market_close):
@@ -996,21 +1149,21 @@ class TradingStrategy:
         
         return day_start_time, day_end_time, day_soft_start_time
 
-    def is_trading_time(self, current_time: datetime, day_soft_start_time: datetime, day_end_time: datetime, daily_bars_index, daily_bars, i):
+    def is_trading_time(self, current_timestamp: datetime, day_soft_start_time: datetime, day_end_time: datetime, daily_bars_index, daily_bars, i):
         if self.is_live_trading:
-            return day_soft_start_time <= current_time < day_end_time
+            return day_soft_start_time <= current_timestamp < day_end_time
         else:
-            return day_soft_start_time <= current_time < day_end_time \
+            return day_soft_start_time <= current_timestamp < day_end_time \
                 and daily_bars_index < len(daily_bars) - 1 \
-                and i < len(self.df) - 1
+                and i < len(self.all_bars) - 1
 
-    def check_soft_end_time(self, current_time, current_date):
+    def check_soft_end_time(self, current_timestamp, current_date):
         if self.params.soft_end_time:
             soft_end_time = pd.Timestamp.combine(current_date, self.params.soft_end_time).tz_localize(ny_tz)
-            return current_time >= soft_end_time
+            return current_timestamp >= soft_end_time
         return False
 
-    def process_active_areas(self, current_time: datetime, data, prev_close, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
+    def process_active_areas(self, current_timestamp: datetime, now_bar, prev_close, pending_orders: List[IntendedOrder]) -> List[IntendedOrder]:
         
         # # do not close then open at same time
         # if pending_orders:
@@ -1021,7 +1174,7 @@ class TradingStrategy:
         pending_short_close = any([a.action == 'close' and not a.position.is_long for a in pending_orders])
         
         for area in self.touch_area_collection.active_date_areas:
-            if area.min_touches_time is None or area.min_touches_time > current_time:
+            if area.min_touches_time is None or area.min_touches_time > current_timestamp:
                 continue
             
             if self.balance <= 0:
@@ -1034,9 +1187,8 @@ class TradingStrategy:
                 
                 # do not close long then open short (or close short then open long) at same time
                 # reduces slippage
-                if not area.is_long and pending_long_close:
-                    continue
-                if area.is_long and pending_short_close:
+                # removes need to submit 2 separate orders
+                if (area.is_long and pending_short_close) or (not area.is_long and pending_long_close):
                     continue
                 
                 # # do not close long then open long (or close short then open short) at same time
@@ -1046,7 +1198,7 @@ class TradingStrategy:
                 #     continue
                 
                     
-                new_position_order = self.create_new_position(area, current_time, data, prev_close, pending_orders)
+                new_position_order = self.create_new_position(area, current_timestamp, now_bar, prev_close, pending_orders)
                 if new_position_order:
                     if pending_long_close or pending_short_close:
                         self.simultaneous_close_open += 1
@@ -1062,8 +1214,8 @@ class TradingStrategy:
         balance_change = ((self.balance - self.params.initial_investment) / self.params.initial_investment) * 100
 
         # Buy and hold strategy
-        start_price = self.df.iloc[0].close
-        end_price = self.df.iloc[-1].close
+        start_price = self.all_bars.iloc[0].close
+        end_price = self.all_bars.iloc[-1].close
         baseline_change = ((end_price - start_price) / start_price) * 100
         
         total_pl = sum(trade.pl for trade in trades)
@@ -1094,9 +1246,10 @@ class TradingStrategy:
         print(f"END\nStrategy: {'Long' if self.params.do_longs else ''}{'&' if self.params.do_longs and self.params.do_shorts else ''}{'Short' if self.params.do_shorts else ''}")
         print(f'{self.touch_detection_areas.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.touch_detection_areas.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
-        print(f"{self.timestamps[0]} -> {self.timestamps[-1]}")
+        timestamps = self.all_bars.index.get_level_values('timestamp')
+        print(f"{timestamps[0]} -> {timestamps[-1]}")
 
-        # debug2_print(df['close'])
+        # debug2_print(all_bars['close'])
         
         print("\nOverall Statistics:")
         print('Initial Investment:', self.params.initial_investment)
@@ -1104,6 +1257,7 @@ class TradingStrategy:
         print(f"Balance % change:   {balance_change:.4f}% ***")
         print(f"Baseline % change:  {baseline_change:.4f}%")
         print('Number of Trades Executed:', self.trades_executed)
+        print(f"Simultaneous close and open count: {self.simultaneous_close_open}")
         print(f"\nTotal Profit/Loss (after fees): ${total_pl:.4f}")
         print(f"  Total Profit: ${total_profit:.4f}")
         print(f"  Total Loss:   ${total_loss:.4f}")
@@ -1163,6 +1317,18 @@ class TradingStrategy:
         # print(f"Average Margin Multiplier: {sum(trade.actual_margin_multiplier for trade in trades) / len(self.trades):.4f}x")
         print(f"Average Transactions per Position: {avg_transact:.4f}")
         
+        print('\nAdjusted scaling statistics:')
+        combined_describe = pd.concat([
+            pd.Series(self.pressure_scalars).describe(),
+            pd.Series(self.spread_scalars).describe(),
+            pd.Series(self.final_scalars).describe(),
+            pd.Series(self.max_trade_sizes).describe(),
+            pd.Series(self.max_trade_size_adjustments).describe(),
+            pd.Series(self.trade_size_reductions).describe()
+        ], axis=1).round(3)
+        combined_describe.columns = ['Pressure', 'Spread', 'Final', 'MaxSize','MaxSizeDiff','SizeDiff']
+        print(combined_describe)
+            
         # # print(trades)
         if self.export_trades_path:
             export_trades_to_csv(self.trades, self.export_trades_path)

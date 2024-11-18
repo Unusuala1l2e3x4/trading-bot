@@ -49,7 +49,7 @@ def retrieve_multi_year_symbol_data(symbols: List[str], years: List[int], symbol
 
 if __name__=="__main__":
     # Example usage:
-    symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA']
+    symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA', 'TSLA']
     # symbols = ['NVDA', 'GOOGL', 'AAPL', 'AMZN', 'MSFT', 'META'] # ordered  by quotes activity, roughly
     # symbols = ['AAPL', 'GOOGL', 'NVDA', 'META']
     years = [2022, 2023]

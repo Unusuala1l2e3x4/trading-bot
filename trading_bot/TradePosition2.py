@@ -23,17 +23,25 @@ def calculate_slippage(is_long: bool, price: float, trade_size: int, volume: flo
     effective_volume = max((volume + avg_volume) / 2, 1)
     
     slippage = slippage_factor * (float(trade_size) / effective_volume)
+    # print(f"${slippage*price:.6f}")
+    # print(f"{slippage*100:.6f} %")
     
     if is_long:
         if is_entry:
-            return price * (1 + slippage)  # Increase price for long entries
+            pass
+            # return price * (1 + slippage),   # Increase price for long entries
         else:
-            return price * (1 - slippage)  # Decrease price for long exits
+            slippage *= -1
+            # return price * (1 - slippage)  # Decrease price for long exits
     else:  # short
         if is_entry:
-            return price * (1 - slippage)  # Decrease price for short entries
+            slippage *= -1
+            # return price * (1 - slippage)  # Decrease price for short entries
         else:
-            return price * (1 + slippage)  # Increase price for short exits
+            pass
+            # return price * (1 + slippage)  # Increase price for short exits
+        
+    return price * (1 + slippage), slippage*price
 
 
 # @jit(nopython=True)
@@ -94,11 +102,14 @@ class TradePosition:
     is_marginable: bool
     times_buying_power: float
     entry_price: float
+    bar_price_at_entry: float
     market_value: float = 0.0
     shares: int = 0 # no fractional trading
     partial_entry_count: int = 0
     partial_exit_count: int = 0
-    max_shares: int = field(init=False)
+    max_shares: Optional[int] = None
+    max_max_shares: Optional[int] = None
+    min_max_shares: Optional[int] = None
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     transactions: List[Transaction] = field(default_factory=list)
@@ -176,7 +187,7 @@ class TradePosition:
         return logger
 
     def log(self, message, level=logging.INFO):
-        self.logger.log(level, message)
+        self.logger.log(level, message, exc_info=level >= logging.ERROR)
 
     @property
     def is_open(self) -> bool:
@@ -237,13 +248,21 @@ class TradePosition:
 
         return transaction_cost
 
+    def increase_max_shares(self, shares):
+        self.max_shares = max(self.max_shares, shares)
+        self.max_max_shares = max(self.max_max_shares or self.max_shares, self.max_shares)
+    
+    def decrease_max_shares(self, shares):
+        self.max_shares = min(self.max_shares, shares)
+        self.min_max_shares = min(self.min_max_shares or self.max_shares, self.max_shares)
+    
     def initial_entry(self, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares, vwap, volume, avg_volume, slippage_factor)
 
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         self.log(f"partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}", level=logging.DEBUG)
 
-        adjusted_price = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
+        adjusted_price, slippage_price_change = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
         cash_committed = shares_to_buy * entry_price
 
         fees = self.add_transaction(entry_time, shares_to_buy, adjusted_price, is_entry=True, vwap=vwap)
@@ -261,7 +280,7 @@ class TradePosition:
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
         self.log(f"partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}", level=logging.DEBUG)
 
-        adjusted_price = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
+        adjusted_price, slippage_price_change = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
 
         cash_released = (shares_to_sell / self.shares) * self.cash_committed
         realized_pl = (adjusted_price - self.entry_price) * shares_to_sell if self.is_long else (self.entry_price - adjusted_price) * shares_to_sell
@@ -277,21 +296,21 @@ class TradePosition:
 
         return realized_pl, cash_released, fees, shares_to_sell
 
-    def update_stop_price(self, current_price: float, current_timestamp: datetime):
+    def update_stop_price(self, bar_price: float, quote_price: float, current_timestamp: datetime):
         self.area.update_bounds(current_timestamp)
         
         if self.is_long:
-            self.max_price = max(self.max_price or self.entry_price, current_price)
+            self.max_price = max(self.max_price or self.bar_price_at_entry, bar_price) # NOTE: this operation should use bar data since update_bounds only uses bar data
             self.current_stop_price = self.max_price - self.area.get_range
             self.current_stop_price_2 = self.max_price - self.area.get_range * 3
         else:
-            self.min_price = min(self.min_price or self.entry_price, current_price)
+            self.min_price = min(self.min_price or self.bar_price_at_entry, bar_price) # NOTE: this operation should use bar data since update_bounds only uses bar data
             self.current_stop_price = self.min_price + self.area.get_range
             self.current_stop_price_2 = self.min_price + self.area.get_range * 3
         
-        self.update_market_value(current_price)
+        # self.update_market_value(quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
         self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}")
-        return self.should_exit(current_price), self.should_exit_2(current_price)
+        return self.should_exit(bar_price), self.should_exit_2(bar_price)
 
     def should_exit(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \

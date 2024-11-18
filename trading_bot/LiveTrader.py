@@ -4,7 +4,7 @@ import numpy as np
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.stream import TradingStream
@@ -24,7 +24,9 @@ from alpaca.data.models import Bar
 from TradePosition import TradePosition
 from TouchArea import TouchArea
 from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable, IntendedOrder
-from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters, np_mean, np_median, fill_missing_data
+from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters
+from TouchDetectionParameters import np_mean, np_median
+from MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data, fill_missing_data, get_data_with_retry, clean_quotes_data
 
 from tqdm import tqdm
 import logging
@@ -50,6 +52,28 @@ debug = False
 def debug_print(*args, **kwargs):
     if debug:
         print(*args, **kwargs)
+
+
+def setup_logger(log_level=logging.INFO):
+    logger = logging.getLogger('LiveTrader')
+    logger.setLevel(log_level)
+
+    # Clear existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Add a new handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logger(logging.INFO)
+
+def log(message, level=logging.INFO):
+    logger.log(level, message, exc_info=level >= logging.ERROR) # show trackback if level is ERROR
+    
 
 
 def fill_latest_missing_data(df, latest_timestamp):
@@ -98,12 +122,13 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]):
 
         # Assert that the first order is a close and the second is an open
         assert first_order.action == 'close' and second_order.action == 'open', \
-            f"When two orders are present, the first must be a close and the second must be an open. ({first_order.action}, {second_order.action})"
+            f"When 2 orders are present, the first must be a close and the second must be an open. ({first_order.action}, {second_order.action})"
 
         # Case 1: Same order side (closing one direction and opening the opposite)
         if first_order.side == second_order.side:
             assert first_order.position.is_long != second_order.position.is_long, (first_order.position.is_long, second_order.position.is_long)
-            # These orders must be executed sequentially
+            # These orders must be executed sequentially (Alpaca prevents switching between long and short in a single order)
+            log(f"Receieved long-to-short or short-to-long order pair. Alpaca prevents switching between long and short in a single order.",level=logging.WARNING)
             return orders_list
 
         # Case 2: Different order side (closing and reopening in the same direction)
@@ -118,7 +143,8 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]):
                 side = first_order.side if qty_difference > 0 else second_order.side
             
             combined_order = IntendedOrder(
-                action = second_order.action, # == 'open'
+                # action = second_order.action, # == 'open'
+                action = 'net_partial_exit' if qty_difference > 0 else 'net_partial_entry',
                 side = side,
                 symbol = second_order.symbol,
                 qty = abs(qty_difference),
@@ -146,18 +172,21 @@ class LiveTrader:
     historical_client: StockHistoricalDataClient = field(init=False)
     trading_strategy: Optional[TradingStrategy] = None
     balance: float = field(init=False)
-    data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    bars: pd.DataFrame = field(default_factory=pd.DataFrame)
+    bars_adjusted: pd.DataFrame = field(default_factory=pd.DataFrame)
+    quotes_raw: pd.DataFrame = field(default_factory=pd.DataFrame)
+    quotes_agg: pd.DataFrame = field(default_factory=pd.DataFrame)
     trade_updates: List[TradeUpdate] = field(default_factory=list)
     is_ready: bool = False
     gap_filled: bool = False
     streamed_data: pd.DataFrame = field(default_factory=pd.DataFrame)
-    last_historical_timestamp: Optional[pd.Timestamp] = None
+    last_hist_bar_dt: Optional[pd.Timestamp] = None
     first_streamed_timestamp: Optional[pd.Timestamp] = None
+    timer_start: datetime = field(init=False)
     open_positions: Dict = field(default_factory=dict)
     open_order_ids: Set = field(default_factory=set)
     area_ids_to_remove: defaultdict = field(default_factory=lambda: defaultdict(set))
     ny_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
-    logger: logging.Logger = field(init=False)
     trades: List[TradePosition] = field(default_factory=list)
 
     def __post_init__(self):
@@ -168,40 +197,21 @@ class LiveTrader:
                                            websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
         self.balance = self.initial_balance
-        self.logger = self.setup_logger(logging.INFO)
-        
-    def setup_logger(self, log_level=logging.INFO):
-        logger = logging.getLogger('LiveTrader')
-        logger.setLevel(log_level)
-
-        # Clear existing handlers
-        if logger.hasHandlers():
-            logger.handlers.clear()
-
-        # Add a new handler
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        return logger
-
-    def log(self, message, level=logging.INFO):
-        self.logger.log(level, message)
             
     async def reset_daily_data(self):
-        self.log("Resetting daily data...")
+        log("Resetting daily data...")
         current_day_start = self.get_current_trading_day_start()
         
         # Reset data and streamed_data
-        if not self.data.empty:
-            # self.data = self.data[self.data.index.get_level_values('timestamp') >= current_day_start]
-            self.data = pd.DataFrame()
+        if not self.bars.empty:
+            # self.bars = self.bars[self.bars.index.get_level_values('timestamp') >= current_day_start]
+            self.bars = pd.DataFrame()
         self.streamed_data = pd.DataFrame()
         
         # Reset other daily variables
         self.is_ready = False
         self.gap_filled = False
-        self.last_historical_timestamp = None
+        self.last_hist_bar_dt = None
         self.first_streamed_timestamp = None
         
         # Re-initialize historical data for the new day
@@ -217,7 +227,7 @@ class LiveTrader:
         current_date = datetime.now(self.ny_tz).date()
         self.trading_strategy.update_daily_parameters(current_date)
         
-        self.log("Daily data reset complete.")
+        log("Daily data reset complete.")
     
     def is_market_open(self, check_time: Optional[datetime] = None):
         if check_time is None:
@@ -237,26 +247,44 @@ class LiveTrader:
 
     async def wait_for_market_open(self):
         while not self.is_market_open():
-            self.log("Market is closed. Waiting for market to open.")
+            log("Market is closed. Waiting for market to open.")
             await asyncio.sleep(60)
 
-    def get_historical_bars(self, start, end):
+    def get_historical_bars(self, start, end, adjustment = Adjustment.RAW):
         request_params = StockBarsRequest(
             symbol_or_symbols=self.symbol,
             timeframe=TimeFrame.Minute,
             start=start.astimezone(ZoneInfo("UTC")),
             end=end.astimezone(ZoneInfo("UTC")),
-            adjustment=Adjustment.ALL,
+            adjustment=adjustment,
+            feed='sip'
         )
-        df = self.historical_client.get_stock_bars(request_params).df
-        if df.empty:
-            return df
+        try:
+            df = get_data_with_retry(self.historical_client, self.historical_client.get_stock_bars, request_params)
+        except Exception as e:
+            log(f"Error requesting bars for {self.symbol}: {str(e)}", level=logging.ERROR)
+            return pd.DataFrame()
         df.index = df.index.set_levels(
             df.index.get_level_values('timestamp').tz_convert(self.ny_tz),
             level='timestamp'
         )
         df.sort_index(inplace=True)
-        df = fill_missing_data(df) # only fills betweem min and max time already in df
+        return fill_missing_data(df) # only fills betweem min and max time already in df
+    
+    def get_historical_quotes(self, start, end):
+        request_params = StockQuotesRequest(
+            symbol_or_symbols=self.symbol,
+            start=start.astimezone(ZoneInfo("UTC")),
+            end=end.astimezone(ZoneInfo("UTC")),
+            feed='sip' # default for market data subscription?
+            # feed='iex'
+        )
+        try:
+            df = get_data_with_retry(self.historical_client, self.historical_client.get_stock_quotes, request_params)
+        except Exception as e:
+            log(f"Error requesting quotes for {self.symbol}: {str(e)}", level=logging.ERROR)
+            return pd.DataFrame()
+        df, _ = clean_quotes_data(df, False, start, end)
         return df
 
     def get_lagged_time(self):
@@ -269,63 +297,63 @@ class LiveTrader:
             end = self.get_lagged_time()
             start = self.get_current_trading_day_start()
             
-            self.log(f"Fetching historical data from {start} to {end}")
+            log(f"Fetching historical data from {start} to {end}")
             
-            self.data = self.get_historical_bars(start, end)
+            self.bars = self.get_historical_bars(start, end)
             
-            if self.data.empty:
-                self.log("No historical data available. Waiting for data.", logging.WARNING)
+            if self.bars.empty:
+                log("No historical data available. Waiting for data.", logging.WARNING)
                 return
             
-            self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
-            time_diff = (end - self.last_historical_timestamp).total_seconds() / 60
+            self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
+            time_diff = (end - self.last_hist_bar_dt).total_seconds() / 60
 
             if time_diff >= 16:
-                self.log(f"Historical data is too old. Latest data point: {self.last_historical_timestamp}", logging.WARNING)
+                log(f"Historical data is too old. Latest data point: {self.last_hist_bar_dt}", logging.WARNING)
                 return
 
-            self.log(f"Initialized historical data: {len(self.data)} bars")
-            self.log(f"Data range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
+            log(f"Initialized historical data: {len(self.bars)} bars")
+            log(f"Data range: {self.bars.index.get_level_values('timestamp')[0]} to {self.last_hist_bar_dt}")
 
         except Exception as e:
-            self.log(f"{type(e).__qualname__} initializing data: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} initializing data: {e}", logging.ERROR)
             raise e
 
     async def update_historical_data(self):
         try:
             end = self.get_lagged_time()
-            start = self.last_historical_timestamp + timedelta(minutes=1)
+            start = self.last_hist_bar_dt + timedelta(minutes=1)
             debug_print('---')
             if end > start:
                 new_data = self.get_historical_bars(start, end)
-                assert new_data.index.get_level_values('timestamp').min() > self.last_historical_timestamp, (new_data.index.get_level_values('timestamp').min(), self.last_historical_timestamp)
+                assert new_data.index.get_level_values('timestamp').min() > self.last_hist_bar_dt, (new_data.index.get_level_values('timestamp').min(), self.last_hist_bar_dt)
                 
                 debug_print('---')
                 if not new_data.empty:
                     debug_print('---')
-                    self.data = pd.concat([self.data, new_data])
+                    self.bars = pd.concat([self.bars, new_data])
                     debug_print('update_historical_data')
-                    debug_print('before remove dups',len(self.data))
-                    self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index() # needed if update_historical_data is called in less than 1 minute intervals
-                    debug_print('after remove dups ',len(self.data))
-                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
-                    self.log(f"Updated historical data. New range: {self.data.index.get_level_values('timestamp')[0]} to {self.last_historical_timestamp}")
+                    debug_print('before remove dups',len(self.bars))
+                    self.bars = self.bars.loc[~self.bars.index.duplicated(keep='last')].sort_index() # needed if update_historical_data is called in less than 1 minute intervals
+                    debug_print('after remove dups ',len(self.bars))
+                    self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
+                    log(f"Updated historical data. New range: {self.bars.index.get_level_values('timestamp')[0]} to {self.last_hist_bar_dt}")
                 
-                assert self.data.index.get_level_values('timestamp')[-1] == self.last_historical_timestamp
+                assert self.bars.index.get_level_values('timestamp')[-1] == self.last_hist_bar_dt
                 
-                if self.last_historical_timestamp < end:
-                    self.log(f"calling fill_latest_missing_data for {self.last_historical_timestamp} -> {end}", level=logging.WARNING)
-                    fill_latest_missing_data(self.data, end)
-                    self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
+                if self.last_hist_bar_dt < end:
+                    log(f"calling fill_latest_missing_data for {self.last_hist_bar_dt} -> {end}", level=logging.WARNING)
+                    fill_latest_missing_data(self.bars, end)
+                    self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
         
         except Exception as e:
-            self.log(f"{type(e).__qualname__} updating historical data: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} updating historical data: {e}", logging.ERROR)
             raise e
                 
     async def simulate_bar(self):
         try:
-            if self.simulation_mode and not self.data.empty:
-                latest_data = self.data.iloc[-1]
+            if self.simulation_mode and not self.bars.empty:
+                latest_data = self.bars.iloc[-1]
                 bar = SimpleNamespace(
                     symbol=latest_data.name[0],
                     timestamp=latest_data.name[1],  # Assuming multi-index with (symbol, timestamp)
@@ -340,14 +368,15 @@ class LiveTrader:
                 )
                 await self.on_bar(bar, check_time=latest_data.name[1])
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in simulate_bar: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} in simulate_bar: {e}", logging.ERROR)
             raise e
         
     async def on_bar(self, bar:Bar, check_time: Optional[datetime] = None):
+        self.timer_start = datetime.now()
         debug_print(bar)
         try:
             if not self.is_market_open(check_time):
-                self.log("Received bar outside market hours. Ignoring.")
+                log("Received bar outside market hours. Ignoring.")
                 return
 
             if hasattr(bar, 'is_simulate_bar'):
@@ -355,12 +384,12 @@ class LiveTrader:
             else:
                 is_simulate_bar = False
                 
-            bar_time = pd.to_datetime(bar.timestamp).tz_convert(self.ny_tz)
+            bar_time = pd.to_datetime(bar.timestamp, utc=True).tz_convert(self.ny_tz)
             now = datetime.now(self.ny_tz)
             time_diff = (now - bar_time).total_seconds() / 60
 
             if time_diff >= 16 and not is_simulate_bar:
-                self.log(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}", logging.WARNING)
+                log(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}", logging.WARNING)
                 return
             
             if self.first_streamed_timestamp is None:
@@ -387,7 +416,7 @@ class LiveTrader:
                 debug_print('before remove dups',len(self.streamed_data))
                 self.streamed_data = self.streamed_data.loc[~self.streamed_data.index.duplicated(keep='last')].sort_index()
                 debug_print('after remove dups ',len(self.streamed_data))
-                self.log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
+                log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
 
             # Check if we've filled the gap
             if not self.is_ready:
@@ -395,49 +424,67 @@ class LiveTrader:
                 
             if self.is_ready:
                 if not self.simulation_mode:
-                    self.data = pd.concat([self.data, new_row])
+                    self.bars = pd.concat([self.bars, new_row])
                     debug_print('on_bar data')
-                    debug_print('before remove dups',len(self.data))
-                    self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
-                    debug_print('after remove dups ',len(self.data))
-                    debug_print('final data:\n',self.data)
+                    debug_print('before remove dups',len(self.bars))
+                    self.bars = self.bars.loc[~self.bars.index.duplicated(keep='last')].sort_index()
+                    debug_print('after remove dups ',len(self.bars))
+                    debug_print('final data:\n',self.bars)
                     # debug_print('final streamed_data:\n',self.streamed_data)
                 await self.execute_trading_logic()
                 
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in on_bar: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} in on_bar: {e}", logging.ERROR)
             raise e
 
     async def check_gap_filled(self):
-        time_diff = (self.first_streamed_timestamp - self.last_historical_timestamp).total_seconds() / 60
+        time_diff = (self.first_streamed_timestamp - self.last_hist_bar_dt).total_seconds() / 60
         if time_diff <= 1 or self.simulation_mode:
             self.is_ready = True
             debug_print('check_gap_filled: self.is_ready = True',time_diff)
             if not self.simulation_mode: # do not use streamed_data if in simulation mode
-                self.data = pd.concat([self.data, self.streamed_data])
-                debug_print('before remove dups',len(self.data))
-                self.data = self.data.loc[~self.data.index.duplicated(keep='last')].sort_index()
-                debug_print('after remove dups ',len(self.data))
-            self.log("Gap filled. Data is now ready for trading.")
-            self.log(f"Continuous data range: {self.data.index.get_level_values('timestamp')[0]} to {self.data.index.get_level_values('timestamp')[-1]}")
+                self.bars = pd.concat([self.bars, self.streamed_data])
+                debug_print('before remove dups',len(self.bars))
+                self.bars = self.bars.loc[~self.bars.index.duplicated(keep='last')].sort_index()
+                debug_print('after remove dups ',len(self.bars))
+            log("Gap filled. Data is now ready for trading.")
+            log(f"Continuous data range: {self.bars.index.get_level_values('timestamp')[0]} to {self.bars.index.get_level_values('timestamp')[-1]}")
         else:
-            self.log(f"Gap not properly filled. Time difference: {time_diff} minutes", logging.WARNING)
+            log(f"Gap not properly filled. Time difference: {time_diff} minutes", logging.WARNING)
 
 
     async def execute_trading_logic(self):
         current_time = None
         try:
             if not self.is_ready:
-                self.log("Data not ready for trading")
+                log("Data not ready for trading")
                 return
 
             # Update TradingStrategy balance
-            current_time = self.data.index.get_level_values('timestamp')[-1]
+            current_time = self.bars.index.get_level_values('timestamp')[-1]
             current_date = current_time.date()
+                        
+            # get quotes data
+            if self.simulation_mode:
+                # NOTE: follow similar quotes data processing as retrieve_quote_data
+                self.quotes_raw = self.get_historical_quotes(start = current_time - timedelta(seconds=2), 
+                                                             end = current_time + timedelta(seconds=1))             # TODO: end should just be now
+
+                # TODO: self.quotes_agg....
+                
+                
+                if self.quotes_raw is None or self.quotes_agg is None:
+                    return
+
+                # NOTE: OR set end to current_time plus elapsed time (unless already handled in TradingStrategy.get_quotes_raw )
+                # TODO: MAKE SURE TradingStrategy.handle_new_trading_day gets the matching raw quotes data, and filters it by elapsed time
+                
+            else:
+                # NOTE: need real time data!
+                raise NotImplementedError('getting live quotes data not implemented for live trading')
             
             # Calculate touch detection areas every minute
             self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours, current_time))
-
             
             # Update daily parameters if it's a new day (already handled in process_live_data)
             # if current_time.date() != getattr(self.trading_strategy, 'current_date', None):
@@ -445,16 +492,18 @@ class LiveTrader:
                 # self.trading_strategy.handle_new_trading_day(current_time)
 
             # print(self.trading_strategy.touch_detection_areas.symbol)
-            # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}, {len(self.trading_strategy.touch_detection_areas.short_touch_area)}, {len(self.area_ids_to_remove)}")
+            # log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}, {len(self.trading_strategy.touch_detection_areas.short_touch_area)}, {len(self.area_ids_to_remove)}")
 
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
-            #     self.log(f'after mask:\n{self.trading_strategy.df}')
-
-            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time)
-
-
+            #     log(f'after mask:\n{self.trading_strategy.df}')
+            
+            # NOTE: PASS QUOTES DATA TO STRATEGY
+            self.trading_strategy.touch_detection_areas.quotes_raw = self.quotes_raw
+            self.trading_strategy.touch_detection_areas.quotes_agg = self.quotes_agg
+            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time, self.timer_start)
+            
             if orders_list:
-                # self.log(f"{current_time.strftime("%H:%M")}: {len(orders_list)} ORDERS CREATED")  
+                # log(f"{current_time.strftime("%H:%M")}: {len(orders_list)} ORDERS CREATED")  
                 
                 if not self.simulation_mode:
                     # Place all orders concurrently
@@ -468,28 +517,28 @@ class LiveTrader:
                 else:
                     # In simulation mode, just log the orders (already done in TradingStrategy)
                     
-                    # self.log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f} after {len(orders_list)} orders.", level=logging.INFO)
-                    # self.log(f"    market value ${self.total_market_value:.4f}, margin used ${self.margin_used:.4f}, buying power ${self.buying_power:.4f}", level=logging.INFO)
+                    # log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f} after {len(orders_list)} orders.", level=logging.INFO)
+                    # log(f"    market value ${self.total_market_value:.4f}, margin used ${self.margin_used:.4f}, buying power ${self.buying_power:.4f}", level=logging.INFO)
                     
                     for a in orders_list:
-                        # self.log({k:order[k] for k in order if k != 'position'})
+                        # log({k:order[k] for k in order if k != 'position'})
                         peak = a.position.max_price if a.position.is_long else a.position.min_price
-                        self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
+                        log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
                             level=logging.INFO)
                         
-                    # self.log(f"{[f"{a.position.id} {a.position.is_long} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, width {a.position.area.get_range:.4f}" for a in orders_list]} {self.trading_strategy.balance:.4f}")
+                    # log(f"{[f"{a.position.id} {a.position.is_long} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, width {a.position.area.get_range:.4f}" for a in orders_list]} {self.trading_strategy.balance:.4f}")
                     
                     
                     # NOTE: self.balance not updated yet
                     
                     
                 if orders_list[0].action == 'open':
-                    self.log(self.trading_strategy.df)
+                    log(self.trading_strategy.df)
                     
                     
                     
                 # total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
-                # self.log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
+                # log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
                 
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
                 pass
@@ -499,13 +548,12 @@ class LiveTrader:
             self.trades.extend(positions_to_remove)
             self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
             
-            
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
             raise e
 
     def calculate_touch_detection_area(self, market_hours=None, current_timestamp=None):
-        return calculate_touch_detection_area(self.touch_detection_params, self.data, market_hours, current_timestamp, self.area_ids_to_remove)
+        return calculate_touch_detection_area(self.touch_detection_params, self.bars, market_hours, current_timestamp, self.area_ids_to_remove)
     
     async def place_order(self, intended_order: IntendedOrder):
         assert isinstance(intended_order.qty, int)
@@ -547,25 +595,25 @@ class LiveTrader:
         
         
         try:
-            # TODO: REVIEW:
+            # NOTE:
                 # class TimeInForce
                 # https://docs.alpaca.markets/docs/working-with-orders#using-client-order-ids
                 
-            # TODO: figure out out TIF strategy, and apply intended strategy to backtesting first
             
+            # NOTE: NO LONGER DOING LIMIT ORDERS
             
-            limit_order_request = LimitOrderRequest(
-                symbol=intended_order.symbol,
-                qty=intended_order.qty,
-                side=intended_order.side,
+            # limit_order_request = LimitOrderRequest(
+            #     symbol=intended_order.symbol,
+            #     qty=intended_order.qty,
+            #     side=intended_order.side,
                 
-                time_in_force=TimeInForce.DAY,
-                # probably need to use IOC (needs elite smart router)
-                # or use GTC - cancel it (call cancel_order_by_id) after waiting a couple seconds, or up to next minute (as long as it is a limit order)
+            #     time_in_force=TimeInForce.DAY,
+            #     # probably need to use IOC (needs elite smart router)
+            #     # or use GTC - cancel it (call cancel_order_by_id) after waiting a couple seconds, or up to next minute (as long as it is a limit order)
                 
                 
-                limit_price=intended_order.price
-            )
+            #     limit_price=intended_order.price
+            # )
             
             
             order_request = MarketOrderRequest(
@@ -575,21 +623,21 @@ class LiveTrader:
                 time_in_force=TimeInForce.DAY
             )
             # new_order = self.trading_client.submit_order(order_request) # class Order
-            self.log(f"Placed {intended_order.side} order for {intended_order.qty} shares of {intended_order.symbol} - {intended_order.action}")
+            log(f"Placed {intended_order.side} order for {intended_order.qty} shares of {intended_order.symbol} - {intended_order.action}")
             
-            # TODO: wait to receive TradeUpdate, which contains the Order after updates
+            # await self.process_new_order(new_order, intended_order) # TODO: implement process_new_order
+            # TODO: await trade update, either here or in process_new_order
             
-            # await self.process_new_order(new_order, intended_order) # NOTE: probably not with new order. need to pass in Order from TradeUpdate.
             
             # return new_order
         except Exception as e:
-            self.log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
             raise e
         
     
     async def on_msg(self, data: TradeUpdate):
         # Print the update to the console.
-        print("Update for {}. Event: {}.".format(data.event))
+        print(f"Update for order ID {data.order.id}. Event: {data.event}. Status: {data.order.status}")
         
         
         # TODO: implement this function. we need:
@@ -610,58 +658,63 @@ class LiveTrader:
         
         
     async def process_new_order(self, new_order: Order, intended_order: IntendedOrder):
-        self.log(f"Order ID: {new_order.id}") # NEED ID FOR CANCELLATION
-        self.log(f"Order Status: {new_order.status}") # assert "new"
+        log(f"Order ID: {new_order.id}") # NEED ID FOR CANCELLATION
+        log(f"Order Status: {new_order.status}") # assert "new"
         
         self.open_order_ids.add(new_order.id)
         
-        # TODO
+        # TODO: wait to receive TradeUpdate (from on_msg handler), or do it in place_order
 
 
 
-    async def process_order_update(self, placed_order: Order, intended_order: IntendedOrder):
+    async def process_trade_update(self, trade_update: TradeUpdate, intended_order: IntendedOrder):
         # Log NEW order details
         
         # see class Order
         # TODO: this function should handle Order objects from TradeUpdate, not NEW orders
         
-        
-        
-        self.log(f"Order ID: {placed_order.id}") # NEED ID FOR CANCELLATION
-        self.log(f"Order Status: {placed_order.status}")
-        self.log(f"Filled Qty: {placed_order.filled_qty}")
-        self.log(f"Filled Avg Price: {placed_order.filled_avg_price}")
+        placed_order = trade_update.order
+        position_qty = trade_update.position_qty
+        log(f"Order ID: {placed_order.id}") # NEED ID FOR CANCELLATION
+        log(f"Order Status: {placed_order.status}")
+        log(f"Filled Qty: {placed_order.filled_qty}")
+        log(f"Filled Avg Price: {placed_order.filled_avg_price}")
 
         # Update internal state based on order status
         if placed_order.status == OrderStatus.FILLED:
-            await self.update_position_after_fill(placed_order, intended_order)
+            await self.update_position_after_fill(placed_order, position_qty, intended_order)
         elif placed_order.status == OrderStatus.PARTIALLY_FILLED:
-            await self.handle_partial_fill(placed_order, intended_order)
+            await self.handle_partial_fill(placed_order, position_qty, intended_order)
         elif placed_order.status in [OrderStatus.REJECTED, OrderStatus.CANCELED]:
-            await self.handle_failed_order(placed_order, intended_order)
+            await self.handle_failed_order(placed_order, position_qty, intended_order)
         else:
             # For other statuses like NEW, ACCEPTED, etc.
-            self.log(f"Order {placed_order.id} is in {placed_order.status} status. Waiting for fill.")
+            log(f"Order {placed_order.id} is in {placed_order.status} status. Waiting for fill.")
 
-    async def update_position_after_fill(self, placed_order: Order, intended_order: IntendedOrder):
-        self.log(f"Order {placed_order.id} filled completely - {placed_order.filled_qty} out of {placed_order.qty}")
+    async def update_position_after_fill(self, placed_order: Order, position_qty: float, intended_order: IntendedOrder):
+        log(f"Order {placed_order.id} filled completely - {placed_order.filled_qty} out of {placed_order.qty}")
         
         position = intended_order.position
         action = intended_order.action
         
         if action == 'open':
+            assert placed_order.filled_qty == position_qty
+            assert int(position_qty) == position_qty
+            
             # Update the position with actual filled quantity and price
-            position.shares = int(placed_order.filled_qty)
+            position.shares = int(position_qty)
             position.entry_price = float(placed_order.filled_avg_price)
-        elif action in ['partial_entry', 'partial_exit', 'close']:
+        elif action in ['net_partial_entry', 'net_partial_exit', 'partial_entry', 'partial_exit', 'close']:
             # Update the position for partial fills
             
             if (position.is_long and intended_order.side == OrderSide.BUY) or (not position.is_long and intended_order.side == OrderSide.SELL): # entry
                 # position.shares += int(placed_order.filled_qty)
-                position.shares -= (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+                # position.shares -= (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+                position.shares = int(position_qty)
             else: # exit
                 # position.shares -= int(placed_order.filled_qty) 
-                position.shares += (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+                # position.shares += (intended_order.qty - int(placed_order.filled_qty)) # position.shares is already changed to be the INTENDED FINAL shares
+                position.shares = int(position_qty)
                 
         # elif action == 'close':
         #     # Remove the position from open positions -> already done in TradingStrategy
@@ -677,10 +730,10 @@ class LiveTrader:
         # Recalculate account balance
         self.recalculate_balance(placed_order, intended_order)
 
-    async def handle_partial_fill(self, placed_order: Order, intended_order: IntendedOrder):
-        self.log(f"Order {placed_order.id} partially filled. Filled {placed_order.filled_qty} out of {placed_order.qty}")
+    async def handle_partial_fill(self, placed_order: Order, position_qty: float, intended_order: IntendedOrder):
+        log(f"Order {placed_order.id} partially filled. Filled {placed_order.filled_qty} out of {placed_order.qty}")
         # Update position with partially filled amount
-        await self.update_position_after_fill(placed_order, intended_order)
+        await self.update_position_after_fill(placed_order, position_qty, intended_order)
         
         # TODO: modify max_price of the corresponding position; be sure to replace/update the position in self.trading_strategy.open_positions
         
@@ -696,9 +749,10 @@ class LiveTrader:
 
 
 
-    async def handle_failed_order(self, placed_order: Order, intended_order: IntendedOrder):
-        self.log(f"Order {placed_order.id} failed with status {placed_order.status}")
+    async def handle_failed_order(self, placed_order: Order, position_qty: float, intended_order: IntendedOrder):
+        log(f"Order {placed_order.id} failed with status {placed_order.status}")
         # Implement logic to handle failed orders (e.g., retry, adjust strategy, etc.)
+        
 
     def recalculate_balance(self, placed_order: Order, intended_order: IntendedOrder):
         # Recalculate balance based on the filled order
@@ -707,13 +761,15 @@ class LiveTrader:
             self.balance -= filled_value
         else:
             self.balance += filled_value
-        self.log(f"Updated balance: {self.balance}")
-        
+        log(f"Updated balance: {self.balance}")
+    
+    
+    # NOTE: NO LONGER DOING LIMIT ORDERS
         
     # async def place_order(self, side, qty, order_type=OrderType.MARKET, limit_price=None):
     #     try:
     #         if not self.is_market_open():
-    #             self.log("Market is closed. Cannot place order.")
+    #             log("Market is closed. Cannot place order.")
     #             return
 
     #         order_data = MarketOrderRequest(
@@ -729,14 +785,14 @@ class LiveTrader:
 
     #         if self.validate_order(order_data):
     #             order = self.trading_client.submit_order(order_data)
-    #             self.log(f"Placed {side} order for {qty} shares of {self.symbol}")
+    #             log(f"Placed {side} order for {qty} shares of {self.symbol}")
     #             return order
     #         else:
-    #             self.log("Order validation failed", logging.WARNING)
+    #             log("Order validation failed", logging.WARNING)
     #             return None
 
     #     except Exception as e:
-    #         self.log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
+    #         log(f"{type(e).__qualname__} placing order: {e}", logging.ERROR)
 
     def validate_order(self, order_data):
         # Implement order validation logic
@@ -780,6 +836,8 @@ class LiveTrader:
         
                 self.data_stream.subscribe_quotes(self.on_quote, self.symbol)
                 
+                self.data_stream.subscribe_trades(self.on_trade, self.symbol)
+                
                 self.trading_stream.subscribe_trade_updates
                 
                 
@@ -789,7 +847,7 @@ class LiveTrader:
                 while self.is_market_open():
                     await asyncio.sleep(1)
                 
-                self.log("Market closed. Stopping data stream.")
+                log("Market closed. Stopping data stream.")
                 await self.close()
                 self.data_stream.unsubscribe_bars(self.symbol)
                 
@@ -801,11 +859,11 @@ class LiveTrader:
                 # except asyncio.CancelledError:
                 #     pass
                 
-                self.log("Waiting for next trading day...")
+                log("Waiting for next trading day...")
                 await asyncio.sleep(2)  # Wait a minute before checking market open status again
 
         except Exception as e:
-            self.log(f"{type(e).__qualname__} in run: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} in run: {e}", logging.ERROR)
             raise e
 
     async def close(self):
@@ -827,13 +885,15 @@ class LiveTrader:
         end = datetime.combine(current_date + timedelta(days=1), time(0, 0)).replace(tzinfo=self.ny_tz)
         
         day_data = self.get_historical_bars(start, end)
+        # day_data_adjusted = self.get_historical_bars(start, end, adjustment=Adjustment.ALL)
         
         if day_data.empty:
-            self.log(f"No data available for {current_date}")
+            log(f"No data available for {current_date}")
             return
         
         # Initialize data with the first minute
-        self.data = day_data.iloc[:2]
+        self.bars = day_data.iloc[:2]
+        # self.bars_adjusted = day_data_adjusted.iloc[:2]
         
         # reset data logic
         self.trading_strategy = TradingStrategy(self.calculate_touch_detection_area(), self.strategy_params, is_live_trading=True)
@@ -843,10 +903,10 @@ class LiveTrader:
         
         # Simulate each minute of the day
         for timestamp in tqdm(day_data.index.get_level_values('timestamp')[2:]):
-            # self.log(timestamp)
-            # Update self.data with all rows up to and including the current timestamp
-            self.data = day_data.loc[day_data.index.get_level_values('timestamp') <= timestamp]
-            self.last_historical_timestamp = self.data.index.get_level_values('timestamp')[-1]
+            # log(timestamp)
+            # Update self.bars with all rows up to and including the current timestamp
+            self.bars = day_data.loc[day_data.index.get_level_values('timestamp') <= timestamp]
+            self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
             
             await self.simulate_bar()
             
@@ -862,11 +922,11 @@ class LiveTrader:
             if timestamp.time() >= time(16,0):
                 break
             
-        # self.log(f"Printing areas for {current_date}", level=logging.WARNING)
+        # log(f"Printing areas for {current_date}", level=logging.WARNING)
         # TouchArea.print_areas_list(self.trading_strategy.touch_area_collection.active_date_areas) # print if in log level
-        self.log(f"terminated areas on {current_date}: {sorted(self.area_ids_to_remove[current_date])}", level=logging.WARNING)
+        log(f"terminated areas on {current_date}: {sorted(self.area_ids_to_remove[current_date])}", level=logging.WARNING)
         
-        self.log(f"Completed simulation for {current_date}")
+        log(f"Completed simulation for {current_date}")
         
         # return self.trading_strategy.generate_backtest_results(self.trades)
         
@@ -875,9 +935,10 @@ import tracemalloc
 tracemalloc.start()
 
 async def main():
-    symbol = "AMZN"
-    # initial_balance = 10000
-    initial_balance = 10103.889074410155
+    # symbol = "AMZN"
+    symbol = "AAPL"
+    initial_balance = 10000
+    # initial_balance = 10103.889074410155
     
     simulation_mode = True  # Set this to True for simulation, False for live trading
 
@@ -893,7 +954,10 @@ async def main():
         # end_time='11:20',
         use_median=True,
         touch_area_width_agg=np_median,
-        rolling_avg_decay_rate=0.85
+
+        ema_span=12,
+        price_ema_span=26
+        
     )
 
     strategy_params = StrategyParameters(
@@ -917,7 +981,8 @@ async def main():
         # await trader.run()
         
         
-        date_to_simulate = date(2024, 8, 20)
+        # date_to_simulate = date(2024, 8, 20)
+        date_to_simulate = date(2024, 9, 4)
         results = await trader.run_day_sim(date_to_simulate)
         print(results)
         

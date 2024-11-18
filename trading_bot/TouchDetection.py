@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from TouchArea import TouchArea
 from MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data
+import TouchDetectionParameters
 from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
 
 import logging
@@ -72,7 +73,7 @@ def setup_logger(log_level=logging.INFO):
 logger = setup_logger(logging.WARNING)
 
 def log(message, level=logging.INFO):
-    logger.log(level, message)
+    logger.log(level, message, exc_info=level >= logging.ERROR)
 
 
 
@@ -147,20 +148,18 @@ def calculate_dynamic_central_value(df:pd.DataFrame, ema_short=9, ema_long=20):
     
     #45
     span = 26 # span of 26 = 9.006468342000588min
-    alpha = 2 / (span + 1)
-    halflife = np.log(2) / np.log(1 / (1 - alpha))
-    halflife_str = f"{halflife}min"
+    # alpha = 2 / (span + 1)
+    # halflife = np.log(2) / np.log(1 / (1 - alpha))
+    # halflife_str = f"{halflife}min"
 
     df['central_value'] = df['close'].ewm(
         # halflife=halflife_str,
         span=span,
         # times=df.index.get_level_values('timestamp'),
-        # adjust=True
-        adjust=False
+        adjust=False # adjust=False -> EMA
     ).mean()
-    # df['central_value'] = (df['vwap'] + df['central_value']*2) / 3
 
-def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: int = None, adjust=True):
+def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: int = None, adjust=False):
     """
     A generic EMA calculation function with an optional cutoff.
     
@@ -169,7 +168,7 @@ def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: i
     field (str): The column on which to apply the EMA.
     span (int): Span for the EMA calculation.
     window (int, optional): The number of periods to use as a cutoff. If None, no cutoff is applied.
-    adjust (bool): Adjust parameter for the .ewm function (default True).
+    adjust (bool): Adjust parameter for the .ewm function (default False for recursive calculation).
     
     Returns:
     pd.Series: EMA values for the specified field.
@@ -377,7 +376,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                                    current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
     def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
-            logger.log(level, message)
+            logger.log(level, message, exc_info=level >= logging.ERROR)
     
     """
     Calculates touch detection areas for a given stock symbol based on historical price data and volatility.
@@ -404,7 +403,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
     customization of the analysis parameters. The resulting touch areas can be used for trading strategies
     or further market analysis.
     """
-    if isinstance(params, BacktestTouchDetectionParameters):
+    if isinstance(params, TouchDetectionParameters.BacktestTouchDetectionParameters):
         assert params.end_date > params.start_date
 
         # Alpaca API setup
@@ -426,7 +425,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         else:
             raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
-    elif isinstance(params, LiveTouchDetectionParameters):
+    elif isinstance(params, TouchDetectionParameters.LiveTouchDetectionParameters):
         if live_bars is None:
             raise ValueError("Live bars data must be provided for live trading parameters")
         df = live_bars
@@ -434,6 +433,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         raw_df = None
         aggregated_df = None
     else:
+        # print(type(params))
+        # print(isinstance(params, BacktestTouchDetectionParameters))
+        # print(isinstance(params, TouchDetectionParameters.BacktestTouchDetectionParameters))
         raise ValueError("Invalid parameter type")
     
     try:
