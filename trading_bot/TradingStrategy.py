@@ -8,7 +8,7 @@ import pandas as pd
 import math
 from TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from TouchArea import TouchArea, TouchAreaCollection
-from TradePosition2 import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price
+from TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
