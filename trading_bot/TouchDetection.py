@@ -21,10 +21,13 @@ from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 from tqdm import tqdm
 
-from TouchArea import TouchArea
-from MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data
-import TouchDetectionParameters
-from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
+import trading_bot.TouchDetectionParameters
+from trading_bot.TradePosition import TradePosition
+from trading_bot.TouchArea import TouchArea
+from trading_bot.MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data
+from trading_bot.TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
+
+import trading_bot
 
 import logging
 import traceback
@@ -183,6 +186,110 @@ def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: i
         return df[field].ewm(span=span, adjust=adjust).mean()
     
 
+
+def calculate_macd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd.Series, 
+                  fast=12, slow=26, signal=9, hist_ema_span=3, rsi_period=14, rsi_ema_span=3, 
+                  mfi_period=14, mfi_ema_span=3):
+    """
+    Calculate MACD, Signal Line, Smoothed MACD Histogram, Histogram ROC, Smoothed RSI, and MFI.
+
+    Parameters:
+    - close: pd.Series, the close prices
+    - high: pd.Series, the high prices
+    - low: pd.Series, the low prices
+    - volume: pd.Series, the volume data
+    - fast: int, the period for the fast EMA (default 12)
+    - slow: int, the period for the slow EMA (default 26)
+    - signal: int, the period for the signal line EMA (default 9)
+    - rsi_period: int, period for RSI calculation (default 14)
+    - mfi_period: int, period for MFI calculation (default 14)
+    - hist_ema_span: int, span for smoothing the MACD histogram (default 3)
+    - rsi_ema_span: int, span for smoothing the RSI (default 3)
+    - mfi_ema_span: int, span for smoothing the MFI (default 3)
+
+    Returns:
+    - pd.DataFrame: A DataFrame with columns ['MACD', 'MACD_signal', 'MACD_hist', 'MACD_hist_roc', 'RSI', 'MFI'].
+    """
+    # Calculate typical price
+    typical_price = (high + low + close) / 3
+    
+    # Calculate raw money flow
+    raw_money_flow = typical_price * volume
+        
+    def calculate_mfi(tp: pd.Series, mf: pd.Series, period: int, smoothing: int):
+        # Calculate positive and negative money flow
+        delta = tp.diff()
+        
+        # Initialize as float series instead of int
+        positive_flow = pd.Series(0.0, index=tp.index)
+        negative_flow = pd.Series(0.0, index=tp.index)
+        
+        # Use loc for assignment to avoid dtype warning
+        positive_flow.loc[delta > 0] = mf[delta > 0]
+        negative_flow.loc[delta < 0] = mf[delta < 0]
+        
+        # Calculate money flow ratio
+        positive_mf = positive_flow.rolling(window=period).sum()
+        negative_mf = negative_flow.rolling(window=period).sum()
+        
+        # Avoid division by zero
+        money_ratio = np.where(negative_mf != 0, 
+                            positive_mf / negative_mf,
+                            np.inf)
+        
+        # Calculate MFI
+        mfi = 100 - (100 / (1 + money_ratio))
+        
+        # Apply smoothing
+        smoothed_mfi = pd.Series(mfi).ewm(span=smoothing, adjust=False).mean()
+        
+        return smoothed_mfi.fillna(50)  # Fill NaN values with 50
+
+    # MACD calculations (unchanged)
+    fast_ema = close.ewm(span=fast, adjust=False).mean()
+    slow_ema = close.ewm(span=slow, adjust=False).mean()
+    macd_line = fast_ema - slow_ema
+    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+    raw_hist = macd_line - macd_signal
+    macd_hist = raw_hist.ewm(span=hist_ema_span, adjust=False).mean()
+    macd_hist_roc = macd_hist.diff().fillna(0)
+
+    def calculate_rsi(series, period, smoothing):
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.fillna(50)  # Fill NaN RSI values with 50
+        # Apply smoothing
+        smoothed_rsi = rsi.ewm(span=smoothing, adjust=False).mean()
+        return smoothed_rsi
+
+    rsi = calculate_rsi(close, rsi_period, rsi_ema_span)
+    mfi = calculate_mfi(typical_price, raw_money_flow, mfi_period, mfi_ema_span)
+    
+    # Calculate ROC for both RSI and MFI
+    rsi_roc = rsi.diff().fillna(0)
+    mfi_roc = mfi.diff().fillna(0)
+    
+    mfi.index = rsi.index.copy()
+    mfi_roc.index = rsi.index.copy()
+
+    # Combine into a DataFrame
+    result = pd.DataFrame({
+        'MACD': macd_line.fillna(0),
+        'MACD_signal': macd_signal.fillna(0),
+        'MACD_hist': macd_hist.fillna(0),
+        'MACD_hist_roc': macd_hist_roc,
+        'RSI': rsi.fillna(50),
+        'RSI_roc': rsi_roc,
+        'MFI': mfi.fillna(50),
+        'MFI_roc': mfi_roc
+    })
+    return result
+
 @dataclass
 class Level:
     id: int
@@ -194,31 +301,16 @@ class Level:
 
 
 @jit(nopython=True)
-def np_searchsorted(a,b): # only used in calculate_touch_area function
+def np_searchsorted(a:np.ndarray,b:np.ndarray): # only used in calculate_touch_area function
     return np.searchsorted(a,b)
 
 
 @jit(nopython=True)
-def calculate_touch_area_bounds(atr_values, level, is_long, touch_area_width_agg, multiplier):
-    touch_area_width = touch_area_width_agg(atr_values) * multiplier
+def process_touches(touch_indices, prices, atrs, level, lmin, lmax, is_long, min_touches, touch_area_width_agg, calculate_bounds, multiplier):
     
-    # touch_area_low = level - (1 * touch_area_width / 3) if is_long else level - (2 * touch_area_width / 3)
-    # touch_area_high = level + (2 * touch_area_width / 3) if is_long else level + (1 * touch_area_width / 3)
-
-    # touch_area_low = level - (1 * touch_area_width / 2) if is_long else level - (1 * touch_area_width / 2)
-    # touch_area_high = level + (1 * touch_area_width / 2) if is_long else level + (1 * touch_area_width / 2)
+    # NOTE: touches, prices, atrs are all filtered
     
-    if is_long:
-        touch_area_low = level - (2 * touch_area_width / 3)
-        touch_area_high = level + (1 * touch_area_width / 3)
-    else:
-        touch_area_low = level - (1 * touch_area_width / 3)
-        touch_area_high = level + (2 * touch_area_width / 3)
-    return touch_area_width, touch_area_low, touch_area_high
-
-@jit(nopython=True)
-def process_touches(touches, prices, atrs, level, lmin, lmax, is_long, min_touches, touch_area_width_agg, multiplier):
-    consecutive_touches = np.full(min_touches, -1, dtype=np.int64)
+    consecutive_touch_indices = np.full(min_touches, -1, dtype=np.int64)
     count, width = 0, 0
     prev_price = None
     
@@ -231,26 +323,26 @@ def process_touches(touches, prices, atrs, level, lmin, lmax, is_long, min_touch
         if lmin <= price <= lmax:
             if is_touch:
                 # Update bounds after each touch
-                width, touch_area_low, touch_area_high = calculate_touch_area_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
+                width, touch_area_low, touch_area_high = calculate_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
                 if width > 0:
-                    consecutive_touches[count] = touches[i]
+                    consecutive_touch_indices[count] = touch_indices[i]
                     count += 1
                 
                     if count == min_touches:
-                        return consecutive_touches[consecutive_touches != -1], touch_area_low, touch_area_high
+                        return consecutive_touch_indices[consecutive_touch_indices != -1], touch_area_low, touch_area_high
                 
         elif width > 0:
             assert touch_area_high is not None and touch_area_low is not None
             buy_price = touch_area_high if is_long else touch_area_low
             if (is_long and price > buy_price) or (not is_long and price < buy_price):
-                consecutive_touches[:] = -1
+                consecutive_touch_indices[:] = -1
                 count = 0
         
         prev_price = price
     return np.empty(0, dtype=np.int64), touch_area_low, touch_area_high
 
 def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, df: pd.DataFrame, symbol, market_hours: Dict[date, Tuple[datetime, datetime]], min_touches, \
-    bid_buffer_pct, use_median, touch_area_width_agg: Callable, multiplier, start_time: datetime, end_time: datetime, current_timestamp: datetime=None):
+    use_median, touch_area_width_agg: Callable, calculate_bounds: Callable, multiplier, start_time: datetime, end_time: datetime):
     touch_areas = []
     widths = []
 
@@ -284,7 +376,7 @@ def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, d
             #     continue
             
             touch_timestamps_np = np.array([t.value for t in level.touches], dtype=np.int64)
-            touch_indices = np_searchsorted(day_timestamps_np, touch_timestamps_np)
+            touch_indices = np.searchsorted(day_timestamps_np, touch_timestamps_np)
             
             valid_mask = (day_timestamps[touch_indices] >= day_start_time) & (day_timestamps[touch_indices] < day_end_time)
             valid_touch_indices = touch_indices[valid_mask]
@@ -305,6 +397,7 @@ def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, d
                 is_long, 
                 min_touches,
                 touch_area_width_agg,
+                calculate_bounds,
                 multiplier
             )
             
@@ -322,16 +415,12 @@ def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, d
                     touches=day_timestamps[valid_touch_indices],
                     is_long=is_long,
                     min_touches=min_touches,
-                    bid_buffer_pct=bid_buffer_pct,
                     valid_atr=valid_atr,
                     touch_area_width_agg=touch_area_width_agg,
+                    calculate_bounds=calculate_bounds,
                     multiplier=multiplier,
-                    calculate_bounds=calculate_touch_area_bounds
                 )
-                # log(f"CALC   area {touch_area.id} ({touch_area.min_touches_time.time()}): get_range {touch_area.get_range:.4f}")
-                # if current_timestamp is not None:
-                #     touch_area.update_bounds(current_timestamp)  # unnecessary?
-                #     log(f"updated to {touch_area.get_range:.4f}")
+
                 touch_areas.append(touch_area)
 
     return touch_areas, widths
@@ -351,7 +440,7 @@ class TouchDetectionAreas:
     min_touches: int
     start_time: Optional[time]
     end_time: Optional[time]
-
+    
     @classmethod
     def from_dict(cls, data: dict) -> 'TouchDetectionAreas':
         return cls(
@@ -373,7 +462,7 @@ class TouchDetectionAreas:
 
 def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, live_bars: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
-                                   current_timestamp: Optional[datetime] = None, area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
+                                   area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
     def log_live(message, level=logging.INFO):
         if isinstance(params, LiveTouchDetectionParameters):
             logger.log(level, message, exc_info=level >= logging.ERROR)
@@ -392,7 +481,6 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         - 'market_hours': Dictionary of market hours for each trading day
         - 'bars': DataFrame of price data
         - 'mask': Boolean mask for filtering data
-        - 'bid_buffer_pct': The bid buffer percentage used
         - 'min_touches': The minimum number of touches used
         - 'start_time': The start time used for analysis
         - 'end_time': The end time used for analysis
@@ -403,7 +491,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
     customization of the analysis parameters. The resulting touch areas can be used for trading strategies
     or further market analysis.
     """
-    if isinstance(params, TouchDetectionParameters.BacktestTouchDetectionParameters):
+    if isinstance(params, BacktestTouchDetectionParameters) or isinstance(params, trading_bot.TouchDetectionParameters.BacktestTouchDetectionParameters):
         assert params.end_date > params.start_date
 
         # Alpaca API setup
@@ -425,7 +513,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         else:
             raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
-    elif isinstance(params, TouchDetectionParameters.LiveTouchDetectionParameters):
+    elif isinstance(params, LiveTouchDetectionParameters) or isinstance(params, trading_bot.TouchDetectionParameters.LiveTouchDetectionParameters):
         if live_bars is None:
             raise ValueError("Live bars data must be provided for live trading parameters")
         df = live_bars
@@ -435,7 +523,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
     else:
         # print(type(params))
         # print(isinstance(params, BacktestTouchDetectionParameters))
-        # print(isinstance(params, TouchDetectionParameters.BacktestTouchDetectionParameters))
+        # print(isinstance(params, BacktestTouchDetectionParameters))
         raise ValueError("Invalid parameter type")
     
     try:
@@ -450,14 +538,51 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # calculate_dynamic_central_value(df, ema_short=9, ema_long=30) # default
         # calculate_dynamic_central_value(df)
         
+        
+        # df['MACD'], df['MACD_signal'], df['MACD_Hist'] = ta.macd(df['close'], fast=5, slow=13, signal=4)
+        
+        # 'MACD': macd_line,
+        # 'MACD_signal': signal_line,
+        # 'MACD_hist': macd_histogram,
+        # 'MACD_hist_roc': histogram_roc
+        # 'RSI': rsi,
+
+        # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=13, rsi_ema_span=3)
+        # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=8, rsi_ema_span=3)
+        # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=3)
+        # macd_df = calculate_macd(df['close'], df['high'], df['low'], df['volume'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=5, mfi_period=5, mfi_span=5) # 5 and 5 for RSI seems best
+        # macd_df = calculate_macd(df['close'], df['high'], df['low'], df['volume'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=5, mfi_period=5, mfi_span=5)
+        # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=4)
+        # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=6)
+                
+        macd_df = calculate_macd(
+            df['close'], df['high'], df['low'], df['volume'],
+            fast=5, slow=13, signal=4,
+            hist_ema_span=5,
+            # rsi_period=5, 
+            rsi_period=9,        # Increased from 5
+            rsi_ema_span=3,
+            # rsi_ema_span=3,      # Reduced from 5
+            # mfi_period=5,
+            mfi_period=9,
+            # mfi_period=14,       # Increased from 5
+            mfi_ema_span=3
+            # mfi_ema_span=4          # Slightly reduced from 5
+        )
+        
+        # print(macd_df)
+        
+        df = pd.concat([df, macd_df],axis=1)
+        # print(df)
+        
         df['central_value'] = (df['vwap'] + calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span) * 2) / 3
-        df['is_res'] = df['close'] >= df['central_value']
+        df['is_res'] = df['close'] >= df['central_value'] # if is_res, trade long
 
         # Calculate True Range (TR)
-        df['H-L'] = df['high'] - df['low']
-        df['H-PC'] = np.abs(df['high'] - df['close'].shift(1))
-        df['L-PC'] = np.abs(df['low'] - df['close'].shift(1))
-        df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        df['H_L'] = df['high'] - df['low']
+        df['H_PC'] = np.abs(df['high'] - df['close'].shift(1))
+        df['L_PC'] = np.abs(df['low'] - df['close'].shift(1))
+        df['TR'] = df[['H_L', 'H_PC', 'L_PC']].max(axis=1)
         
         
         df['ATR'] = calculate_ema_with_cutoff(df, 'TR', span=params.ema_span) # , window=params.atr_period
@@ -470,7 +595,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # your strategy to be less affected by occasional spikes in activity.
         
         # Calculate rolling average volume and trade count
-        df['shares_per_trade'] = df['volume'] / df['trade_count']
+        # df['shares_per_trade'] = df['volume'] / df['trade_count']
         df['avg_volume'] = calculate_ema_with_cutoff(df, 'volume', span=params.ema_span) # , window=params.level1_period
         df['avg_trade_count'] = calculate_ema_with_cutoff(df, 'trade_count', span=params.ema_span) # , window=params.level1_period
         
@@ -481,6 +606,13 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         df['log_return'] = np.log(df['close'] / df['close'].shift(1))
         df['volatility'] = df['log_return'].rolling(window=15).std().fillna(0)
+            
+        # Narrow Range calculations
+        df['rolling_range_min_4'] = df['H_L'].rolling(window=4, min_periods=1).min()
+        df['rolling_range_min_7'] = df['H_L'].rolling(window=7, min_periods=1).min()
+        
+        # Add ATR-based calculations
+        df['rolling_ATR'] = df['ATR'].rolling(window=15, min_periods=1).mean()
         
         # Group data by date
         grouped = df.groupby(timestamps.date)
@@ -585,18 +717,18 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         long_touch_area, long_widths = calculate_touch_area(
             all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
-            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+            params.use_median, params.touch_area_width_agg, params.calculate_bounds, params.multiplier, start_time, end_time
         )
         log_live(f'{len(long_touch_area)} Long touch areas calculated')
         short_touch_area, short_widths = calculate_touch_area(
             all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
-            params.bid_buffer_pct, params.use_median, params.touch_area_width_agg, params.multiplier, start_time, end_time, current_timestamp
+            params.use_median, params.touch_area_width_agg, params.calculate_bounds, params.multiplier, start_time, end_time
         )
         log_live(f'{len(short_touch_area)} Short touch areas calculated')
             
         # widths = long_widths + short_widths
 
-        df = df.drop(columns=['H-L','H-PC','L-PC','TR','ATR','MTR'])
+        df = df.drop(columns=['H_PC','L_PC','TR']) # 'H_L',  ,'ATR','MTR'
         
         ret = {
             'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,
@@ -608,11 +740,9 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'quotes_raw': raw_df,
             'quotes_agg': aggregated_df,
             'mask': final_mask,
-            # 'bid_buffer_pct': params.bid_buffer_pct,
             'min_touches': params.min_touches,
             'start_time': start_time,
             'end_time': end_time,
-            # 'use_median': params.use_median
         }
         return TouchDetectionAreas.from_dict(ret) # , high_low_diffs_list
         
@@ -621,7 +751,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         raise e
 
 
-def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None, filter_date=None, filter_areas=None):
+def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_start_date=None, zoom_end_date=None, save_path=None, filter_date=None, filter_areas=None, 
+                               trades: List[TradePosition] = None, rsi_overbought = 70, rsi_oversold = 30, mfi_overbought = 80, mfi_oversold = 20):
     """
     Visualizes touch detection areas and price data on a chart.
 
@@ -642,29 +773,206 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     df = touch_detection_areas.bars
     df_adjusted = touch_detection_areas.bars_adjusted
     mask = touch_detection_areas.mask
-    # bid_buffer_pct = touch_detection_areas.bid_buffer_pct
     min_touches = touch_detection_areas.min_touches
     start_time = touch_detection_areas.start_time
     end_time = touch_detection_areas.end_time
     # use_median = touch_detection_areas.use_median
-    
-    
-    plt.figure(figsize=(14, 7))
-    if not filter_date:
-        plt.plot(df.index.get_level_values('timestamp'), df['central_value'], label='central_value', color='yellow')
-        plt.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue')
-    else:
+
+    # plt.figure(figsize=(14, 7))
+    # Create figure with 3 subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 14), height_ratios=[3, 1, 1], sharex=True)
+    plt.subplots_adjust(hspace=0.05)
+
+    if filter_date:
         df = df.loc[df.index.get_level_values('timestamp').date == filter_date]
         mask = mask.loc[mask.index.get_level_values('timestamp').date == filter_date]
-        plt.plot(df.index.get_level_values('timestamp'), df['central_value'], label='central_value', color='yellow')
-        plt.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue')
+    
+    # Main price plot (ax1)
+    ax1.plot(df.index.get_level_values('timestamp'), df['central_value'], label='Central Value', color='yellow', linewidth=1)
+    ax1.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue', linewidth=1)
+            
+    # MACD plot with ROC (ax2)
+    ax2_twin = ax2.twinx()
+    timestamps = df.index.get_level_values('timestamp')
+    
+    # Get the values for both metrics
+    macd_hist = df['MACD_hist'].values
+    macd_roc = df['MACD_hist_roc'].values
+    
+    # Create line plots for both metrics
+    macd_line = ax2.plot(timestamps, macd_hist, label='MACD Hist', color='purple', linewidth=1)
+    roc_line = ax2_twin.plot(timestamps, macd_roc, label='MACD Hist RoC', color='orange', linewidth=1)
+    
+    # Add zero lines
+    ax2.axhline(y=0, color='black', linestyle=':', alpha=0.3)
+    ax2_twin.axhline(y=0, color='black', linestyle=':', alpha=0.3)
+    
+    # Set labels and colors
+    ax2.set_ylabel('MACD Histogram', color='purple')
+    ax2.tick_params(axis='y', labelcolor='purple')
+    ax2_twin.set_ylabel('MACD Rate of Change', color='orange')
+    ax2_twin.tick_params(axis='y', labelcolor='orange')
+    
+    # Align zero lines for both y-axes
+    left_ylim = ax2.get_ylim()
+    right_ylim = ax2_twin.get_ylim()
+    left_range = left_ylim[1] - left_ylim[0]
+    right_range = right_ylim[1] - right_ylim[0]
+    
+    left_zero_pos = -left_ylim[0] / left_range
+    right_zero_pos = -right_ylim[0] / right_range
+    
+    if left_zero_pos < right_zero_pos:
+        # Adjust right axis
+        new_bottom = -right_ylim[1] * left_zero_pos / (1 - left_zero_pos)
+        ax2_twin.set_ylim(new_bottom, right_ylim[1])
+    else:
+        # Adjust left axis
+        new_bottom = -left_ylim[1] * right_zero_pos / (1 - right_zero_pos)
+        ax2.set_ylim(new_bottom, left_ylim[1])
+    
+    # Add combined legend
+    lines = macd_line + roc_line
+    labels = [l.get_label() for l in lines]
+    ax2.legend(lines, labels, loc='upper left')
+    ax2.grid(True)
+    
+    # RSI and MFI plot (ax3)
+    ax3_twin = ax3.twinx()
+    
+    # Plot RSI on left axis
+    ax3.plot(df.index.get_level_values('timestamp'), df['RSI'], label='RSI', color='purple', linewidth=1)
+    ax3.axhline(y=rsi_overbought, color='purple', linestyle=':', alpha=0.3, label='RSI Overbought')
+    ax3.axhline(y=rsi_oversold, color='purple', linestyle=':', alpha=0.3, label='RSI Oversold')
+    ax3.axhline(y=50, color='black', linestyle=':', alpha=0.3)
+    ax3.set_ylim(0, 100)
+    ax3.set_ylabel('RSI', color='purple')
+    ax3.tick_params(axis='y', labelcolor='purple')
+    
+    # Plot MFI on right axis
+    ax3_twin.plot(df.index.get_level_values('timestamp'), df['MFI'], label='MFI', color='orange', linewidth=1)
+    ax3_twin.axhline(y=mfi_overbought, color='orange', linestyle=':', alpha=0.3, label='MFI Overbought')
+    ax3_twin.axhline(y=mfi_oversold, color='orange', linestyle=':', alpha=0.3, label='MFI Oversold')
+    ax3_twin.set_ylim(0, 100)
+    ax3_twin.set_ylabel('MFI', color='orange')
+    ax3_twin.tick_params(axis='y', labelcolor='orange')
+    
+    # Combine legends from both axes
+    lines_rsi, labels_rsi = ax3.get_legend_handles_labels()
+    lines_mfi, labels_mfi = ax3_twin.get_legend_handles_labels()
+    # ax3.legend(lines_rsi + lines_mfi, labels_rsi + labels_mfi, loc='upper left')
+    ax3.legend().remove()
+    
+    # Keep grid only on the main axis
+    ax3.grid(True)
+    
+    # Helper function to plot trade markers
+    def plot_trade_markers(ax, ax_twin, y_value, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=False, custom_marker=None):
+        if ax_twin:
+            axes = [ax, ax_twin]
+            zorder_value = 100
+        else:
+            axes = [ax]
+            zorder_value = 10
+        
+        for plot_ax in axes:
+            if long_entries:
+                times, _, ids = zip(*long_entries)
+                colors = ['lime' if iswin else 'orangered' for iswin in long_iswin]
+                plot_ax.scatter(times, [y_value] * len(times), c=colors, marker='+' if custom_marker is None else custom_marker,
+                            s=30, zorder=zorder_value, alpha=1)
+                if plot_ids and plot_ax == ax:  # Only plot IDs once, on the main axis
+                    for time, trade_id in zip(times, ids):
+                        plot_ax.text(time, y_value, str(trade_id), fontsize=8,
+                                horizontalalignment='right', verticalalignment='bottom',
+                                color='black', zorder=zorder_value)
+            
+            if long_exits:
+                times, _, _ = zip(*long_exits)
+                colors = ['lime' if iswin else 'orangered' for iswin in long_iswin]
+                plot_ax.scatter(times, [y_value] * len(times), c=colors, marker='x' if custom_marker is None else custom_marker,
+                            s=30, zorder=zorder_value, alpha=1)
+            
+            if short_entries:
+                times, _, ids = zip(*short_entries)
+                colors = ['lime' if iswin else 'orangered' for iswin in short_iswin]
+                plot_ax.scatter(times, [y_value] * len(times), c=colors, marker='+' if custom_marker is None else custom_marker,
+                            s=30, zorder=zorder_value, alpha=1)
+                if plot_ids and plot_ax == ax:  # Only plot IDs once, on the main axis
+                    for time, trade_id in zip(times, ids):
+                        plot_ax.text(time, y_value, str(trade_id), fontsize=8,
+                                horizontalalignment='right', verticalalignment='top',
+                                color='black', zorder=zorder_value)
+            
+            if short_exits:
+                times, _, _ = zip(*short_exits)
+                colors = ['lime' if iswin else 'orangered' for iswin in short_iswin]
+                plot_ax.scatter(times, [y_value] * len(times), c=colors, marker='x' if custom_marker is None else custom_marker,
+                            s=30, zorder=zorder_value, alpha=1)
 
+    if trades:
+        # Collect trade points with IDs
+        long_entries = [(t.entry_time, df.loc[df.index.get_level_values('timestamp') == t.entry_time, 'close'].iloc[0], t.id) 
+                       for t in trades if t.is_long]
+        long_exits = [(t.exit_time, df.loc[df.index.get_level_values('timestamp') == t.exit_time, 'close'].iloc[0], t.id) 
+                     for t in trades if t.is_long]
+        long_iswin = [t.pl > 0 for t in trades if t.is_long]
+        
+        # print(pd.Series(long_iswin).value_counts())
+        
+        short_entries = [(t.entry_time, df.loc[df.index.get_level_values('timestamp') == t.entry_time, 'close'].iloc[0], t.id) 
+                        for t in trades if not t.is_long]
+        short_exits = [(t.exit_time, df.loc[df.index.get_level_values('timestamp') == t.exit_time, 'close'].iloc[0], t.id) 
+                      for t in trades if not t.is_long]
+        short_iswin = [t.pl > 0 for t in trades if not t.is_long]
+        
+        # print(pd.Series(short_iswin).value_counts())
+        if long_iswin:
+            long_colors = ['lime' if iswin else 'orangered' for iswin in long_iswin]
+        if short_iswin:
+            short_colors = ['lime' if iswin else 'orangered' for iswin in short_iswin]
+        # Plot on price chart (ax1)
+        if long_entries:
+            times, prices, ids = zip(*long_entries)
+            ax1.scatter(times, prices, c=long_colors, marker='+', s=30, label='Long Entry', 
+                       zorder=5, alpha=1)
+            for time, price, trade_id in zip(times, prices, ids):
+                ax1.text(time, price, str(trade_id), fontsize=8,
+                        horizontalalignment='right', verticalalignment='bottom',
+                        color='black', zorder=5)
+        
+        if long_exits:
+            times, prices, _ = zip(*long_exits)
+            ax1.scatter(times, prices, c=long_colors, marker='x', s=30, label='Long Exit', 
+                       zorder=5, alpha=1)
+            
+        if short_entries:
+            times, prices, ids = zip(*short_entries)
+            ax1.scatter(times, prices, c=short_colors, marker='+', s=30, label='Short Entry', 
+                       zorder=5, alpha=1)
+            for time, price, trade_id in zip(times, prices, ids):
+                ax1.text(time, price, str(trade_id), fontsize=8,
+                        horizontalalignment='right', verticalalignment='top',
+                        color='black', zorder=5)
+            
+        if short_exits:
+            times, prices, _ = zip(*short_exits)
+            ax1.scatter(times, prices, c=short_colors, marker='x', s=30, label='Short Exit', 
+                       zorder=5, alpha=1)
+        
+        # Plot on MACD chart (ax2)
+        plot_trade_markers(ax2, ax2_twin, 0, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True) # , custom_marker='.'
+        
+        # Plot on RSI chart (ax3)
+        plot_trade_markers(ax3, ax3_twin, 50, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True)
+        
+        
     df = df[mask]
     timestamps = df.index.get_level_values('timestamp')
     
 
     # Prepare data structures for combined plotting
-    scatter_data = defaultdict(lambda: defaultdict(list))
+    # scatter_data = defaultdict(lambda: defaultdict(list))
     fill_between_data = defaultdict(list)
     line_data = defaultdict(list)
 
@@ -741,8 +1049,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                 if filter_areas and filter_areas[current_date] and area.id not in filter_areas[current_date]:
                     continue
                         
-                scatter_color = 'gray' if i != min_touches - 1 else 'red' if end_idx == start_idx else 'blue'
-                scatter_data[scatter_color][mark_shape].append((touch_time, mark_pos))
+                # scatter_color = 'gray' if i != min_touches - 1 else 'red' if end_idx == start_idx else 'blue'
+                # scatter_data[scatter_color][mark_shape].append((touch_time, mark_pos))
                 
                 if i == 0:  # first touch
                     fill_between_data[color].append((x1 + x2, [area.lower_bound] * 4, [area.upper_bound] * 4))
@@ -754,32 +1062,31 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
         if not filter_date or area.date == filter_date:
             process_area(area)
 
-    # Plot combined data
-    for color, shape_data in scatter_data.items():
-        for shape, points in shape_data.items():
-            if points:
-                x, y = zip(*points)
-                plt.scatter(x, y, color=color, s=12, marker=shape)
+    # # Plot combined data on ax1 instead of plt
+    # for color, shape_data in scatter_data.items():
+    #     for shape, points in shape_data.items():
+    #         if points:
+    #             x, y = zip(*points)
+    #             ax1.scatter(x, y, color=color, s=12, marker=shape)
 
     for color, data in fill_between_data.items():
         for x, lower, upper in data:
-            plt.fill_between(x[:2], lower[:2], upper[:2], color=color, alpha=0.1)
-            plt.fill_between(x[2:], lower[2:], upper[2:], color=color, alpha=0.25)
+            ax1.fill_between(x[:2], lower[:2], upper[:2], color=color, alpha=0.1)
+            ax1.fill_between(x[2:], lower[2:], upper[2:], color=color, alpha=0.25)
 
     for color, data in line_data.items():
         for x, y in data:
             if color == 'blue_alpha':
-                plt.plot(x, y, color='blue', linestyle='-', alpha=0.20)
+                ax1.plot(x, y, color='blue', linestyle='-', alpha=0.20)
             else:
-                plt.plot(x, y, color='blue', linestyle='-')
+                ax1.plot(x, y, color='blue', linestyle='-')
 
-    plt.title(f'{symbol} Price Chart with Touch Detection Areas')
-    plt.xlabel('Date')
-    plt.ylabel('Price')
-    # plt.legend(['Close Price', 'Long Touch Area', 'Short Touch Area'])
-    plt.legend().remove()
-    plt.grid(True)
+    ax1.set_title(f'{symbol} Price Chart with Touch Detection Areas')
+    ax1.set_ylabel('Price')
+    ax1.legend().remove()
+    ax1.grid(True)
 
+    # Set x-axis limits for all subplots
     if zoom_start_date:
         zstart = pd.to_datetime(zoom_start_date)
         zstart = zstart.tz_localize(ny_tz) if zstart.tz is None else zstart.tz_convert(ny_tz)
@@ -791,26 +1098,23 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
         zend = zend.tz_localize(ny_tz) if zend.tz is None else zend.tz_convert(ny_tz)
     else:
         zend = timestamps[-1]
-        
-    # print(zstart, zend)
 
-    plt.xlim(max(zstart, timestamps[0]), min(zend, timestamps[-1]))
+    ax1.set_xlim(max(zstart, timestamps[0]), min(zend, timestamps[-1]))
 
+    # Set y-axis limits for price plot
     ymin, ymax = 0, -1
     for i in range(len(timestamps)):
         if timestamps[i] >= zstart:
-            # print(timestamps[i])
             ymin = i-1
             break
     for i in range(len(timestamps)):
         if timestamps[i] >= zend:
-            # print(timestamps[i])
             ymax = i
             break
     ys = df['close'].iloc[max(ymin, 0):min(ymax, len(df))]
-    plt.ylim(min(ys),max(ys))
+    ax1.set_ylim(min(ys), max(ys))
     
     if save_path:
         plt.savefig(save_path)
-
+        
     plt.show()

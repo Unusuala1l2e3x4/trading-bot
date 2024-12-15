@@ -12,6 +12,8 @@ dependencies:
     - ipykernel
     - alpaca-trade-api
     - alpaca-py
+    - statsmodels
+    - scikit-learn
     - toml
     - matplotlib
     - tqdm
@@ -20,3 +22,4 @@ dependencies:
     - line_profiler
     - snakeviz
     - seaborn
+    - pydeps

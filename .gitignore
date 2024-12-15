@@ -4,10 +4,12 @@ __pycache__/
 *.toml
 *.url
 *.csv
+*.tsv
 *.xlsx
 *.zip
 *.txt
 *.png
+*.svg
 *.lnk
 *.pdf
 bars
@@ -15,3 +17,7 @@ quotes
 quotes2
 documentation/outdated docs
 trading_bot/reject
+
+trading_bot/trading_bot.egg-info/PKG-INFO
+trading_bot.egg-info/PKG-INFO
+setup.py

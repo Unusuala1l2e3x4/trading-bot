@@ -6,6 +6,9 @@ from itertools import takewhile
 from numba import jit
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Callable, Set
+import copy
+
+from TypedBarData import TypedBarData
 
 import logging
 def setup_logger(log_level=logging.INFO):
@@ -49,13 +52,15 @@ class TouchArea:
     touches: List[datetime] # should be sorted
     is_long: bool
     min_touches: int
-    bid_buffer_pct: float
     valid_atr: np.ndarray
     touch_area_width_agg: Callable
-    multiplier: float
     calculate_bounds: Callable
+    multiplier: float
+    is_side_switched: bool = False
+    bar_at_switch: TypedBarData = None
     min_touches_time: datetime = field(init=False)
     entries_exits: List[EntryExit] = field(default_factory=list)
+    
         
     def __post_init__(self):
         assert self.min_touches > 1, f'{self.min_touches} > 1'
@@ -104,7 +109,6 @@ class TouchArea:
     
     @property
     def get_buy_price(self) -> float:
-        # return self.upper_bound * (1 + self.bid_buffer_pct / 100) if self.is_long else self.lower_bound * (1 - self.bid_buffer_pct / 100)
         return self.upper_bound if self.is_long else self.lower_bound
     
     @property
@@ -121,12 +125,20 @@ class TouchArea:
     def get_range(self) -> float:
         return self.upper_bound - self.lower_bound
     
-    # def terminate(self, touch_area_collection):
-    #     # print(self.id,self.entries_exits[0][2],len([touch for touch in self.touches if touch <= self.entries_exits[0][2]]),self.get_range,'\n')
-    #     touch_area_collection.terminate_area(self)
-    
     def current_touches(self, current_timestamp: datetime):
         return [touch for touch in self.touches if touch <= current_timestamp]
+    
+    def switch_side(self, bar_at_switch=None): # , current_timestamp: datetime
+        if not self.is_side_switched:
+            self.is_long = not self.is_long
+            self.is_side_switched = True
+            self.bar_at_switch = bar_at_switch
+        
+    def reset_side(self): # , current_timestamp: datetime
+        if self.is_side_switched:
+            self.is_long = not self.is_long
+            self.is_side_switched = False
+            self.bar_at_switch = None
         
     def update_bounds(self, current_timestamp: datetime, monotonic_duration: Optional[int] = 0):        
         current_atr = self.valid_atr[:len(self.current_touches(current_timestamp))]
@@ -138,11 +150,9 @@ class TouchArea:
             self.touch_area_width_agg, 
             self.multiplier
         )
-        
         if self.lower_bound != new_lower_bound or self.upper_bound != new_upper_bound:
             self.lower_bound = new_lower_bound
             self.upper_bound = new_upper_bound
-            # print(self.id,current_timestamp,len(self.current_touches(current_timestamp)),self.get_range)
 
     @staticmethod
     def print_areas_list(arr):
@@ -162,6 +172,96 @@ class TouchArea:
                 # f"Profit={self.calculate_profit:.4f}"
                 )
 
+    def is_within_range(self, low: float, high: float) -> bool:
+        """
+        Check if this area's bounds lie completely within the given range.
+        """
+        if low > high:
+            high, low = low, high
+        return low <= self.lower_bound <= high and low <= self.upper_bound <= high # Better??? or amplifies gain or loss
+        # return low <= self.level <= high
+
+
+    def get_time_since_latest_touch(self, current_time: datetime, touches: List[datetime] = None) -> float:
+        """Return minutes since most recent touch before current_time"""
+        if touches is None:
+            touches = self.current_touches(current_time)
+        if not touches:
+            return float('inf')
+        return (current_time - touches[-1]).total_seconds() / 60
+
+    def get_time_since_min_touch(self, current_time: datetime) -> float: #
+        """Return minutes since min_touches was reached"""
+        if not self.min_touches_time or current_time <= self.min_touches_time:
+            return float('inf')
+        return (current_time - self.min_touches_time).total_seconds() / 60
+
+    def get_touch_formation_time(self) -> float: #
+        """Return minutes between first and min touch that made area active"""
+        if len(self.initial_touches) < self.min_touches:
+            return float('inf')
+        return (self.initial_touches[-1] - self.initial_touches[0]).total_seconds() / 60
+
+    def get_touch_density(self, current_time: datetime, touches: List[datetime] = None) -> float:
+        """Return touches per minute up to current_time"""
+        if touches is None:
+            touches = self.current_touches(current_time)
+        if not touches:
+            return 0.0
+        duration = (current_time - touches[0]).total_seconds() / 60
+        return len(touches) / duration if duration > 0 else 0.0
+
+    def get_touch_regularity(self, current_time: datetime, touches: List[datetime] = None) -> float:
+        """
+        Return coefficient of variation of time between touches.
+        Lower values indicate more regular spacing.
+        """
+        if touches is None:
+            touches = self.current_touches(current_time)
+        if len(touches) < 2:
+            return float('inf')
+            
+        intervals = np.array([(touches[i+1] - touches[i]).total_seconds() / 60 
+                            for i in range(len(touches)-1)])
+        return np.std(intervals) / np.mean(intervals) if np.mean(intervals) > 0 else float('inf')
+
+    def get_atr_trend(self, current_time: datetime, touches: List[datetime] = None) -> float:
+        """Return slope of ATR values over time (in minutes)"""
+        if touches is None:
+            touches = self.current_touches(current_time)
+        if len(touches) < 2:
+            return 0.0
+        
+        atr_values = self.valid_atr[:len(touches)]
+        time_intervals = np.array([(touch - touches[0]).total_seconds() / 60 
+                                 for touch in touches])
+        return np.polyfit(time_intervals, atr_values, 1)[0]
+
+    def get_metrics(self, current_time: datetime, prefix: str = '') -> dict:
+        """
+        Get all metrics for the area at current_time.
+        
+        Args:
+            current_time: Current timestamp
+            prefix: Optional prefix for metric names (e.g. 'exit_')
+            
+        Returns:
+            dict: Dictionary of metric names and their values
+        """
+        touches = self.current_touches(current_time)
+        
+        return {
+            f'{prefix}time_since_latest_touch': self.get_time_since_latest_touch(current_time, touches),
+            f'{prefix}time_since_min_touch': self.get_time_since_min_touch(current_time), #
+            f'{prefix}touch_formation_time': self.get_touch_formation_time(), #
+            f'{prefix}touch_density': self.get_touch_density(current_time, touches),
+            f'{prefix}touch_regularity': self.get_touch_regularity(current_time, touches),
+            f'{prefix}atr_trend': self.get_atr_trend(current_time, touches),
+            # f'{prefix}num_touches': len(touches), #
+            # f'{prefix}area_width': self.get_range, #
+        }
+        
+        
 @dataclass
 class TouchAreaCollection:
     touch_areas: List[TouchArea]
@@ -196,7 +296,16 @@ class TouchAreaCollection:
         if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
             return self.active_date_areas[index]
         return None
-
+    
+    def switch_side(self, area: TouchArea): # , current_timestamp: datetime
+        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+                            key=self.area_sort_key)
+        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+            self.active_date_areas[index].switch_side() # current_timestamp
+            return True
+        return False
+    
+    
     def add_open_position_area(self, area: TouchArea):
         index = bisect_left(self.active_date_areas, self.area_sort_key(area),
                             key=self.area_sort_key)
@@ -214,7 +323,7 @@ class TouchAreaCollection:
             return True
         return False
     
-    def get_active_areas(self, current_time: datetime):
+    def reset_active_areas(self, current_time: datetime):
         try:
             current_date = current_time.date()
             if current_date not in self.areas_by_date:
@@ -227,12 +336,13 @@ class TouchAreaCollection:
             if self.active_date is None or self.active_date != current_date: # change the date and get areas in that date
                 # log(f"2 {current_date} {current_time}")
                 self.active_date = current_date
-                self.active_date_areas = list(self.areas_by_date[self.active_date]) # get copy so that original isnt modified
+                # self.active_date_areas = self.areas_by_date[self.active_date]
+                self.active_date_areas = copy.deepcopy(self.areas_by_date[self.active_date]) # NOTE: gets copy so that original isnt modified
                 self.terminated_date_areas = list()
             
             # return list(takewhile(lambda area: area.min_touches_time <= current_time, self.active_date_areas)) # to enable area terminations without deleting the data
         except Exception as e:
-            log(f"{type(e).__qualname__} in get_active_areas at {current_time}: {e}", logging.ERROR)
+            log(f"{type(e).__qualname__} in reset_active_areas at {current_time}: {e}", logging.ERROR)
             raise e
         
     def terminate_area(self, area: TouchArea):
@@ -252,3 +362,49 @@ class TouchAreaCollection:
         except Exception as e:
             log(f"{type(e).__qualname__} in terminate_area: {e}", logging.ERROR)
             raise e
+
+
+    def remove_areas_in_range(self, low: float, high: float, current_time: datetime, other_areas_to_remove: List[TouchArea] = None) -> Set[int]:
+        """
+        Remove areas whose bounds lie completely within the given price range,
+        plus any additional areas specified. Only removes areas that were already active
+        by current_time (min_touches_time < current_time).
+        
+        Args:
+            low (float): Lower bound of range to check
+            high (float): Upper bound of range to check
+            current_time: Current timestamp in backtest
+            other_areas_to_remove: Optional list of additional areas to remove
+            
+        Returns:
+            List[int]: IDs of all removed areas
+        """
+        if not self.active_date_areas:
+            return []
+        
+        if low > high:
+            high, low = low, high
+            
+        other_ids_to_remove = {area.id for area in other_areas_to_remove} if other_areas_to_remove else set()
+        
+        remaining = []
+        removed_ids = set()
+        
+        for area in self.active_date_areas:
+            # Only consider removing areas that were active before current_time
+            if area.min_touches_time < current_time:
+            # if area.min_touches_time <= current_time:
+                area.update_bounds(current_time) # added, need to test
+                if area.is_within_range(low, high) or area.id in other_ids_to_remove:
+                    removed_ids.add(area.id)
+                    self.terminated_date_areas.append(area)
+                else:
+                    remaining.append(area)
+            else:
+                # Keep areas that haven't become active yet
+                remaining.append(area)
+                
+        if removed_ids:
+            self.active_date_areas = remaining
+            
+        return removed_ids

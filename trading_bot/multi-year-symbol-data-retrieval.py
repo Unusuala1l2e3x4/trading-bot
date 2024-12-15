@@ -5,8 +5,8 @@ from typing import List, Tuple
 import numpy as np
 import math
 from tqdm import tqdm
-from MultiSymbolDataRetrieval import retrieve_multi_symbol_data
-from TouchDetection import BacktestTouchDetectionParameters
+from trading_bot.MultiSymbolDataRetrieval import retrieve_multi_symbol_data
+from trading_bot.TouchDetection import BacktestTouchDetectionParameters
 
 def retrieve_multi_year_symbol_data(symbols: List[str], years: List[int], symbols_batch_size: int, interval_months: int, params: BacktestTouchDetectionParameters, 
                                     first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf):

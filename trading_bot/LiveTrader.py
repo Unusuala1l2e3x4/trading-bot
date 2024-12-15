@@ -4,7 +4,7 @@ import numpy as np
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.stream import TradingStream
@@ -19,14 +19,14 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Set
 from collections import defaultdict
 
-from alpaca.data.models import Bar
+from alpaca.data.models import Bar, Quote
 
-from TradePosition import TradePosition
-from TouchArea import TouchArea
-from TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable, IntendedOrder
-from TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters
-from TouchDetectionParameters import np_mean, np_median
-from MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data, fill_missing_data, get_data_with_retry, clean_quotes_data
+from trading_bot.TradePosition import TradePosition
+# from trading_bot.TouchArea import TouchArea
+from trading_bot.TradingStrategy import StrategyParameters, TouchDetectionAreas, TradingStrategy, is_security_shortable_and_etb, is_security_marginable, IntendedOrder
+from trading_bot.TouchDetection import calculate_touch_detection_area, plot_touch_detection_areas, LiveTouchDetectionParameters
+from trading_bot.TouchDetectionParameters import np_mean, np_median
+from trading_bot.MultiSymbolDataRetrieval import retrieve_bar_data, retrieve_quote_data, fill_missing_data, get_data_with_retry, clean_quotes_data, get_stock_latest_quote_with_retry
 
 from tqdm import tqdm
 import logging
@@ -107,50 +107,80 @@ def fill_latest_missing_data(df, latest_timestamp):
         
     # No return statement as requested; df is modified in place if necessary.
 
-def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]):
+def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[IntendedOrder]:
+    """
+    Combine two orders for the same symbol into a single net order when possible.
+    Only combines close->open order pairs in the same direction (long->long or short->short).
+    
+    Args:
+        orders_list: List of 1-2 IntendedOrder objects to potentially combine
+        
+    Returns:
+        List containing either the original orders or a single combined net order
+        
+    Raises:
+        ValueError: If more than 2 orders provided
+        AssertionError: If orders don't meet combining requirements
+    """
+    # Validate input length
     assert len(orders_list) <= 2
     
+    # Return single orders unchanged
     if len(orders_list) == 1:
+        assert orders_list[0].qty > 0, f"Order quantity must be positive: {orders_list[0].qty}"
         return orders_list
 
     if len(orders_list) == 2:
         first_order, second_order = orders_list
         
-        assert first_order.symbol == second_order.symbol, f"{first_order.symbol} == {second_order.symbol}"
-        # if first_order.symbol != second_order.symbol:
-        #     return orders_list
-
-        # Assert that the first order is a close and the second is an open
+        # Validate basic order properties
+        assert first_order.qty > 0 and second_order.qty > 0, \
+            f"Order quantities must be positive: {first_order.qty}, {second_order.qty}"
+        assert first_order.symbol == second_order.symbol, \
+            f"Orders must be for same symbol: {first_order.symbol} != {second_order.symbol}"
+        
+        # Validate order sequence
         assert first_order.action == 'close' and second_order.action == 'open', \
             f"When 2 orders are present, the first must be a close and the second must be an open. ({first_order.action}, {second_order.action})"
 
+        # Validate order sides match position directions
+        assert (first_order.side == OrderSide.SELL) == first_order.position.is_long, \
+            f"First order side {first_order.side} doesn't match position direction {first_order.position.is_long}"
+        assert (second_order.side == OrderSide.BUY) == second_order.position.is_long, \
+            f"Second order side {second_order.side} doesn't match position direction {second_order.position.is_long}"
+
         # Case 1: Same order side (closing one direction and opening the opposite)
+        # NOTE: this should not happen given changes to TradingStrategy.process_active_areas function
         if first_order.side == second_order.side:
-            assert first_order.position.is_long != second_order.position.is_long, (first_order.position.is_long, second_order.position.is_long)
+            assert first_order.position.is_long != second_order.position.is_long, \
+                f"Orders with same side must be switching directions: {first_order.position.is_long} != {second_order.position.is_long}"
             # These orders must be executed sequentially (Alpaca prevents switching between long and short in a single order)
-            log(f"Receieved long-to-short or short-to-long order pair. Alpaca prevents switching between long and short in a single order.",level=logging.WARNING)
+            log(f"Received long-to-short or short-to-long order pair. Alpaca prevents switching between long and short in a single order.",
+                level=logging.WARNING)
             return orders_list
 
         # Case 2: Different order side (closing and reopening in the same direction)
         else:
-            assert first_order.position.is_long == second_order.position.is_long, (first_order.position.is_long, second_order.position.is_long)
-            # Determine the resulting order details
-            qty_difference = first_order.qty - second_order.qty
-            if qty_difference == 0:
-                # return []  # No order needed if quantities cancel out
-                side = None
-            else:
-                side = first_order.side if qty_difference > 0 else second_order.side
+            assert first_order.position.is_long == second_order.position.is_long, \
+                f"Orders with different sides must maintain same direction: {first_order.position.is_long} == {second_order.position.is_long}"
             
+            # Calculate net quantity change needed
+            qty_difference = first_order.qty - second_order.qty
+            
+            # No order needed if quantities exactly match
+            if qty_difference == 0:
+                return []
+            
+            # Create combined order
             combined_order = IntendedOrder(
-                # action = second_order.action, # == 'open'
-                action = 'net_partial_exit' if qty_difference > 0 else 'net_partial_entry',
-                side = side,
-                symbol = second_order.symbol,
-                qty = abs(qty_difference),
-                price = second_order.price,  # 2nd order price might be more recent
-                position = second_order.position
+                action='net_partial_exit' if qty_difference > 0 else 'net_partial_entry',
+                side=first_order.side if qty_difference > 0 else second_order.side,
+                symbol=second_order.symbol,
+                qty=abs(qty_difference),
+                price=second_order.price,  # Use second order price as it's more recent
+                position=second_order.position  # Use new position for tracking
             )
+            
             return [combined_order]
 
     # If there are more than 2 orders, raise an error
@@ -179,13 +209,14 @@ class LiveTrader:
     trade_updates: List[TradeUpdate] = field(default_factory=list)
     is_ready: bool = False
     gap_filled: bool = False
-    streamed_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    streamed_bars: pd.DataFrame = field(default_factory=pd.DataFrame)
     last_hist_bar_dt: Optional[pd.Timestamp] = None
     first_streamed_timestamp: Optional[pd.Timestamp] = None
     timer_start: datetime = field(init=False)
     open_positions: Dict = field(default_factory=dict)
     open_order_ids: Set = field(default_factory=set)
     area_ids_to_remove: defaultdict = field(default_factory=lambda: defaultdict(set))
+    area_ids_to_side_switch: defaultdict = field(default_factory=lambda: defaultdict(set))
     ny_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
     trades: List[TradePosition] = field(default_factory=list)
 
@@ -202,11 +233,11 @@ class LiveTrader:
         log("Resetting daily data...")
         current_day_start = self.get_current_trading_day_start()
         
-        # Reset data and streamed_data
+        # Reset data and streamed_bars
         if not self.bars.empty:
             # self.bars = self.bars[self.bars.index.get_level_values('timestamp') >= current_day_start]
             self.bars = pd.DataFrame()
-        self.streamed_data = pd.DataFrame()
+        self.streamed_bars = pd.DataFrame()
         
         # Reset other daily variables
         self.is_ready = False
@@ -236,13 +267,13 @@ class LiveTrader:
             check_time = check_time.astimezone(self.ny_tz)
         
         return (check_time.weekday() < 5 and 
-                time(4, 0) <= check_time.time() <= time(20, 0))
+                time(4, 0) <= check_time.time() < time(20, 0))
 
     def get_current_trading_day_start(self):
         now = datetime.now(self.ny_tz)
         current_date = now.date()
-        if now.time() < time(4, 0):
-            current_date -= timedelta(days=1)
+        # if now.time() < time(4, 0):
+        #     current_date -= timedelta(days=1)
         return datetime.combine(current_date, time(4, 0)).replace(tzinfo=self.ny_tz)
 
     async def wait_for_market_open(self):
@@ -265,7 +296,7 @@ class LiveTrader:
             log(f"Error requesting bars for {self.symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
         df.index = df.index.set_levels(
-            df.index.get_level_values('timestamp').tz_convert(self.ny_tz),
+            df.index.get_level_values('timestamp').tz_convert(self.ny_tz) + timedelta(minutes=1),
             level='timestamp'
         )
         df.sort_index(inplace=True)
@@ -286,6 +317,19 @@ class LiveTrader:
             return pd.DataFrame()
         df, _ = clean_quotes_data(df, False, start, end)
         return df
+    
+    def get_latest_quote(self, timestamp: datetime):
+        request_params = StockLatestQuoteRequest(
+            symbol_or_symbols=self.symbol,
+            feed='sip' # default for market data subscription?
+            # feed='iex'
+        )
+        try:
+            ret = get_stock_latest_quote_with_retry(self.historical_client, request_params)
+        except Exception as e:
+            log(f"Error requesting latest quote for {self.symbol} at {timestamp}: {str(e)}", level=logging.ERROR)
+            return None
+        return ret
 
     def get_lagged_time(self):
         # return datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=30)
@@ -306,9 +350,9 @@ class LiveTrader:
                 return
             
             self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
-            time_diff = (end - self.last_hist_bar_dt).total_seconds() / 60
+            minutes_diff = (end - self.last_hist_bar_dt).total_seconds() / 60
 
-            if time_diff >= 16:
+            if minutes_diff >= 16:
                 log(f"Historical data is too old. Latest data point: {self.last_hist_bar_dt}", logging.WARNING)
                 return
 
@@ -381,22 +425,36 @@ class LiveTrader:
 
             if hasattr(bar, 'is_simulate_bar'):
                 is_simulate_bar = bar.is_simulate_bar
+                assert self.simulation_mode
             else:
                 is_simulate_bar = False
+                assert not self.simulation_mode
                 
             bar_time = pd.to_datetime(bar.timestamp, utc=True).tz_convert(self.ny_tz)
-            now = datetime.now(self.ny_tz)
-            time_diff = (now - bar_time).total_seconds() / 60
 
-            if time_diff >= 16 and not is_simulate_bar:
+            # NOTE: there can be updated bars sent 30 seconds after the initial bar to account for any late-reported trades.
+            # These updated bars will have the same timestamp as the original bar but with updated data.
+            # https://forum.alpaca.markets/t/why-is-a-small-subset-of-1m-ohlcv-bars-delayed-by-30s-from-sip-websockets-data-connection/6207
+            # NOTE: ignore these bars!!!!
+            if not self.simulation_mode and bar_time == self.last_hist_bar_dt:
+                return
+            
+            now = datetime.now(self.ny_tz)
+            minutes_diff = (now - bar_time).total_seconds() / 60
+            
+            # if not is_simulate_bar:
+            #     assert 0.5 < minutes_diff < 1.5, minutes_diff # NOTE: bar timestamp is at least 1 minute before current time.
+
+            if minutes_diff >= 16 and not is_simulate_bar:
                 log(f"Received outdated bar data. Bar time: {bar_time}, Current time: {now}", logging.WARNING)
                 return
             
             if self.first_streamed_timestamp is None:
                 self.first_streamed_timestamp = bar_time
                 
+            assert self.symbol == bar.symbol
             bar_data = {
-                'symbol': self.symbol,
+                'symbol': bar.symbol,
                 'timestamp': bar_time,
                 'open': bar.open,
                 'high': bar.high,
@@ -411,12 +469,12 @@ class LiveTrader:
             debug_print(new_row)
             
             if not is_simulate_bar:
-                self.streamed_data = pd.concat([self.streamed_data, new_row])
-                debug_print('on_bar streamed_data')
-                debug_print('before remove dups',len(self.streamed_data))
-                self.streamed_data = self.streamed_data.loc[~self.streamed_data.index.duplicated(keep='last')].sort_index()
-                debug_print('after remove dups ',len(self.streamed_data))
-                log(f"Added streamed bar. {len(self.streamed_data)} streamed bars total.")
+                self.streamed_bars = pd.concat([self.streamed_bars, new_row])
+                debug_print('on_bar streamed_bars')
+                debug_print('before remove dups',len(self.streamed_bars))
+                self.streamed_bars = self.streamed_bars.loc[~self.streamed_bars.index.duplicated(keep='last')].sort_index()
+                debug_print('after remove dups ',len(self.streamed_bars))
+                log(f"Added streamed bar. {len(self.streamed_bars)} streamed bars total.")
 
             # Check if we've filled the gap
             if not self.is_ready:
@@ -430,27 +488,37 @@ class LiveTrader:
                     self.bars = self.bars.loc[~self.bars.index.duplicated(keep='last')].sort_index()
                     debug_print('after remove dups ',len(self.bars))
                     debug_print('final data:\n',self.bars)
-                    # debug_print('final streamed_data:\n',self.streamed_data)
+                    # debug_print('final streamed_bars:\n',self.streamed_bars)
                 await self.execute_trading_logic()
                 
         except Exception as e:
             log(f"{type(e).__qualname__} in on_bar: {e}", logging.ERROR)
             raise e
 
+    # async def on_quote(self, quote:Quote):
+    #     try:
+    #         self.trading_strategy.latest_live_bid_price = quote.bid_price
+    #         self.trading_strategy.latest_live_ask_price = quote.ask_price
+
+    #     except Exception as e:
+    #         log(f"{type(e).__qualname__} in on_bar: {e}", logging.ERROR)
+    #         raise e
+        
+        
     async def check_gap_filled(self):
-        time_diff = (self.first_streamed_timestamp - self.last_hist_bar_dt).total_seconds() / 60
-        if time_diff <= 1 or self.simulation_mode:
+        minutes_diff = (self.first_streamed_timestamp - self.last_hist_bar_dt).total_seconds() / 60
+        if minutes_diff <= 1 or self.simulation_mode:
             self.is_ready = True
-            debug_print('check_gap_filled: self.is_ready = True',time_diff)
-            if not self.simulation_mode: # do not use streamed_data if in simulation mode
-                self.bars = pd.concat([self.bars, self.streamed_data])
+            debug_print('check_gap_filled: self.is_ready = True',minutes_diff)
+            if not self.simulation_mode: # do not use streamed_bars if in simulation mode
+                self.bars = pd.concat([self.bars, self.streamed_bars])
                 debug_print('before remove dups',len(self.bars))
                 self.bars = self.bars.loc[~self.bars.index.duplicated(keep='last')].sort_index()
                 debug_print('after remove dups ',len(self.bars))
             log("Gap filled. Data is now ready for trading.")
             log(f"Continuous data range: {self.bars.index.get_level_values('timestamp')[0]} to {self.bars.index.get_level_values('timestamp')[-1]}")
         else:
-            log(f"Gap not properly filled. Time difference: {time_diff} minutes", logging.WARNING)
+            log(f"Gap not properly filled. Time difference: {minutes_diff} minutes", logging.WARNING)
 
 
     async def execute_trading_logic(self):
@@ -463,33 +531,35 @@ class LiveTrader:
             # Update TradingStrategy balance
             current_time = self.bars.index.get_level_values('timestamp')[-1]
             current_date = current_time.date()
-                        
+            
+            
+            # Calculate touch detection areas every minute
+            # TODO: CALL THIS IN SEPARATE THREAD. It does not retrieve quotes data in the live params scenario.
+            self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours))
+
+
+
             # get quotes data
             if self.simulation_mode:
                 # NOTE: follow similar quotes data processing as retrieve_quote_data
                 self.quotes_raw = self.get_historical_quotes(start = current_time - timedelta(seconds=2), 
                                                              end = current_time + timedelta(seconds=1))             # TODO: end should just be now
 
-                # TODO: self.quotes_agg....
-                
-                
-                if self.quotes_raw is None or self.quotes_agg is None:
-                    return
+                # self.quotes_agg = 
+
+                # if self.quotes_raw is None: #  or self.quotes_agg is None
+                #     return
 
                 # NOTE: OR set end to current_time plus elapsed time (unless already handled in TradingStrategy.get_quotes_raw )
                 # TODO: MAKE SURE TradingStrategy.handle_new_trading_day gets the matching raw quotes data, and filters it by elapsed time
                 
             else:
                 # NOTE: need real time data!
-                raise NotImplementedError('getting live quotes data not implemented for live trading')
-            
-            # Calculate touch detection areas every minute
-            self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours, current_time))
-            
-            # Update daily parameters if it's a new day (already handled in process_live_data)
-            # if current_time.date() != getattr(self.trading_strategy, 'current_date', None):
-                # self.trading_strategy.update_daily_parameters(current_time.date())
-                # self.trading_strategy.handle_new_trading_day(current_time)
+                # raise NotImplementedError('getting live quotes data not implemented for live trading')
+                
+                # TODO: get latest quote and put it in self.quotes_raw
+                self.trading_strategy.latest_quote = self.get_latest_quote(current_time)
+                
 
             # print(self.trading_strategy.touch_detection_areas.symbol)
             # log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}, {len(self.trading_strategy.touch_detection_areas.short_touch_area)}, {len(self.area_ids_to_remove)}")
@@ -497,10 +567,13 @@ class LiveTrader:
             # if self.trading_strategy.df is not None and not self.trading_strategy.df.empty:
             #     log(f'after mask:\n{self.trading_strategy.df}')
             
-            # NOTE: PASS QUOTES DATA TO STRATEGY
+            
+            
+            # NOTE: IF USING LIMIT PRICING: pass in quotes data
             self.trading_strategy.touch_detection_areas.quotes_raw = self.quotes_raw
             self.trading_strategy.touch_detection_areas.quotes_agg = self.quotes_agg
-            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time, self.timer_start)
+            
+            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time, self.timer_start, self.area_ids_to_side_switch[current_date])
             
             if orders_list:
                 # log(f"{current_time.strftime("%H:%M")}: {len(orders_list)} ORDERS CREATED")  
@@ -522,15 +595,19 @@ class LiveTrader:
                     
                     for a in orders_list:
                         # log({k:order[k] for k in order if k != 'position'})
-                        peak = a.position.max_price if a.position.is_long else a.position.min_price
+                        peak = a.position.max_close if a.position.is_long else a.position.min_close
                         log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
                             level=logging.INFO)
                         
                     # log(f"{[f"{a.position.id} {a.position.is_long} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, width {a.position.area.get_range:.4f}" for a in orders_list]} {self.trading_strategy.balance:.4f}")
                     
-                    
-                    # NOTE: self.balance not updated yet
-                    
+                    # orders_list_2 = combine_two_orders_same_symbol(orders_list)
+                    # if orders_list_2 == orders_list:
+                        
+                        
+                        
+                        
+                        
                     
                 if orders_list[0].action == 'open':
                     log(self.trading_strategy.df)
@@ -546,14 +623,16 @@ class LiveTrader:
             
             # do after to not slow things down
             self.trades.extend(positions_to_remove)
-            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
+            # self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
+            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | set.union(*(position.cleared_area_ids for position in positions_to_remove))
+            self.area_ids_to_side_switch[current_date] = self.area_ids_to_side_switch[current_date] | {a.position.area.id for a in orders_list if a.position.area.is_side_switched}
             
         except Exception as e:
             log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
             raise e
 
-    def calculate_touch_detection_area(self, market_hours=None, current_timestamp=None):
-        return calculate_touch_detection_area(self.touch_detection_params, self.bars, market_hours, current_timestamp, self.area_ids_to_remove)
+    def calculate_touch_detection_area(self, market_hours=None):
+        return calculate_touch_detection_area(self.touch_detection_params, self.bars, market_hours, self.area_ids_to_remove)
     
     async def place_order(self, intended_order: IntendedOrder):
         assert isinstance(intended_order.qty, int)
@@ -639,8 +718,9 @@ class LiveTrader:
         # Print the update to the console.
         print(f"Update for order ID {data.order.id}. Event: {data.event}. Status: {data.order.status}")
         
-        
-        # TODO: implement this function. we need:
+        # TODO: update balance, cash, and accrued fees using trading account
+
+        # TODO: implement this function. relevant class:
         # class TradeUpdate(BaseModel):
         #     """
         #     Represents a trade update.
@@ -735,7 +815,7 @@ class LiveTrader:
         # Update position with partially filled amount
         await self.update_position_after_fill(placed_order, position_qty, intended_order)
         
-        # TODO: modify max_price of the corresponding position; be sure to replace/update the position in self.trading_strategy.open_positions
+        # TODO: modify max_close/min_close of the corresponding position; be sure to replace/update the position in self.trading_strategy.open_positions
         
         # You might want to create a new order for the remaining quantity
         remaining_qty = float(placed_order.qty) - float(placed_order.filled_qty)
@@ -809,8 +889,8 @@ class LiveTrader:
         pass
     
     def is_receiving_data(self):
-        if not self.streamed_data.empty:
-            last_data_time = self.streamed_data.index.get_level_values('timestamp').max()
+        if not self.streamed_bars.empty:
+            last_data_time = self.streamed_bars.index.get_level_values('timestamp').max()  # NOTE: bar timestamp is at least 1 minute before current time.
             time_since_last_data = (datetime.now(self.ny_tz) - last_data_time).total_seconds()
             return time_since_last_data < 120  # Consider it active if data received in last 2 minutes
         return False
@@ -836,7 +916,7 @@ class LiveTrader:
         
                 self.data_stream.subscribe_quotes(self.on_quote, self.symbol)
                 
-                self.data_stream.subscribe_trades(self.on_trade, self.symbol)
+                # self.data_stream.subscribe_trades(self.on_trade, self.symbol)
                 
                 self.trading_stream.subscribe_trade_updates
                 
@@ -948,7 +1028,6 @@ async def main():
         level1_period=15,
         multiplier=1.4,
         min_touches=3,
-        # bid_buffer_pct=0.005,
         start_time=None,
         end_time='15:55',
         # end_time='11:20',

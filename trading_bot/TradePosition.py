@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta, time as time2
-from typing import List, Tuple, Optional
-from TouchArea import TouchArea
+from typing import List, Set, Tuple, Optional
+from trading_bot.TouchArea import TouchArea
+from trading_bot.TypedBarData import TypedBarData # , DefaultTypedBarData
 import math
 import os
 import pandas as pd
@@ -17,61 +18,46 @@ SEC_FEE_RATE = 0.0000278  # $27.80 per $1,000,000
 FINRA_TAF_RATE = 0.000166  # $166 per 1,000,000 shares
 FINRA_TAF_MAX = 8.30  # Maximum $8.30 per trade
 
+# ELITE_SMART_ROUTER_RATE = 0 # if not using elite smart router
+
+ELITE_SMART_ROUTER_RATE = 0.004 # All-In plan (safest bet)
+# ELITE_SMART_ROUTER_RATE = 0.0025
+# ELITE_SMART_ROUTER_RATE = 0.002
+# ELITE_SMART_ROUTER_RATE = 0.0015
+# ELITE_SMART_ROUTER_RATE = 0.001
+# ELITE_SMART_ROUTER_RATE = 0.0005
+
+
 @jit(nopython=True)
-def calculate_slippage(is_long: bool, price: float, trade_size: int, volume: float, avg_volume: float, slippage_factor: float, is_entry: bool) -> float:
-    # Use the average of current volume and average volume, with a minimum to avoid division by zero
-    effective_volume = max((volume + avg_volume) / 2, 1)
+def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: int, avg_volume: float, rolling_atr: float,
+                       slippage_factor: float, atr_sensitivity: float) -> float:
+    # Normalize ATR
+    normalized_atr = rolling_atr / price if price > 0 else 0
     
-    slippage = slippage_factor * (float(trade_size) / effective_volume)
-    # print(f"${slippage*price:.6f}")
-    # print(f"{slippage*100:.6f} %")
+    # ATR effect (dynamic volatility adjustment)
+    atr_effect = 1 + atr_sensitivity * normalized_atr
+    
+    # Trade size multiplier (captures relative trade size impact)
+    trade_size_multiplier = max(1, float(trade_size) / avg_volume)
+    
+    # Adjust slippage per share
+    slippage_per_share = slippage_factor * atr_effect * trade_size_multiplier
+
+    # Convert slippage to percentage of price
+    slippage = slippage_per_share / price
     
     if is_long:
         if is_entry:
-            pass
-            # return price * (1 + slippage),   # Increase price for long entries
+            pass  # Increase price for long entries
         else:
-            slippage *= -1
-            # return price * (1 - slippage)  # Decrease price for long exits
+            slippage *= -1  # Decrease price for long exits
     else:  # short
         if is_entry:
-            slippage *= -1
-            # return price * (1 - slippage)  # Decrease price for short entries
+            slippage *= -1  # Decrease price for short entries
         else:
-            pass
-            # return price * (1 + slippage)  # Increase price for short exits
-        
-    return price * (1 + slippage), slippage*price
+            pass  # Increase price for short exits
 
-
-# @jit(nopython=True)
-# def calculate_slippage(price: float, trade_size: int, avg_volume: float, volatility: float, is_long: bool, is_entry: bool, slippage_factor: float, beta: float = 0.7) -> float:
-#     # Use avg_volume directly as effective volume
-#     effective_volume = max(avg_volume, 1)
-    
-#     # Compute the relative trade size
-#     relative_size = trade_size / effective_volume
-    
-#     # Calculate slippage using a non-linear model
-#     slippage = slippage_factor * (relative_size ** beta)
-    
-#     # Adjust slippage for volatility
-#     slippage *= (1 + volatility)
-    
-#     # Adjust the price based on the direction of the trade
-#     if is_long:
-#         if is_entry:
-#             adjusted_price = price * (1 + slippage)
-#         else:
-#             adjusted_price = price * (1 - slippage)
-#     else:
-#         if is_entry:
-#             adjusted_price = price * (1 - slippage)
-#         else:
-#             adjusted_price = price * (1 + slippage)
-    
-#     return adjusted_price
-
+    return price * (1 + slippage), slippage * price
 
 
 @dataclass
@@ -85,38 +71,60 @@ class Transaction:
     finra_taf: float
     sec_fee: float  # > 0 for sells (long exits and short entries)
     stock_borrow_cost: float # 0 if not is_long and not is_entry (short exits)
+    commission: float
     value: float  # Positive if profit, negative if loss (before transaction costs are applied)
-    vwap: float
+    bar_latest: TypedBarData
     realized_pl: Optional[float] = None # None if is_entry is True
+    slippage_price_change: Optional[float] = 0.0
 
 @dataclass
 class TradePosition:
+    symbol: str
     date: date
     id: int
     area: TouchArea
     is_long: bool
     entry_time: datetime
     initial_balance: float
-    initial_shares: int # no fractional trading
+    target_max_shares: int 
     use_margin: bool
     is_marginable: bool
     times_buying_power: float
     entry_price: float
-    bar_price_at_entry: float
+    bar_at_entry: TypedBarData
+    
     market_value: float = 0.0
     shares: int = 0 # no fractional trading
     partial_entry_count: int = 0
     partial_exit_count: int = 0
+    is_simulated: Optional[bool] = None
     max_shares: Optional[int] = None
+    max_shares_reached: Optional[int] = None
     max_max_shares: Optional[int] = None
     min_max_shares: Optional[int] = None
+    initial_shares: Optional[int] = None  # actual shares bought at first entry
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
+    
+    full_entry_price: Optional[float] = None
+    max_target_shares_limit: Optional[int] = None
+    has_crossed_full_entry: bool = False
+    full_entry_time: Optional[datetime] = None
+    gradual_entry_range_multiplier: Optional[float] = 1.0 # Adjust this to control how far price needs to move
+    
     transactions: List[Transaction] = field(default_factory=list)
+    area_width_history: List[float] = field(default_factory=list)
+    cleared_area_ids: Set[int] = field(default_factory=list)
     current_stop_price: Optional[float] = None
     current_stop_price_2: Optional[float] = None
-    max_price: Optional[float] = None
-    min_price: Optional[float] = None
+    
+    max_close: Optional[float] = None
+    min_close: Optional[float] = None
+    max_high: Optional[float] = None
+    min_high: Optional[float] = None
+    max_low: Optional[float] = None
+    min_low: Optional[float] = None
+    
     cash_committed: float = field(init=False)
     unrealized_pl: float = field(default=0.0)
     realized_pl: float = 0.0
@@ -172,8 +180,53 @@ class TradePosition:
         self.market_value = 0
         self.shares = 0
         self.cash_committed = 0
-        self.max_shares = self.initial_shares
+        self.max_shares, self.max_max_shares, self.min_max_shares = self.target_max_shares, self.target_max_shares, self.target_max_shares
         self.logger = self.setup_logger(logging.WARNING)
+        
+        # Calculate full entry price based on area range
+        if self.is_long:
+            self.full_entry_price = self.area.get_buy_price + (self.area.get_range * self.gradual_entry_range_multiplier) # area bounds already updated in TradingStrategy.create_new_position
+        else:
+            self.full_entry_price = self.area.get_buy_price - (self.area.get_range * self.gradual_entry_range_multiplier)
+            
+        # Calculate initial shares based on price movement
+        if (self.is_long and self.bar_at_entry.close >= self.full_entry_price) or \
+           (not self.is_long and self.bar_at_entry.close <= self.full_entry_price):
+            # Price already beyond full entry threshold - allow full position
+            self.has_crossed_full_entry = True
+            self.full_entry_time = self.entry_time
+            self.max_target_shares_limit = self.target_max_shares
+        else:
+            # Calculate partial position size
+            self.max_target_shares_limit = self.calculate_initial_target_shares()
+            
+        self.initial_shares = self.max_target_shares_limit
+        self.max_shares_reached = self.max_target_shares_limit
+        self.update_stop_price(self.bar_at_entry, self.entry_time)
+        
+        
+    def calculate_initial_target_shares(self) -> int:
+        """
+        Calculate initial target shares based on price movement beyond entry price.
+        Always returns at least 1 share if target_max_shares > 0.
+        """
+        if self.target_max_shares <= 0:
+            return 0
+            
+        if self.is_long:
+            price_movement = self.bar_at_entry.high - self.area.get_buy_price
+            full_movement = self.full_entry_price - self.area.get_buy_price
+        else:
+            price_movement = self.area.get_buy_price - self.bar_at_entry.low
+            full_movement = self.area.get_buy_price - self.full_entry_price
+            
+        assert price_movement >= 0, f"Negative price movement: {price_movement}"
+        
+        target_pct = np.clip(price_movement / full_movement, 0, 1.0)
+        shares = math.floor(target_pct * self.target_max_shares)
+        
+        # Ensure at least 1 share if initial_shares > 0
+        return max(1, shares)
 
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('TradePosition')
@@ -193,8 +246,11 @@ class TradePosition:
     def is_open(self) -> bool:
         return self.shares > 0
 
-    def calculate_slippage(self, price: float, trade_size: int, volume: float, avg_volume: float, slippage_factor: float, is_entry: bool) -> float:
-        return calculate_slippage(self.is_long, price, trade_size, volume, avg_volume, slippage_factor, is_entry)
+    def calculate_slippage(self, is_entry: bool, price: float, trade_size: int, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float) -> float:
+        adjusted_price, slippage_price_change = calculate_slippage(self.is_long, is_entry, price, trade_size, bar.avg_volume, bar.rolling_ATR, slippage_factor, atr_sensitivity)
+        # print(f"{self.is_long} {is_entry} {trade_size} {price} -> {adjusted_price} ({slippage_price_change})")
+        
+        return adjusted_price, slippage_price_change
 
     def update_market_value(self, current_price: float):
         self.market_value = self.shares * current_price if self.is_long else -self.shares * current_price
@@ -205,6 +261,8 @@ class TradePosition:
         finra_taf = min(FINRA_TAF_RATE * shares, FINRA_TAF_MAX) if is_sell else 0
         trade_value = price * shares
         sec_fee = SEC_FEE_RATE * trade_value if is_sell else 0
+        
+        commission = ELITE_SMART_ROUTER_RATE * shares
         
         stock_borrow_cost = 0
         if not self.is_long and not is_entry:  # Stock borrow cost applies only to short position exits
@@ -230,14 +288,15 @@ class TradePosition:
                 total_cost += relevant_shares * price * daily_borrow_rate * days_held
             assert cumulative_shares == shares, f"Mismatch in shares calculation: {cumulative_shares} != {shares}"
             stock_borrow_cost = total_cost
-        return finra_taf, sec_fee, stock_borrow_cost
+        return finra_taf, sec_fee, stock_borrow_cost, commission
 
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, is_entry: bool, vwap: float, realized_pl: Optional[float] = None):
-        finra_taf, sec_fee, stock_borrow_cost = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
-        transaction_cost = finra_taf + sec_fee + stock_borrow_cost
+    def add_transaction(self, timestamp: datetime, shares: int, price: float, slippage_price_change: float, is_entry: bool, bar: TypedBarData, realized_pl: Optional[float] = None):
+        finra_taf, sec_fee, stock_borrow_cost, commission = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
+        transaction_cost = finra_taf + sec_fee + stock_borrow_cost + commission
         value = -shares * price if is_entry else shares * price
         
-        transaction = Transaction(timestamp, shares, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, value, vwap, realized_pl)
+        transaction = Transaction(timestamp, shares, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, 
+                                  commission, value, bar, realized_pl, slippage_price_change)
         self.transactions.append(transaction)
         
         if not is_entry and realized_pl is not None:
@@ -250,67 +309,92 @@ class TradePosition:
 
     def increase_max_shares(self, shares):
         self.max_shares = max(self.max_shares, shares)
-        self.max_max_shares = max(self.max_max_shares or self.max_shares, self.max_shares)
+        self.max_max_shares = max(self.max_max_shares, self.max_shares)
     
     def decrease_max_shares(self, shares):
         self.max_shares = min(self.max_shares, shares)
-        self.min_max_shares = min(self.min_max_shares or self.max_shares, self.max_shares)
+        self.min_max_shares = min(self.min_max_shares, self.max_shares)
     
-    def initial_entry(self, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
-        return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares, vwap, volume, avg_volume, slippage_factor)
-
-    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
+    def initial_entry(self, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
+        """
+        Initial entry with gradual sizing based on max_target_shares_limit.
+        Uses partial_entry internally.
+        """
+        # Use the calculated limit instead of initial_shares
+        return self.partial_entry(self.entry_time, self.entry_price, self.max_target_shares_limit, bar, slippage_factor, atr_sensitivity)
+        # return self.partial_entry(self.entry_time, self.entry_price, self.initial_shares, vwap, volume, avg_volume, slippage_factor)
+        
+    def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
         self.log(f"partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}", level=logging.DEBUG)
 
-        adjusted_price, slippage_price_change = self.calculate_slippage(entry_price, shares_to_buy, volume, avg_volume, slippage_factor, is_entry=True)
+        adjusted_price, slippage_price_change = self.calculate_slippage(True, entry_price, shares_to_buy, bar, slippage_factor, atr_sensitivity)
         cash_committed = shares_to_buy * entry_price
 
-        fees = self.add_transaction(entry_time, shares_to_buy, adjusted_price, is_entry=True, vwap=vwap)
+        fees = self.add_transaction(entry_time, shares_to_buy, adjusted_price, slippage_price_change, True, bar)
         
         self.shares += shares_to_buy
         self.cash_committed += cash_committed
         self.update_market_value(adjusted_price)
         self.partial_entry_count += 1
+        self.max_shares_reached = max(self.max_shares_reached, self.shares)
+        self.area_width_history.append(self.area.get_range)
 
         self.log(f"Partial entry complete - Shares added: {shares_to_buy}, New total shares: {self.shares}, "
                  f"New cash committed: {self.cash_committed:.4f}", level=logging.DEBUG)
 
         return cash_committed, fees, shares_to_buy
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, vwap: float, volume: float, avg_volume: float, slippage_factor: float):
+    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
         self.log(f"partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}", level=logging.DEBUG)
 
-        adjusted_price, slippage_price_change = self.calculate_slippage(exit_price, shares_to_sell, volume, avg_volume, slippage_factor, is_entry=False)
+        adjusted_price, slippage_price_change = self.calculate_slippage(False, exit_price, shares_to_sell, bar, slippage_factor, atr_sensitivity)
 
         cash_released = (shares_to_sell / self.shares) * self.cash_committed
         realized_pl = (adjusted_price - self.entry_price) * shares_to_sell if self.is_long else (self.entry_price - adjusted_price) * shares_to_sell
 
-        fees = self.add_transaction(exit_time, shares_to_sell, adjusted_price, is_entry=False, vwap=vwap, realized_pl=realized_pl)
+        fees = self.add_transaction(exit_time, shares_to_sell, adjusted_price, slippage_price_change, False, bar, realized_pl=realized_pl)
 
         self.shares -= shares_to_sell
         self.cash_committed -= cash_released
         self.update_market_value(adjusted_price)
         self.partial_exit_count += 1
-
+        self.area_width_history.append(self.area.get_range)
+        
         self.log(f"Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}", level=logging.DEBUG)
 
         return realized_pl, cash_released, fees, shares_to_sell
 
-    def update_stop_price(self, bar_price: float, quote_price: float, current_timestamp: datetime):
+    # NOTE: updates stop price, as well as min/max close, max high, min low
+    def update_stop_price(self, bar: TypedBarData, current_timestamp: datetime):
         self.area.update_bounds(current_timestamp)
+        self.max_close = max(self.max_close or self.bar_at_entry.close, bar.close)
+        self.min_close = min(self.min_close or self.bar_at_entry.close, bar.close)
         
+        self.max_high = max(self.max_high or self.bar_at_entry.high, bar.high)
+        self.min_high = min(self.min_high or self.bar_at_entry.high, bar.high)
+        
+        self.max_low = max(self.max_low or self.bar_at_entry.low, bar.low)
+        self.min_low = min(self.min_low or self.bar_at_entry.low, bar.low)
+           
         if self.is_long:
-            self.max_price = max(self.max_price or self.bar_price_at_entry, bar_price) # NOTE: this operation should use bar data since update_bounds only uses bar data
-            self.current_stop_price = self.max_price - self.area.get_range
-            self.current_stop_price_2 = self.max_price - self.area.get_range * 3
+            self.current_stop_price = self.max_close - self.area.get_range
+            self.current_stop_price_2 = self.max_close - self.area.get_range * 3
         else:
-            self.min_price = min(self.min_price or self.bar_price_at_entry, bar_price) # NOTE: this operation should use bar data since update_bounds only uses bar data
-            self.current_stop_price = self.min_price + self.area.get_range
-            self.current_stop_price_2 = self.min_price + self.area.get_range * 3
+            self.current_stop_price = self.min_close + self.area.get_range
+            self.current_stop_price_2 = self.min_close + self.area.get_range * 3
         
         # self.update_market_value(quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
         self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}")
-        return self.should_exit(bar_price), self.should_exit_2(bar_price)
+        
+        # Check if price has crossed full entry threshold
+        if not self.has_crossed_full_entry:
+            if (self.is_long and bar.close >= self.full_entry_price) or \
+               (not self.is_long and bar.close <= self.full_entry_price):
+                self.has_crossed_full_entry = True
+                self.full_entry_time = current_timestamp
+                self.max_target_shares_limit = self.max_shares
+                
+        return self.should_exit(bar.close), self.should_exit_2(bar.close)
 
     def should_exit(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \
@@ -323,6 +407,10 @@ class TradePosition:
     def close(self, exit_time: datetime, exit_price: float):
         self.exit_time = exit_time
         self.exit_price = exit_price
+
+    @property
+    def total_commission(self) -> float:
+        return sum(t.commission for t in self.transactions)
 
     @property
     def total_stock_borrow_cost(self) -> float:
@@ -374,31 +462,67 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     cumulative_pct_change = 0
     for trade in trades:
         cumulative_pct_change += trade.plpc
+        side_string = 'Long' if trade.is_long else 'Short'
+        if trade.area.is_side_switched:
+            side_string = '*'+side_string
+
+        
         row = {
+            'sym': trade.symbol,
             'date': trade.date,
             'ID': trade.id,
             'AreaID': trade.area.id,
-            'Type': 'Long' if trade.is_long else 'Short',
+            'Type': side_string,
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
-            'Holding Time (min)': trade.holding_time.total_seconds() / 60,
+            'Holding Time (min)': int(trade.holding_time.total_seconds() / 60),
             'Entry Price': trade.entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
-            'Initial Shares': trade.initial_shares,
-            'Realized P/L': trade.get_realized_pl,
-            'Unrealized P/L': trade.get_unrealized_pl,
-            'Total P/L': trade.pl,
-            'ROE (P/L %)': trade.plpc,
-            'Cumulative P/L %': cumulative_pct_change,
-            'Transaction Costs': trade.total_transaction_costs,
-            'Times Buying Power': trade.times_buying_power
+            'Initial Qty': trade.initial_shares,
+            'Target Qty': trade.target_max_shares,
+            'Max Qty Reached (%)': trade.max_shares_reached / trade.target_max_shares,
+            'Min Area Width': min(trade.area_width_history),
+            'Max Area Width': max(trade.area_width_history),
+            # 'Largest Max Qty': trade.max_max_shares,
+            # 'Smallest Max Qty': trade.min_max_shares,
+            # 'Realized P/L': f"{trade.get_realized_pl:.6f}",
+            # 'Unrealized P/L': f"{trade.get_unrealized_pl:.6f}",
+            'Total P/L': f"{trade.pl:.6f}",
+            'ROE (P/L %)': f"{trade.plpc:.12f}",
+            'Cumulative P/L %': f"{cumulative_pct_change:.6f}",
+            'Transaction Costs': f"{trade.total_transaction_costs:.6f}",
+            'Times Buying Power': trade.times_buying_power,
+            
+            # bar metrics
+            'shares_per_trade': f"{trade.bar_at_entry.shares_per_trade:.6f}",
+            'doji_ratio': f"{trade.bar_at_entry.doji_ratio:.6f}",
+            'wick_ratio': f"{trade.bar_at_entry.wick_ratio:.6f}",
+            'nr4_hl_diff': f"{trade.bar_at_entry.nr4_hl_diff:.6f}",
+            'nr7_hl_diff': f"{trade.bar_at_entry.nr7_hl_diff:.6f}",
+            'volume_ratio': f"{trade.bar_at_entry.volume_ratio:.6f}",
+            'ATR_ratio': f"{trade.bar_at_entry.ATR_ratio:.6f}",
         }
+        # get aggregated metrics per area
+        row.update(trade.area.get_metrics(trade.entry_time, prefix=''))
+        # row.update(trade.area.get_metrics(trade.entry_time, prefix='entry_'))
+        # row.update(trade.area.get_metrics(trade.exit_time, prefix='exit_'))
         data.append(row)
+        
     df = pd.DataFrame(data)
+    bardf = TypedBarData.to_dataframe([trade.bar_at_entry for trade in trades])
+    # print(df['Entry Time'])
+    # print(bardf['timestamp'].dt.time )
+    assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time'])
+    df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)
+    
     if len(os.path.dirname(filename)) > 0:
         os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
     df.to_csv(filename, index=False)
     print(f"Trade summary has been exported to {filename}")
+    
+    # df.to_csv(filename.replace('.csv', '.tsv'), index=False, sep='\t')   # Replace the existing df.to_csv line
+    # print(f"Trade summary has been exported to {filename}")
 
 
 def time_to_minutes(t: time2):
@@ -406,6 +530,7 @@ def time_to_minutes(t: time2):
 
 @dataclass
 class SimplifiedTradePosition:
+    symbol: str
     date: date
     id: int
     area_id: int
@@ -415,18 +540,37 @@ class SimplifiedTradePosition:
     holding_time: timedelta
     entry_price: float
     exit_price: float
+    bar_at_entry: TypedBarData
     initial_shares: int
-    realized_pl: float
-    unrealized_pl: float
+    target_max_shares: int
+    max_shares_reached: float
+    min_area_width: float
+    max_area_width: float
+    # max_max_shares: int
+    # min_max_shares: int
+    # realized_pl: float
+    # unrealized_pl: float
     pl: float
     plpc: float
     cumulative_pct_change: float
     total_transaction_costs: float
     times_buying_power: float
 
+    
+    shares_per_trade: float
+    doji_ratio: float
+    wick_ratio: float
+    nr4_hl_diff: float
+    nr7_hl_diff: float
+    volume_ratio: float
+    ATR_ratio: float
+    
+
 def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
     df = pd.read_csv(csv_file_path)
     trade_positions = []
+    
+    bar_columns = TypedBarData.get_field_names()
     
     for _, row in df.iterrows():
         trade_date = datetime.strptime(row['date'], '%Y-%m-%d').date()
@@ -449,32 +593,48 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
         holding_time = timedelta(seconds=row['Holding Time (min)'] * 60)
         
         trade_position = SimplifiedTradePosition(
+            symbol=row['sym'],
             date=trade_date,
             id=row['ID'],
             area_id=row['AreaID'],
-            is_long=(row['Type'] == 'Long'),
+            is_long=(row['Type'].endswith('Long')),
             entry_time=entry_time,
             exit_time=exit_time,
             holding_time=holding_time,
             entry_price=row['Entry Price'],
             exit_price=row['Exit Price'] if pd.notna(row['Exit Price']) else None,
+
+            bar_at_entry = TypedBarData.from_row(row.loc[bar_columns]),
+
             initial_shares=row['Initial Shares'],
-            realized_pl=row['Realized P/L'],
-            unrealized_pl=row['Unrealized P/L'],
+            target_max_shares=row['Target Qty'],
+            max_shares_reached=row['Max Qty Reached (%)'],
+            min_area_width=row['Min Area Width'],
+            max_area_width=row['Max Area Width'],
+            # max_max_shares=row['Largest Max Qty'],
+            # min_max_shares=row['Smallest Max Qty'],
+            # realized_pl=row['Realized P/L'],
+            # unrealized_pl=row['Unrealized P/L'],
             pl=row['Total P/L'],
             plpc=row['ROE (P/L %)'],
             cumulative_pct_change=row['Cumulative P/L %'],
             total_transaction_costs=row['Transaction Costs'],
-            times_buying_power=row['Times Buying Power']
+            times_buying_power=row['Times Buying Power'],
+            
+            shares_per_trade=row['shares_per_trade'],
+            doji_ratio=row['doji_ratio'],
+            wick_ratio=row['wick_ratio'],
+            nr4_hl_diff=row['nr4_hl_diff'],
+            nr7_hl_diff=row['nr7_hl_diff'],
+            volume_ratio=row['volume_ratio'],
+            ATR_ratio=row['ATR_ratio'],
+            
         )
         trade_positions.append(trade_position)
     
     return trade_positions
 
-# import matplotlib.patches as mpatches
-# def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
 import matplotlib.patches as mpatches
-# import numpy as np
 
 def is_trading_day(date: date):
     return date.weekday() < 5
@@ -519,14 +679,15 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
     if is_short_period:
         # Group by half-hour intervals
         df_intraday['half_hour'] = df_intraday['time'].apply(lambda t: t.replace(minute=0 if t.minute < 30 else 30, second=0))
-        volume_data = df_intraday.groupby(['date', 'half_hour'])['volume'].mean().reset_index()
+        volume_data = df_intraday.groupby(['date', 'half_hour'])['volume'].sum().reset_index()
         volume_data['datetime'] = volume_data.apply(lambda row: pd.Timestamp.combine(row['date'], row['half_hour']), axis=1)
         volume_data = volume_data.set_index('datetime').sort_index()
         volume_data = volume_data[volume_data.index.time != time2(16, 0)]
     else:
         # Group by day
-        volume_data = df_intraday.groupby('date')['volume'].mean()
-    
+        volume_data = df_intraday.groupby('date')['volume'].sum()
+        # TODO: instead of grouping all volume data from each day, filter by the first 15-30 minutes (starting 9:30 AM) of each day's volume
+        
     # Create a continuous index
     unique_dates = sorted(df_intraday['date'].unique())
     continuous_index = []

@@ -2,9 +2,10 @@ import os
 import zipfile
 import pandas as pd
 from alpaca.data import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
+from alpaca.data.models import Bar, Quote
 from datetime import datetime, time, timedelta
 from tqdm import tqdm
 import time as t2
@@ -12,7 +13,7 @@ from typing import List, Tuple, Optional, Dict, Callable
 import math
 import copy
 import numpy as np
-from TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
+from trading_bot.TouchDetectionParameters import BacktestTouchDetectionParameters, LiveTouchDetectionParameters
 
 from requests import Session
 import hashlib
@@ -190,7 +191,7 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
         except Exception as e:
             log(f"Error requesting bars for {symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
-        df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz), level='timestamp')
+        df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz) + timedelta(minutes=1), level='timestamp')
         df.sort_index(inplace=True)
         return fill_missing_data(df)
 
@@ -350,6 +351,7 @@ def calculate_twap_micro_data(df: pd.DataFrame, interval_start: datetime, interv
         interval_end_ts
     )
 
+# NOTE: results in micro dataset
 def clean_quotes_data(df: pd.DataFrame, carryover_exists: bool, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> Tuple[pd.DataFrame, float]:
     """
     Clean quotes data and calculate intra-timestamp changes with improved efficiency.
@@ -395,6 +397,7 @@ def clean_quotes_data(df: pd.DataFrame, carryover_exists: bool, interval_start: 
     carryover = (timestamps[0] - interval_start).total_seconds()
     return df_agg, carryover
 
+# NOTE: results in macro dataset
 def aggregate_by_second(df: pd.DataFrame, carryover_exists: bool, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> pd.DataFrame:
     """
     Aggregate quote data by second intervals with time-weighted spread calculation.
@@ -760,7 +763,45 @@ def get_data_with_retry(client: StockHistoricalDataClient, client_func: Callable
             refresh_client(client)
             t2.sleep(sleep_seconds)
             
+def get_stock_latest_quote_with_retry(client: StockHistoricalDataClient, request_params: StockLatestQuoteRequest, max_retries=10, sleep_seconds=0.01) -> Optional[Quote]:
+    """
+    Retrieves the latest quote for a stock with retry logic.
+    
+    Args:
+        client: StockHistoricalDataClient instance
+        request_params: StockLatestQuoteRequest parameters
+        max_retries: Maximum number of retry attempts (default: 10)
+        sleep_seconds: Seconds to wait between retries (default: 0.01)
+        
+    Returns:
+        Quote object if successful, None if all retries fail
+    """
+    attempt = 0
+    while True:
+        try:
+            res = client.get_stock_latest_quote(request_params)
             
+            # Handle single symbol vs multiple symbols
+            if isinstance(res, dict):
+                # For multiple symbols, return the full dictionary
+                return res
+            else:
+                # For single symbol, return the Quote object
+                return res
+
+        except Exception as e:
+            attempt += 1
+            symbols = request_params.symbol_or_symbols
+            
+            log(f"Attempt {attempt}: Error retrieving latest quote for {symbols}: {str(e)}", level=logging.ERROR)
+            
+            if attempt >= max_retries:
+                log(f"Max retries ({max_retries}) reached. Giving up.", level=logging.ERROR)
+                return None
+                
+            log(f"Refreshing client session and retrying in {sleep_seconds} seconds...", level=logging.ERROR)
+            refresh_client(client)
+            t2.sleep(sleep_seconds)
 
 def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols: List[str], first_seconds_sample: int = np.inf, 
                                last_seconds_sample: int = np.inf, return_data=True) -> Dict | None:
@@ -816,6 +857,12 @@ if __name__=="__main__":
     start_date = "2024-09-01 00:00:00"
     end_date =   "2024-10-01 00:00:00"
 
+    # start_date = "2024-10-01 00:00:00"
+    # end_date =   "2024-11-01 00:00:00"
+
+    start_date = "2024-11-01 00:00:00"
+    end_date =   "2024-12-01 00:00:00"
+
     # start_date = "2024-09-04 00:00:00"
     # end_date =   "2024-09-05 00:00:00"
     
@@ -863,38 +910,46 @@ if __name__=="__main__":
     
     
     # symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA', 'TSLA']
+    symbols = ['MSTR','MARA','INTC','GOOG']
     # symbols = ['AAPL']
-    symbols = ['QFIN']
+    # symbols = ['QFIN']
         
     # params.start_date = "2024-09-04 00:00:00"
     # params.end_date =   "2024-09-05 00:00:00"
     # for symbol in symbols:
     #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
     
-    params.start_date = "2024-11-01 00:00:00"
-    params.end_date =   "2024-11-16 00:00:00"
-    for symbol in symbols:
-        retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    # params.start_date = "2024-11-11 00:00:00"
+    # params.end_date =   "2024-11-16 00:00:00"
+    # for symbol in symbols:
+    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+        
+    # params.start_date = "2024-11-18 00:00:00"
+    # params.end_date =   "2024-11-23 00:00:00"
+    # for symbol in symbols:
+    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+        
+    # params.start_date = "2024-11-11 00:00:00"
+    # params.end_date =   "2024-11-23 00:00:00"
+    # for symbol in symbols:
+    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
 
     # params.start_date = "2024-01-01 00:00:00"
     # params.end_date =   "2024-02-01 00:00:00"
     # for symbol in symbols:
     #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
-        
-    # params.start_date = "2024-02-01 00:00:00"
-    # params.end_date =   "2024-03-01 00:00:00"
-    # for symbol in symbols:
-    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    
 
-    # params.start_date = "2024-03-01 00:00:00"
-    # params.end_date =   "2024-04-01 00:00:00"
-    # for symbol in symbols:
-    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    for month in range(11, 0, -1):  # Loop through months
+        start_date = f"2024-{month:02d}-01 00:00:00"
+        end_date = f"2024-{month + 1:02d}-01 00:00:00"
+        print(start_date, end_date)
         
-    # params.start_date = "2024-04-01 00:00:00"
-    # params.end_date =   "2024-05-01 00:00:00"
-    # for symbol in symbols:
-    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+        params.start_date = start_date
+        params.end_date = end_date
+        
+        for symbol in symbols:
+            retrieve_multi_symbol_data(params, [symbol], return_data=False)
 
 
     # symbols = ['AAPL'] 
