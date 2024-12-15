@@ -25,6 +25,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.trading import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.enums import OrderSide
+from alpaca.trading.models import TradeAccount
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 from alpaca.data.models import Bar, Quote
@@ -102,6 +103,38 @@ def filter_df_by_timerange(df: pd.DataFrame, start_time: datetime, end_time: dat
     
     # Return filtered DataFrame
     return df.iloc[left_pos:right_pos]
+
+
+def calculate_margin_values(use_margin: bool, is_marginable: bool, times_buying_power: float) -> Tuple[float, float, float]:
+    """
+    Calculate margin requirement and leverage values.
+    
+    Args:
+        use_margin: Whether to use margin
+        is_marginable: Whether the security is marginable
+        times_buying_power: Requested margin multiplier
+    
+    Returns:
+        Tuple containing:
+        - initial_margin_requirement: Base margin requirement
+        - max_leverage: Maximum leverage allowed
+        - actual_margin_multiplier: Actual multiplier to use
+    """
+    if use_margin and is_marginable:
+        # Use 25% initial margin requirement for marginable securities (intraday)
+        initial_margin_requirement = 0.25  # Intraday margin requirement
+        # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
+    else:
+        # Use 100% initial margin requirement for non-marginable securities or cash accounts
+        initial_margin_requirement = 1.0
+
+    # Calculate max leverage based on initial margin requirement
+    max_leverage = 1.0 / initial_margin_requirement
+    
+    # Apply the times_buying_power constraint
+    actual_margin_multiplier = min(times_buying_power, max_leverage)
+    
+    return initial_margin_requirement, max_leverage, actual_margin_multiplier
 
 
 @dataclass
@@ -228,23 +261,12 @@ class TradingStrategy:
 
     @property
     def buying_power(self):
-        if self.params.use_margin and self.is_marginable:
-            # Use 25% initial margin requirement for marginable securities (intraday)
-            initial_margin_requirement = 0.25  # Intraday margin requirement
-            # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
-        else:
-            # Use 100% initial margin requirement for non-marginable securities or cash accounts
-            initial_margin_requirement = 1.0
-        # Calculate max leverage based on initial margin requirement
-        max_leverage = 1.0 / initial_margin_requirement
+        _, max_leverage, _ = calculate_margin_values(
+            self.params.use_margin, self.is_marginable, self.params.times_buying_power
+        )
         
-        # actual_margin_multiplier = min(self.params.times_buying_power, max_leverage)
-        # return self.total_equity * actual_margin_multiplier - self.total_market_value
-    
-        return self.total_equity * max_leverage - self.total_market_value  # Assuming 4x margin
-    
-
-    
+        return self.total_equity * max_leverage - self.total_market_value
+        
     
     def get_account_summary(self):
         return {
@@ -284,6 +306,18 @@ class TradingStrategy:
     @property
     def total_equity(self):
         return self.balance + self.total_market_value - self.margin_used
+
+
+    def update_balance_from_account(self, account: TradeAccount):
+        """Updates strategy's base balance by reverse calculating from Alpaca's buying power."""
+        # Get margin values using helper function
+        _, _, actual_margin_multiplier = calculate_margin_values(
+            self.params.use_margin, self.is_marginable, self.params.times_buying_power
+        )
+        
+        # Convert from margined buying power to base balance
+        base_balance = float(account.buying_power) / actual_margin_multiplier
+        self.update_balance(base_balance)
 
 
     def update_market_values(self, current_price: float):
@@ -374,24 +408,13 @@ class TradingStrategy:
         if not self.params.ordersizing.is_trading_allowed(self.total_equity, avg_trade_count, avg_volume, trade_count_mult):
             return 0, 0, 0, 0, 0, 0, 0, 0
 
-        
-        # NOTE: micro_quote_count may need to be normalized to 1 second average count, or filtered to last second only
-        
-        
-        # when live, need to call is_security_marginable
-        # Determine initial margin requirement and calculate max leverage
-        if self.params.use_margin and self.is_marginable:
-            # Use 25% initial margin requirement for marginable securities (intraday)
-            initial_margin_requirement = 0.25  # Intraday margin requirement
-            # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
-        else:
-            # Use 100% initial margin requirement for non-marginable securities or cash accounts
-            initial_margin_requirement = 1.0
 
-        # Calculate max leverage based on initial margin requirement
-        max_leverage = 1.0 / initial_margin_requirement
-        # Apply the times_buying_power constraint
-        actual_margin_multiplier = min(times_buying_power, max_leverage)
+        # NOTE: when live, need to call is_security_marginable
+        
+        # Get margin values using helper function
+        initial_margin_requirement, _, actual_margin_multiplier = calculate_margin_values(
+            self.params.use_margin, self.is_marginable, times_buying_power
+        )
         
         current_shares = existing_shares
         max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)
@@ -472,21 +495,6 @@ class TradingStrategy:
         # TODO: make sure now_quotes_raw is filtered to before cutoff
         if not self.params.ordersizing.is_trading_allowed(self.total_equity, avg_trade_count, avg_volume, trade_count_mult):
             return 0
-        
-        # when live, need to call is_security_marginable
-        # Determine initial margin requirement and calculate max leverage
-        if self.params.use_margin and self.is_marginable:
-            # Use 25% initial margin requirement for marginable securities (intraday)
-            initial_margin_requirement = 0.25  # Intraday margin requirement
-            # initial_margin_requirement = 0.5   # Uncomment for overnight margin requirement if needed
-        else:
-            # Use 100% initial margin requirement for non-marginable securities or cash accounts
-            initial_margin_requirement = 1.0
-
-        # Calculate max leverage based on initial margin requirement
-        max_leverage = 1.0 / initial_margin_requirement
-        # Apply the times_buying_power constraint
-        actual_margin_multiplier = min(times_buying_power, max_leverage)
         
         # Calculate max shares that can be exited based on volume
         max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)
@@ -623,7 +631,7 @@ class TradingStrategy:
             entry_price=price_at_action,
             bar_at_entry=self.now_bar,
             use_margin=self.params.use_margin,
-            is_marginable=self.is_marginable, # when live, need to call is_security_marginable
+            is_marginable=self.is_marginable, # NOTE: when live, need to call is_security_marginable
             times_buying_power=actual_margin_multiplier,
             
             gradual_entry_range_multiplier=self.params.gradual_entry_range_multiplier
