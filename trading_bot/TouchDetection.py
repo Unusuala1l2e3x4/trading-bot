@@ -508,8 +508,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         quotes_data = retrieve_quote_data(client, [params.symbol], minute_intervals_dict, params)
         
         if isinstance(quotes_data[params.symbol]['raw'], pd.DataFrame) and isinstance(quotes_data[params.symbol]['agg'], pd.DataFrame):
-            raw_df = quotes_data[params.symbol]['raw']
-            aggregated_df = quotes_data[params.symbol]['agg']
+            quotes_raw_df = quotes_data[params.symbol]['raw']
+            quotes_agg_df = quotes_data[params.symbol]['agg']
         else:
             raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
@@ -518,8 +518,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             raise ValueError("Live bars data must be provided for live trading parameters")
         df = live_bars
         df_adjusted = None
-        raw_df = None
-        aggregated_df = None
+        quotes_raw_df = None
+        quotes_agg_df = None
     else:
         # print(type(params))
         # print(isinstance(params, BacktestTouchDetectionParameters))
@@ -737,8 +737,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'market_hours': market_hours,
             'bars': df,
             'bars_adjusted': df_adjusted,
-            'quotes_raw': raw_df,
-            'quotes_agg': aggregated_df,
+            'quotes_raw': quotes_raw_df, # None for LiveTrader since not doing limit pricing
+            'quotes_agg': quotes_agg_df, # None for LiveTrader since not doing limit pricing
             'mask': final_mask,
             'min_touches': params.min_touches,
             'start_time': start_time,
@@ -771,9 +771,10 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     short_touch_area = touch_detection_areas.short_touch_area
     market_hours = touch_detection_areas.market_hours
     df = touch_detection_areas.bars
-    df_adjusted = touch_detection_areas.bars_adjusted
+    # df = touch_detection_areas.bars_adjusted
+    # df_adjusted = touch_detection_areas.bars_adjusted
     mask = touch_detection_areas.mask
-    min_touches = touch_detection_areas.min_touches
+    # min_touches = touch_detection_areas.min_touches
     start_time = touch_detection_areas.start_time
     end_time = touch_detection_areas.end_time
     # use_median = touch_detection_areas.use_median

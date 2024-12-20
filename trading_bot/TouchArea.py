@@ -270,7 +270,8 @@ class TouchAreaCollection:
     active_date: datetime = None
     active_date_areas: List[TouchArea] = field(default_factory=list)
     terminated_date_areas: List[TouchArea] = field(default_factory=list)
-    open_position_areas: Set[TouchArea] = field(default_factory=set)
+    traded_date_areas: List[TouchArea] = field(default_factory=list)
+    # open_position_areas: Set[TouchArea] = field(default_factory=set)
             
     def __post_init__(self):
         for area in self.touch_areas:
@@ -306,22 +307,22 @@ class TouchAreaCollection:
         return False
     
     
-    def add_open_position_area(self, area: TouchArea):
-        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
-                            key=self.area_sort_key)
-        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
-            assert self.active_date_areas[index] not in self.open_position_areas
-            self.open_position_areas.add(self.active_date_areas[index])
-            return True
-        return False
+    # def add_open_position_area(self, area: TouchArea):
+    #     index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+    #                         key=self.area_sort_key)
+    #     if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+    #         assert self.active_date_areas[index] not in self.open_position_areas
+    #         self.open_position_areas.add(self.active_date_areas[index])
+    #         return True
+    #     return False
         
-    def del_open_position_area(self, area: TouchArea):
-        index = bisect_left(self.active_date_areas, self.area_sort_key(area),
-                            key=self.area_sort_key)
-        if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
-            self.open_position_areas.remove(self.active_date_areas[index])
-            return True
-        return False
+    # def del_open_position_area(self, area: TouchArea):
+    #     index = bisect_left(self.active_date_areas, self.area_sort_key(area),
+    #                         key=self.area_sort_key)
+    #     if index < len(self.active_date_areas) and self.active_date_areas[index].id == area.id:
+    #         self.open_position_areas.remove(self.active_date_areas[index])
+    #         return True
+    #     return False
     
     def reset_active_areas(self, current_time: datetime):
         try:
@@ -331,6 +332,7 @@ class TouchAreaCollection:
                 self.active_date = None
                 self.active_date_areas = list()
                 self.terminated_date_areas = list()
+                self.traded_date_areas = list()
                 return list()
             
             if self.active_date is None or self.active_date != current_date: # change the date and get areas in that date
@@ -339,6 +341,7 @@ class TouchAreaCollection:
                 # self.active_date_areas = self.areas_by_date[self.active_date]
                 self.active_date_areas = copy.deepcopy(self.areas_by_date[self.active_date]) # NOTE: gets copy so that original isnt modified
                 self.terminated_date_areas = list()
+                self.traded_date_areas = list()
             
             # return list(takewhile(lambda area: area.min_touches_time <= current_time, self.active_date_areas)) # to enable area terminations without deleting the data
         except Exception as e:
@@ -363,7 +366,11 @@ class TouchAreaCollection:
             log(f"{type(e).__qualname__} in terminate_area: {e}", logging.ERROR)
             raise e
 
-
+    def add_traded_area(self, area: TouchArea):
+        """Add area to the list of areas used for trading."""
+        if area not in self.traded_date_areas:
+            self.traded_date_areas.append(area)
+            
     def remove_areas_in_range(self, low: float, high: float, current_time: datetime, other_areas_to_remove: List[TouchArea] = None) -> Set[int]:
         """
         Remove areas whose bounds lie completely within the given price range,

@@ -48,7 +48,7 @@ API_KEY = config[livepaper]['key']
 API_SECRET = config[livepaper]['secret']
 
 
-debug = False
+debug = True
 def debug_print(*args, **kwargs):
     if debug:
         print(*args, **kwargs)
@@ -86,26 +86,27 @@ def fill_latest_missing_data(df, latest_timestamp):
         symbol = df.index.get_level_values('symbol')[0]
         
         # Create a date range from the last timestamp + 1 minute up to the latest timestamp
-        missing_timestamps = pd.date_range(start=last_timestamp + pd.Timedelta(minutes=1), 
-                                           end=latest_timestamp, 
-                                           freq='min', 
-                                           tz=last_timestamp.tz)
-
-        # Create a DataFrame to store missing rows
-        missing_data = pd.DataFrame({
-            'open': df['close'].iloc[-1],  # Forward fill 'open' with the last 'close' value
-            'high': df['close'].iloc[-1],  # Forward fill 'high' with the last 'close' value
-            'low': df['close'].iloc[-1],   # Forward fill 'low' with the last 'close' value
-            'close': df['close'].iloc[-1], # Forward fill 'close' with the last 'close' value
-            'volume': 0,                   # Set volume to 0
-            'trade_count': 0,               # Set trade_count to 0
-            # 'vwap': np.nan
-        }, index=pd.MultiIndex.from_product([[symbol], missing_timestamps], names=['symbol', 'timestamp']))
-
-        # Use pd.concat to append the missing data
-        df = pd.concat([df, missing_data])
+        missing_timestamps = pd.date_range(
+            start=last_timestamp + pd.Timedelta(minutes=1),
+            end=latest_timestamp,
+            freq='min',
+            tz=last_timestamp.tz
+        )
         
-    # No return statement as requested; df is modified in place if necessary.
+        # Get the last row of the DataFrame to replicate values
+        val = df['close'].iloc[-1]
+
+        # Iterate over missing timestamps and set values directly (to ensure in place)
+        for timestamp in missing_timestamps:
+            df.loc[(symbol, timestamp), :] = {
+                'open': val,
+                'high': val,
+                'low': val,
+                'close': val,
+                'volume': 0,
+                'trade_count': 0
+            }
+
 
 def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[IntendedOrder]:
     """
@@ -124,6 +125,8 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[Int
     """
     # Validate input length
     assert len(orders_list) <= 2
+    if not orders_list:
+        return orders_list
     
     # Return single orders unchanged
     if len(orders_list) == 1:
@@ -178,7 +181,8 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[Int
                 symbol=second_order.symbol,
                 qty=abs(qty_difference),
                 price=second_order.price,  # Use second order price as it's more recent
-                position=second_order.position  # Use new position for tracking
+                position=second_order.position,  # Use new position for tracking
+                fees=first_order.fees + second_order.fees # NOTE: overestimating fees for now
             )
             
             return [combined_order]
@@ -201,11 +205,12 @@ class LiveTrader:
     trading_stream: TradingStream = field(init=False)
     historical_client: StockHistoricalDataClient = field(init=False)
     trading_strategy: Optional[TradingStrategy] = None
-    balance: float = field(init=False)
+    # balance: float = field(init=False)
     bars: pd.DataFrame = field(default_factory=pd.DataFrame)
     bars_adjusted: pd.DataFrame = field(default_factory=pd.DataFrame)
-    quotes_raw: pd.DataFrame = field(default_factory=pd.DataFrame)
-    quotes_agg: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # quotes_raw: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # quotes_agg: pd.DataFrame = field(default_factory=pd.DataFrame)
+    prev_quotes_raw: pd.DataFrame = field(default_factory=pd.DataFrame)
     trade_updates: List[TradeUpdate] = field(default_factory=list)
     is_ready: bool = False
     gap_filled: bool = False
@@ -227,7 +232,7 @@ class LiveTrader:
         self.trading_stream = TradingStream(self.api_key, self.secret_key, paper= livepaper == 'paper',
                                            websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
         self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
-        self.balance = self.initial_balance
+        # self.trading_strategy.balance = self.initial_balance
             
     async def reset_daily_data(self):
         log("Resetting daily data...")
@@ -295,10 +300,11 @@ class LiveTrader:
         except Exception as e:
             log(f"Error requesting bars for {self.symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
-        df.index = df.index.set_levels(
-            df.index.get_level_values('timestamp').tz_convert(self.ny_tz) + timedelta(minutes=1),
-            level='timestamp'
-        )
+        if not df.empty:
+            df.index = df.index.set_levels(
+                df.index.get_level_values('timestamp').tz_convert(self.ny_tz) + timedelta(minutes=1),
+                level='timestamp'
+            )
         df.sort_index(inplace=True)
         return fill_missing_data(df) # only fills betweem min and max time already in df
     
@@ -315,10 +321,10 @@ class LiveTrader:
         except Exception as e:
             log(f"Error requesting quotes for {self.symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
-        df, _ = clean_quotes_data(df, False, start, end)
+        df, _ = clean_quotes_data(df, False, start, end, calculate_durations=False)
         return df
     
-    def get_latest_quote(self, timestamp: datetime):
+    def get_latest_quote(self):
         request_params = StockLatestQuoteRequest(
             symbol_or_symbols=self.symbol,
             feed='sip' # default for market data subscription?
@@ -327,14 +333,15 @@ class LiveTrader:
         try:
             ret = get_stock_latest_quote_with_retry(self.historical_client, request_params)
         except Exception as e:
-            log(f"Error requesting latest quote for {self.symbol} at {timestamp}: {str(e)}", level=logging.ERROR)
+            log(f"Error requesting latest quote for {self.symbol}: {str(e)}", level=logging.ERROR)
             return None
         return ret
 
     def get_lagged_time(self):
         # return datetime.now(self.ny_tz) - timedelta(minutes=15, seconds=30)
         now = datetime.now(self.ny_tz).replace(second=0, microsecond=0)
-        return now - timedelta(minutes=16)
+        # return now - timedelta(minutes=16)
+        return now # allowed with market data subscription
     
     async def initialize_data(self):
         try:
@@ -354,7 +361,7 @@ class LiveTrader:
 
             if minutes_diff >= 16:
                 log(f"Historical data is too old. Latest data point: {self.last_hist_bar_dt}", logging.WARNING)
-                return
+                # return
 
             log(f"Initialized historical data: {len(self.bars)} bars")
             log(f"Data range: {self.bars.index.get_level_values('timestamp')[0]} to {self.last_hist_bar_dt}")
@@ -370,10 +377,9 @@ class LiveTrader:
             debug_print('---')
             if end > start:
                 new_data = self.get_historical_bars(start, end)
-                assert new_data.index.get_level_values('timestamp').min() > self.last_hist_bar_dt, (new_data.index.get_level_values('timestamp').min(), self.last_hist_bar_dt)
-                
-                debug_print('---')
                 if not new_data.empty:
+                    assert new_data.index.get_level_values('timestamp').min() > self.last_hist_bar_dt, (new_data.index.get_level_values('timestamp').min(), self.last_hist_bar_dt)
+
                     debug_print('---')
                     self.bars = pd.concat([self.bars, new_data])
                     debug_print('update_historical_data')
@@ -387,7 +393,9 @@ class LiveTrader:
                 
                 if self.last_hist_bar_dt < end:
                     log(f"calling fill_latest_missing_data for {self.last_hist_bar_dt} -> {end}", level=logging.WARNING)
+                    # print(self.bars)
                     fill_latest_missing_data(self.bars, end)
+                    # print(self.bars)
                     self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
         
         except Exception as e:
@@ -417,7 +425,8 @@ class LiveTrader:
         
     async def on_bar(self, bar:Bar, check_time: Optional[datetime] = None):
         self.timer_start = datetime.now()
-        debug_print(bar)
+        # debug_print('on_bar') # ,bar
+        log("on_bar")
         try:
             if not self.is_market_open(check_time):
                 log("Received bar outside market hours. Ignoring.")
@@ -435,8 +444,16 @@ class LiveTrader:
             # NOTE: there can be updated bars sent 30 seconds after the initial bar to account for any late-reported trades.
             # These updated bars will have the same timestamp as the original bar but with updated data.
             # https://forum.alpaca.markets/t/why-is-a-small-subset-of-1m-ohlcv-bars-delayed-by-30s-from-sip-websockets-data-connection/6207
-            # NOTE: ignore these bars!!!!
-            if not self.simulation_mode and bar_time == self.last_hist_bar_dt:
+            
+            # OR, instead of ignoring updated repeat-timestamp bars, accept them as normal bars. 
+            # May allow performance to be closer to backtesting but  slightly increases transaction costs.
+            
+            # VERDICT: ignore these bars. very little benefit.
+            
+            # TODO: compare with right data point (or just compare with both)
+            if not self.simulation_mode and (bar_time == self.streamed_bars.index.get_level_values('timestamp')[-1] or \
+                                             bar_time == self.bars.index.get_level_values('timestamp')[-1]):
+                log(f"Skipping repeated bar {bar}")
                 return
             
             now = datetime.now(self.ny_tz)
@@ -466,7 +483,7 @@ class LiveTrader:
             }
             new_row = pd.DataFrame([bar_data])
             new_row.set_index(['symbol','timestamp'], inplace=True)
-            debug_print(new_row)
+            # debug_print('new_row',new_row)
             
             if not is_simulate_bar:
                 self.streamed_bars = pd.concat([self.streamed_bars, new_row])
@@ -531,8 +548,11 @@ class LiveTrader:
             # Update TradingStrategy balance
             current_time = self.bars.index.get_level_values('timestamp')[-1]
             current_date = current_time.date()
+            # log(f'execute_trading_logic {current_time}')
             
-            
+            if self.trading_strategy.touch_detection_areas.quotes_raw is not None and not self.trading_strategy.touch_detection_areas.quotes_raw.empty:
+                self.prev_quotes_raw = self.trading_strategy.touch_detection_areas.quotes_raw.iloc[[-1]].copy(deep=True) # store copy of last row
+        
             # Calculate touch detection areas every minute
             # TODO: CALL THIS IN SEPARATE THREAD. It does not retrieve quotes data in the live params scenario.
             self.trading_strategy.update_strategy(self.calculate_touch_detection_area(self.trading_strategy.touch_detection_areas.market_hours))
@@ -542,10 +562,20 @@ class LiveTrader:
             # get quotes data
             if self.simulation_mode:
                 # NOTE: follow similar quotes data processing as retrieve_quote_data
-                self.quotes_raw = self.get_historical_quotes(start = current_time - timedelta(seconds=2), 
-                                                             end = current_time + timedelta(seconds=1))             # TODO: end should just be now
-
+                self.trading_strategy.touch_detection_areas.quotes_raw = self.get_historical_quotes(start = current_time - timedelta(seconds=2), 
+                                                             end = current_time + timedelta(seconds=1))
+                # ensure there is at least 1 datapoint before the minute mark
+                if self.trading_strategy.touch_detection_areas.quotes_raw.empty or \
+                    self.trading_strategy.touch_detection_areas.quotes_raw.index.get_level_values('timestamp')[0] > current_time:
+                    temp = self.get_historical_quotes(start = current_time - timedelta(seconds=59), 
+                                                             end = current_time - timedelta(seconds=2))
+                    if not temp.empty:
+                        self.trading_strategy.touch_detection_areas.quotes_raw = pd.concat([temp, self.trading_strategy.touch_detection_areas.quotes_raw])
+                    else:
+                        self.trading_strategy.touch_detection_areas.quotes_raw = pd.concat([self.prev_quotes_raw, self.trading_strategy.touch_detection_areas.quotes_raw])
+                    
                 # self.quotes_agg = 
+                self.trading_strategy.touch_detection_areas.quotes_agg = pd.DataFrame() # placeholder
 
                 # if self.quotes_raw is None: #  or self.quotes_agg is None
                 #     return
@@ -556,9 +586,11 @@ class LiveTrader:
             else:
                 # NOTE: need real time data!
                 # raise NotImplementedError('getting live quotes data not implemented for live trading')
+                self.trading_strategy.touch_detection_areas.quotes_raw = pd.DataFrame() # placeholder
+                self.trading_strategy.touch_detection_areas.quotes_agg = pd.DataFrame() # placeholder
                 
-                # TODO: get latest quote and put it in self.quotes_raw
-                self.trading_strategy.latest_quote = self.get_latest_quote(current_time)
+                # TODO: get latest quote BUT do it AFTER order submitted (for recordkeeping), and in SEPERATE THREAD
+                self.trading_strategy.latest_quote = self.get_latest_quote()
                 
 
             # print(self.trading_strategy.touch_detection_areas.symbol)
@@ -570,18 +602,34 @@ class LiveTrader:
             
             
             # NOTE: IF USING LIMIT PRICING: pass in quotes data
-            self.trading_strategy.touch_detection_areas.quotes_raw = self.quotes_raw
-            self.trading_strategy.touch_detection_areas.quotes_agg = self.quotes_agg
+            # print(self.trading_strategy.touch_detection_areas.quotes_raw.shape)
+            # print(self.trading_strategy.touch_detection_areas.quotes_agg.shape)
+            # log(f'execute_trading_logic {current_time}')
+            orders_list0, positions_to_remove = self.trading_strategy.process_live_data(current_time, self.timer_start, self.area_ids_to_side_switch[current_date])
+            orders_list = combine_two_orders_same_symbol(orders_list0)
             
-            orders_list, positions_to_remove = self.trading_strategy.process_live_data(current_time, self.timer_start, self.area_ids_to_side_switch[current_date])
-            
-            if orders_list:
-                # log(f"{current_time.strftime("%H:%M")}: {len(orders_list)} ORDERS CREATED")  
+            if orders_list0:
+                # log(f"{current_time.strftime("%H:%M")}: {len(orders_list0)} ORDERS CREATED")  
                 
+                
+                if len(orders_list) != len(orders_list0):
+                    
+                    if len(orders_list) == 0:
+                        a = orders_list0[-1]
+                        log(f"            Zero net qty change. No order created.",level=logging.INFO)
+                    
+                    for a in orders_list:
+                        # log({k:order[k] for k in order if k != 'position'})
+                        peak = a.position.max_close if a.position.is_long else a.position.min_close
+                        log(f"            {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
+                            level=logging.INFO)
+                        
+                        
                 if not self.simulation_mode:
                     # Place all orders concurrently
                     
-                    orders_list = combine_two_orders_same_symbol(orders_list)
+                    # TODO: PLACE ORDER
+                    pass
                     
                     # not sure how to do this. 2 options:
                     # for order in orders_list:
@@ -590,42 +638,35 @@ class LiveTrader:
                 else:
                     # In simulation mode, just log the orders (already done in TradingStrategy)
                     
-                    # log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f} after {len(orders_list)} orders.", level=logging.INFO)
+                    # log(f"    Remaining ${self.trading_strategy.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f} after {len(orders_list0)} orders.", level=logging.INFO)
                     # log(f"    market value ${self.total_market_value:.4f}, margin used ${self.margin_used:.4f}, buying power ${self.buying_power:.4f}", level=logging.INFO)
-                    
-                    for a in orders_list:
-                        # log({k:order[k] for k in order if k != 'position'})
-                        peak = a.position.max_close if a.position.is_long else a.position.min_close
-                        log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
-                            level=logging.INFO)
+
+                    # print(len(orders_list), len(orders_list0))
+
+                    pass
+                        
                         
                     # log(f"{[f"{a.position.id} {a.position.is_long} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, width {a.position.area.get_range:.4f}" for a in orders_list]} {self.trading_strategy.balance:.4f}")
                     
-                    # orders_list_2 = combine_two_orders_same_symbol(orders_list)
-                    # if orders_list_2 == orders_list:
-                        
-                        
-                        
-                        
-                        
-                    
-                if orders_list[0].action == 'open':
-                    log(self.trading_strategy.df)
-                    
-                    
+                # if orders_list[0].action == 'open':
+                #     log(self.trading_strategy.daily_bars)
+                      
                     
                 # total_areas = len(self.trading_strategy.touch_detection_areas.long_touch_area)+len(self.trading_strategy.touch_detection_areas.short_touch_area)+len(self.area_ids_to_remove[current_date])
                 # log(f"{len(self.trading_strategy.touch_detection_areas.long_touch_area)}+{len(self.trading_strategy.touch_detection_areas.short_touch_area)}+{len(self.area_ids_to_remove[current_date])} = {total_areas}")
                 
                 # plot_touch_detection_areas(self.trading_strategy.touch_detection_areas) # for testing
-                pass
             
             
             # do after to not slow things down
-            self.trades.extend(positions_to_remove)
-            # self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
-            self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | set.union(*(position.cleared_area_ids for position in positions_to_remove))
-            self.area_ids_to_side_switch[current_date] = self.area_ids_to_side_switch[current_date] | {a.position.area.id for a in orders_list if a.position.area.is_side_switched}
+            if positions_to_remove:
+                log(f'positions_to_remove: {[a.id for a in positions_to_remove]}', logging.DEBUG)
+                self.trades.extend(positions_to_remove)
+            # if positions_to_remove:
+            #     self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
+            if positions_to_remove:
+                self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | set.union(*(position.cleared_area_ids for position in positions_to_remove))
+            self.area_ids_to_side_switch[current_date] = self.area_ids_to_side_switch[current_date] | {a.position.area.id for a in orders_list0 if a.position.area.is_side_switched}
             
         except Exception as e:
             log(f"{type(e).__qualname__} in execute_trading_logic at {current_time}: {e}", logging.ERROR)
@@ -717,8 +758,13 @@ class LiveTrader:
     async def on_msg(self, data: TradeUpdate):
         # Print the update to the console.
         print(f"Update for order ID {data.order.id}. Event: {data.event}. Status: {data.order.status}")
-        
-        # TODO: update balance, cash, and accrued fees using trading account
+        print(data)
+        # TODO: BESIDES processing TradeUpdate, update balance, cash, and accrued fees using trading account
+        account = self.trading_client.get_account()    
+        print(account)
+        self.trading_strategy.update_balance_from_account(account)
+        # TODO
+
 
         # TODO: implement this function. relevant class:
         # class TradeUpdate(BaseModel):
@@ -838,10 +884,10 @@ class LiveTrader:
         # Recalculate balance based on the filled order
         filled_value = float(placed_order.filled_qty) * float(placed_order.filled_avg_price)
         if intended_order.side == OrderSide.BUY:
-            self.balance -= filled_value
+            self.trading_strategy.balance -= filled_value
         else:
-            self.balance += filled_value
-        log(f"Updated balance: {self.balance}")
+            self.trading_strategy.balance += filled_value
+        log(f"Updated balance: {self.trading_strategy.balance}")
     
     
     # NOTE: NO LONGER DOING LIMIT ORDERS
@@ -909,20 +955,22 @@ class LiveTrader:
     async def run(self):
         try:
             while True:
-                await self.wait_for_market_open()
+                # await self.wait_for_market_open()
                 await self.reset_daily_data()
 
                 self.data_stream.subscribe_bars(self.on_bar, self.symbol)
+                log(f'Subscribed to bars for {self.symbol}')
         
-                self.data_stream.subscribe_quotes(self.on_quote, self.symbol)
+                # self.data_stream.subscribe_quotes(self.on_quote, self.symbol)
                 
                 # self.data_stream.subscribe_trades(self.on_trade, self.symbol)
                 
-                self.trading_stream.subscribe_trade_updates
-                
+                self.trading_stream.subscribe_trade_updates(self.on_msg)
+                log(f'Subscribed to trade updates for current account')
                 
                 update_task = asyncio.create_task(self.update_historical_periodically())
-                stream_task = asyncio.create_task(self.data_stream._run_forever())
+                data_stream_task = asyncio.create_task(self.data_stream._run_forever())
+                trading_stream_task = asyncio.create_task(self.trading_stream._run_forever())
                 
                 while self.is_market_open():
                     await asyncio.sleep(1)
@@ -932,10 +980,11 @@ class LiveTrader:
                 self.data_stream.unsubscribe_bars(self.symbol)
                 
                 update_task.cancel()
-                stream_task.cancel()
+                data_stream_task.cancel()
+                trading_stream_task.cancel()
                 # try:
                 #     await update_task
-                #     await stream_task
+                #     await data_stream_task
                 # except asyncio.CancelledError:
                 #     pass
                 
@@ -972,21 +1021,28 @@ class LiveTrader:
             return
         
         # Initialize data with the first minute
-        self.bars = day_data.iloc[:2]
+        # self.bars = day_data.iloc[:2]
         # self.bars_adjusted = day_data_adjusted.iloc[:2]
         
         # reset data logic
-        self.trading_strategy = TradingStrategy(self.calculate_touch_detection_area(), self.strategy_params, is_live_trading=True)
-        self.trading_strategy.update_daily_parameters(current_date) # assuming only simulating one day
+
 
         text_trap = io.StringIO()
         
         # Simulate each minute of the day
-        for timestamp in tqdm(day_data.index.get_level_values('timestamp')[2:]):
+        # for timestamp in tqdm([a for a in day_data.index.get_level_values('timestamp') if a.time() >= time(10, 37)]):
+        for timestamp in [a for a in day_data.index.get_level_values('timestamp') if a.time() >= time(10, 37)]:
+        # for timestamp in tqdm(day_data.index.get_level_values('timestamp')[2:]):
             # log(timestamp)
             # Update self.bars with all rows up to and including the current timestamp
             self.bars = day_data.loc[day_data.index.get_level_values('timestamp') <= timestamp]
             self.last_hist_bar_dt = self.bars.index.get_level_values('timestamp')[-1]
+            
+            
+            if self.trading_strategy is None:
+                self.trading_strategy = TradingStrategy(self.calculate_touch_detection_area(), self.strategy_params, log_level=logging.INFO, is_live_trading=True)
+                self.trading_strategy.update_daily_parameters(current_date) # assuming only simulating one day
+                    
             
             await self.simulate_bar()
             
@@ -1016,31 +1072,38 @@ tracemalloc.start()
 
 async def main():
     # symbol = "AMZN"
-    symbol = "AAPL"
-    initial_balance = 10000
-    # initial_balance = 10103.889074410155
+    # symbol = "AAPL"
+    # symbol = "SOL"
+    symbol = "ETH"
+    # symbol = "TSLA"
     
-    simulation_mode = True  # Set this to True for simulation, False for live trading
+    simulation_mode = False  # Set this to True for simulation, False for live trading
 
     touch_detection_params = LiveTouchDetectionParameters(
         symbol=symbol,
-        atr_period=15,
-        level1_period=15,
-        multiplier=1.4,
-        min_touches=3,
+        # atr_period=15,
+        # level1_period=15,
+        # multiplier=1.4,
+        # min_touches=3,
         start_time=None,
         end_time='15:55',
         # end_time='11:20',
-        use_median=True,
-        touch_area_width_agg=np_median,
+        # use_median=True,
+        # touch_area_width_agg=np_median,
 
-        ema_span=12,
-        price_ema_span=26
+        # ema_span=12,
+        # price_ema_span=26
         
     )
-
+    
+    
+    
+    initial_balance = 30_000
+    # initial_balance = 10103.889074410155
+    
     strategy_params = StrategyParameters(
         initial_investment=initial_balance,
+        max_investment=initial_balance,
         do_longs=True,
         do_shorts=True,
         sim_longs=True,
@@ -1048,22 +1111,39 @@ async def main():
         
         use_margin=True,
         
+        assume_marginable_and_etb=False,
+        
         times_buying_power=1,
         
         soft_start_time = None, 
-        soft_end_time = '15:50',
+        soft_end_time = '15:30',
+            
+        # plot_day_results=True,
+        
+        # allow_reversal_detection=True, # False (no switching) seems better for more stocks. If True, clear_passed_areas=True might improve performance.
+        
+        # clear_passed_areas=True, # False is better for meme stocks, True better for mid and losing stocks (reduces losses).
+        # clear_traded_areas=True,
+        
+        # min_stop_dist_relative_change_for_partial=1,
+    
     )
 
+    
+    strategy_params.gradual_entry_range_multiplier = 0.9
+    strategy_params.ordersizing.max_volume_percentage = 0.2 # %. default is 1 %
+    strategy_params.slippage.slippage_factor = 0
+    
     trader = LiveTrader(API_KEY, API_SECRET, symbol, initial_balance, touch_detection_params, strategy_params, simulation_mode)
 
     try:
-        # await trader.run()
+        await trader.run()
         
         
-        # date_to_simulate = date(2024, 8, 20)
-        date_to_simulate = date(2024, 9, 4)
-        results = await trader.run_day_sim(date_to_simulate)
-        print(results)
+        # # date_to_simulate = date(2024, 8, 20)
+        # date_to_simulate = date(2024, 9, 4)
+        # results = await trader.run_day_sim(date_to_simulate)
+        # print(results)
         
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Stopping trader.")

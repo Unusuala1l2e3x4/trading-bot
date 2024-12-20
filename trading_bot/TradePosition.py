@@ -37,27 +37,30 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
     # ATR effect (dynamic volatility adjustment)
     atr_effect = 1 + atr_sensitivity * normalized_atr
     
-    # Trade size multiplier (captures relative trade size impact)
-    trade_size_multiplier = max(1, float(trade_size) / avg_volume)
+    # Trade size impact (square root dampens the effect)
+    trade_size_multiplier = (float(trade_size) / avg_volume) ** 0.5
     
-    # Adjust slippage per share
-    slippage_per_share = slippage_factor * atr_effect * trade_size_multiplier
-
-    # Convert slippage to percentage of price
-    slippage = slippage_per_share / price
+    # Base slippage per share adjusted for volatility
+    slippage_per_share = slippage_factor * atr_effect
+    
+    # Total slippage amount including size impact
+    total_slippage = slippage_per_share * trade_size * (1 + trade_size_multiplier)
+    
+    # Convert to price ratio
+    slippage_ratio = total_slippage / (price * trade_size)
     
     if is_long:
         if is_entry:
             pass  # Increase price for long entries
         else:
-            slippage *= -1  # Decrease price for long exits
+            slippage_ratio *= -1  # Decrease price for long exits
     else:  # short
         if is_entry:
-            slippage *= -1  # Decrease price for short entries
+            slippage_ratio *= -1  # Decrease price for short entries
         else:
             pass  # Increase price for short exits
 
-    return price * (1 + slippage), slippage * price
+    return price * (1 + slippage_ratio), slippage_ratio * price
 
 
 @dataclass
@@ -114,7 +117,7 @@ class TradePosition:
     
     transactions: List[Transaction] = field(default_factory=list)
     area_width_history: List[float] = field(default_factory=list)
-    cleared_area_ids: Set[int] = field(default_factory=list)
+    cleared_area_ids: Set[int] = field(default_factory=set)
     current_stop_price: Optional[float] = None
     current_stop_price_2: Optional[float] = None
     
@@ -181,7 +184,7 @@ class TradePosition:
         self.shares = 0
         self.cash_committed = 0
         self.max_shares, self.max_max_shares, self.min_max_shares = self.target_max_shares, self.target_max_shares, self.target_max_shares
-        self.logger = self.setup_logger(logging.WARNING)
+        self.logger = self.setup_logger(self.log_level)
         
         # Calculate full entry price based on area range
         if self.is_long:
@@ -189,44 +192,32 @@ class TradePosition:
         else:
             self.full_entry_price = self.area.get_buy_price - (self.area.get_range * self.gradual_entry_range_multiplier)
             
-        # Calculate initial shares based on price movement
-        if (self.is_long and self.bar_at_entry.close >= self.full_entry_price) or \
-           (not self.is_long and self.bar_at_entry.close <= self.full_entry_price):
-            # Price already beyond full entry threshold - allow full position
-            self.has_crossed_full_entry = True
-            self.full_entry_time = self.entry_time
-            self.max_target_shares_limit = self.target_max_shares
-        else:
-            # Calculate partial position size
-            self.max_target_shares_limit = self.calculate_initial_target_shares()
-            
-        self.initial_shares = self.max_target_shares_limit
-        self.max_shares_reached = self.max_target_shares_limit
+        # Initial setup only - update_stop_price will handle the rest
+        self.has_crossed_full_entry = False
+        self.max_target_shares_limit = None
+        self.max_shares_reached = 0
+        self.initial_shares = None
         self.update_stop_price(self.bar_at_entry, self.entry_time)
         
-        
-    def calculate_initial_target_shares(self) -> int:
-        """
-        Calculate initial target shares based on price movement beyond entry price.
-        Always returns at least 1 share if target_max_shares > 0.
-        """
+    def calculate_target_shares_from_price(self, current_price: float) -> int:
+        """Calculate target shares based on how close price is to full entry"""
         if self.target_max_shares <= 0:
             return 0
             
         if self.is_long:
-            price_movement = self.bar_at_entry.high - self.area.get_buy_price
+            price_movement = current_price - self.area.get_buy_price
             full_movement = self.full_entry_price - self.area.get_buy_price
         else:
-            price_movement = self.area.get_buy_price - self.bar_at_entry.low
+            price_movement = self.area.get_buy_price - current_price
             full_movement = self.area.get_buy_price - self.full_entry_price
             
-        assert price_movement >= 0, f"Negative price movement: {price_movement}"
-        
+        # Note: price_movement could be negative if price moved away
         target_pct = np.clip(price_movement / full_movement, 0, 1.0)
         shares = math.floor(target_pct * self.target_max_shares)
         
-        # Ensure at least 1 share if initial_shares > 0
+        # Ensure at least 1 share
         return max(1, shares)
+    
 
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('TradePosition')
@@ -263,6 +254,8 @@ class TradePosition:
         sec_fee = SEC_FEE_RATE * trade_value if is_sell else 0
         
         commission = ELITE_SMART_ROUTER_RATE * shares
+        
+        # TODO: also calculate borrow costs for longs if there is > 1 times_buying_power (margin usage) 
         
         stock_borrow_cost = 0
         if not self.is_long and not is_entry:  # Stock borrow cost applies only to short position exits
@@ -384,16 +377,49 @@ class TradePosition:
             self.current_stop_price_2 = self.min_close + self.area.get_range * 3
         
         # self.update_market_value(quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
-        self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}")
-        
+        self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}",level=logging.DEBUG)
+            
         # Check if price has crossed full entry threshold
         if not self.has_crossed_full_entry:
             if (self.is_long and bar.close >= self.full_entry_price) or \
-               (not self.is_long and bar.close <= self.full_entry_price):
+            (not self.is_long and bar.close <= self.full_entry_price):
+                # Full entry condition met - go to maximum size
                 self.has_crossed_full_entry = True
                 self.full_entry_time = current_timestamp
-                self.max_target_shares_limit = self.max_shares
+                self.max_target_shares_limit = self.target_max_shares
+                self.max_shares_reached = max(self.max_shares_reached, self.max_target_shares_limit)
+                if self.initial_shares is None:
+                    self.initial_shares = self.max_target_shares_limit
+                # self.log(f"100% of target shares ({self.target_max_shares}) reached at entry",level=logging.INFO)
+                self.log(f"100% of target shares ({self.target_max_shares}) reached {(current_timestamp - self.entry_time).total_seconds()/60 :.2f} min after entry",level=logging.INFO)
+            else:
+                # Check for close price crossing buy price
+                current_limit = self.max_target_shares_limit or 0 # default 0 for comparisons of limits
+                new_limit = self.calculate_target_shares_from_price(bar.close)
                 
+                # Scale up based on close price (when full entry not reached but close has crossed entry price)
+                # NOTE: commenting this out seems to improve performance
+                # if (self.is_long and bar.close >= self.area.get_buy_price) or \
+                # (not self.is_long and bar.close <= self.area.get_buy_price):
+                #     # Close has crossed buy price - calculate size based on movement
+                #     if new_limit > current_limit:
+                #         self.max_target_shares_limit = new_limit
+                #         self.max_shares_reached = max(self.max_shares_reached, new_limit)
+                #         if self.initial_shares is None:
+                #             self.initial_shares = new_limit
+                #         self.log(f"Close price crossed {(current_timestamp - self.entry_time).total_seconds()/60 :.2f} min after entry: {new_limit} shares ({(new_limit/self.target_max_shares)*100:.1f}%)",level=logging.INFO)
+                # else:
+                
+                # Close hasn't crossed but high/low has - start with 1 share
+                if self.max_target_shares_limit is None:
+                    self.max_target_shares_limit = 1
+                    self.max_shares_reached = self.max_target_shares_limit
+                    self.initial_shares = self.max_target_shares_limit
+                    self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
+                elif new_limit > current_limit:
+                    # Maintain current limit until close crosses buy price
+                    self.max_target_shares_limit = current_limit
+
         return self.should_exit(bar.close), self.should_exit_2(bar.close)
 
     def should_exit(self, current_price: float) -> bool:

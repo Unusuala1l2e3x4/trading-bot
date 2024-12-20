@@ -191,8 +191,9 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
         except Exception as e:
             log(f"Error requesting bars for {symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
-        df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz) + timedelta(minutes=1), level='timestamp')
-        df.sort_index(inplace=True)
+        if not df.empty:
+            df.index = df.index.set_levels(df.index.get_level_values('timestamp').tz_convert(ny_tz) + timedelta(minutes=1), level='timestamp')
+            df.sort_index(inplace=True)
         return fill_missing_data(df)
 
     if df is None:
@@ -352,7 +353,7 @@ def calculate_twap_micro_data(df: pd.DataFrame, interval_start: datetime, interv
     )
 
 # NOTE: results in micro dataset
-def clean_quotes_data(df: pd.DataFrame, carryover_exists: bool, interval_start: pd.Timestamp, interval_end: pd.Timestamp) -> Tuple[pd.DataFrame, float]:
+def clean_quotes_data(df: pd.DataFrame, carryover_exists: bool, interval_start: pd.Timestamp, interval_end: pd.Timestamp, calculate_durations: bool = True) -> Tuple[pd.DataFrame, float]:
     """
     Clean quotes data and calculate intra-timestamp changes with improved efficiency.
     """
@@ -383,15 +384,16 @@ def clean_quotes_data(df: pd.DataFrame, carryover_exists: bool, interval_start: 
     )
 
     # Calculate durations
-    timestamps_series = df_agg.index.get_level_values('timestamp').tz_localize(None).to_series().astype('datetime64[us]')
-    duration_series = timestamps_series.diff().dt.total_seconds().shift(-1)
-    df_agg['duration'] = duration_series.values
-    last_duration = (interval_end.tz_localize(None) - timestamps_series.iloc[-1]).total_seconds()
-    df_agg.iloc[-1, df_agg.columns.get_loc('duration')] = last_duration
-    
-    # Validations
-    assert not np.any(duration_series.values[:-1] <= 0), \
-           ("Zero or negative durations found after processing\n", df_agg.loc[df_agg['duration'] <= 0])
+    if calculate_durations:
+        timestamps_series = df_agg.index.get_level_values('timestamp').tz_localize(None).to_series().astype('datetime64[us]')
+        duration_series = timestamps_series.diff().dt.total_seconds().shift(-1)
+        df_agg['duration'] = duration_series.values
+        last_duration = (interval_end.tz_localize(None) - timestamps_series.iloc[-1]).total_seconds()
+        df_agg.iloc[-1, df_agg.columns.get_loc('duration')] = last_duration
+        
+        # Validations
+        assert not np.any(duration_series.values[:-1] <= 0), \
+            ("Zero or negative durations found after processing\n", df_agg.loc[df_agg['duration'] <= 0])
     assert interval_start <= timestamps[0], (interval_start, timestamps[0])
     
     carryover = (timestamps[0] - interval_start).total_seconds()

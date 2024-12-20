@@ -25,7 +25,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.trading import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.enums import OrderSide
-from alpaca.trading.models import TradeAccount
+from alpaca.trading.models import TradeAccount, Position
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 from alpaca.data.models import Bar, Quote
@@ -79,6 +79,72 @@ class IntendedOrder:
             fees=self.fees
         )
 
+    def format_order(self) -> str:
+        """
+        Format a single order into a human-readable string.
+        
+        Returns:
+            str: A formatted string describing the order details
+        
+        Example:
+            "AAPL: Open Long 100 shares @ $150.25 (Position #123, Fees: $1.50)"
+        """
+        # Extract the side without the enum prefix
+        side_str = str(self.side).split('.')[1]
+        
+        # Format position details
+        position_str = f"Position #{self.position.id}"
+        if hasattr(self.position, 'current_stop_price') and self.position.current_stop_price is not None:
+            peak = self.position.max_close if self.position.is_long else self.position.min_close
+            if peak is not None:
+                position_str += f", Peak-Stop: ${peak:.2f}-${self.position.current_stop_price:.2f}"
+        
+        # Build the complete order string
+        order_parts = [
+            f"{self.symbol}:",
+            self.action.capitalize(),
+            side_str,
+            f"{self.qty} shares",
+            f"@ ${self.price:.2f}",
+            f"({position_str},",
+            f"Fees: ${self.fees:.2f})"
+        ]
+        
+        return " ".join(order_parts)
+
+    @classmethod
+    def format_orders(cls, orders: List['IntendedOrder']) -> str:
+        """
+        Format a list of orders into a human-readable string.
+        
+        Args:
+            orders: List of IntendedOrder objects
+            
+        Returns:
+            str: A formatted string containing all orders, one per line
+        
+        Example:
+            "Orders (3):
+             1. AAPL: Open Long 100 shares @ $150.25 (Position #123, Fees: $1.50)
+             2. MSFT: Partial Exit Short 50 shares @ $280.75 (Position #124, Fees: $0.75)
+             3. GOOGL: Close Long 75 shares @ $2750.50 (Position #125, Fees: $2.25)"
+        """
+        if not orders:
+            return "No orders"
+            
+        # Build header with order count
+        header = f"Orders ({len(orders)}):"
+        
+        # Format each order with a number prefix
+        formatted_orders = [
+            f"{i+1}. {order.format_order()}"
+            for i, order in enumerate(orders)
+        ]
+        
+        # Combine header and formatted orders
+        return header + "\n" + "\n".join(formatted_orders)
+    
+    
 from trading_bot.TradingStrategyParameters import *
 
 
@@ -148,10 +214,11 @@ class TradingStrategy:
     # Fields with default values
     all_bars: pd.DataFrame = field(init=False)
     logger: logging.Logger = field(init=False)
-    balance: float = field(init=False)
+    balance: float = field(init=False) # equivalent to account buying power divided by margin multiplier
     open_positions: Set[TradePosition] = field(default_factory=set)
     trades: List[TradePosition] = field(default_factory=list)
     terminated_area_ids: Dict[pd.Timestamp, List[int]] = field(default_factory=dict)
+    traded_area_ids: Dict[pd.Timestamp, List[int]] = field(default_factory=dict)
     trades_executed: int = 0
     simultaneous_close_open: int = 0
     is_marginable: bool = field(init=False)
@@ -182,7 +249,9 @@ class TradingStrategy:
     now_bid_price: float = field(init=False)
     now_ask_price: float = field(init=False)
     
-    latest_quote: Optional[Quote] = None
+    latest_quote: Optional[Quote] = None # only used for live trading
+    
+    log_level: Optional[int] = logging.INFO
     
     daily_bars_index: int = field(init=False)
     soft_end_triggered: bool = False
@@ -208,9 +277,10 @@ class TradingStrategy:
     
     
     def __post_init__(self):
+        self.latest_quote_time = None
+        
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
-        # self.logger = self.setup_logger(logging.INFO)
-        self.logger = self.setup_logger(logging.WARNING)
+        self.logger = self.setup_logger(self.log_level)
         self.initialize_strategy()
 
     def setup_logger(self, log_level=logging.INFO):
@@ -257,6 +327,9 @@ class TradingStrategy:
     def update_strategy(self, touch_detection_areas: TouchDetectionAreas):
         self.touch_detection_areas = touch_detection_areas
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
+        if self.is_live_trading:
+            self.daily_bars = self.all_bars  # In live trading, all data is "daily data"
+            self.daily_bars_index = len(self.daily_bars) - 1
         self.initialize_touch_areas()
 
     @property
@@ -278,12 +351,20 @@ class TradingStrategy:
         }
 
         
-    def rebalance(self, is_simulated: bool, cash_change: float, current_price: float = None):
-        if not is_simulated:
+    def rebalance(self, is_simulated: bool, cash_change: float):
+        if is_simulated:
+            return
+        if not self.is_live_trading:
             old_balance = self.balance
             new_balance = self.balance + cash_change
             assert new_balance >= 0, f"Negative balance encountered: {new_balance:.4f} ({old_balance:.4f} {cash_change:.4f})"
             self.balance = new_balance
+        else:
+            pass
+            # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
+            # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
+            # only the cost (cash committed/released) is adjusted with position.times_buying_power
+            # TODO: PERHAPS remove all times_buying_power adjustments and just go by buying_power.
 
         # Assert and debug printing logic here (similar to your original function)
         
@@ -296,7 +377,6 @@ class TradingStrategy:
         return sum(
             abs(position.market_value) * (1 - 1/position.times_buying_power)
             for position in self.open_positions
-            if position.use_margin
         )
 
     @property
@@ -305,6 +385,9 @@ class TradingStrategy:
     
     @property
     def total_equity(self):
+        # if self.is_live_trading:
+        #     # TODO: retrieve actual equity from LiveTrader
+        # else:
         return self.balance + self.total_market_value - self.margin_used
 
 
@@ -317,8 +400,19 @@ class TradingStrategy:
         
         # Convert from margined buying power to base balance
         base_balance = float(account.buying_power) / actual_margin_multiplier
-        self.update_balance(base_balance)
-
+        
+        # if account balance (buying power) is sufficient, do not update
+        balance_for_strategy = min(base_balance, self.balance)
+        
+        # if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
+        if self.balance != balance_for_strategy:
+            self.log(f"Updating balance from {self.balance:.2f} to {balance_for_strategy:.2f}",level=logging.WARNING)
+            self.balance = balance_for_strategy
+ 
+    def update_market_values_from_account(self, account: TradeAccount, positions: List[Position]):
+        # TODO: upate positions to matching TradePositions (matching if they are the same symbol)
+        # for the current strategy, self.open_positions and positions should all have length 1
+        pass
 
     def update_market_values(self, current_price: float):
         for position in self.open_positions:
@@ -328,7 +422,7 @@ class TradingStrategy:
     def exit_action(self, position: TradePosition):
         # Logic for handling position exit (similar to your original function)
         self.trades.append(position) # append position
-        self.touch_area_collection.del_open_position_area(position.area)
+        # self.touch_area_collection.del_open_position_area(position.area)
         self.open_positions.remove(position)
         
         
@@ -346,11 +440,19 @@ class TradingStrategy:
             
             # low = position.max_low # For mid/losing stocks: 3rd w/o switching, 2nd w/ switching
             # high = position.min_high
-            position.cleared_area_ids = self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
-        else:
-            position.cleared_area_ids = {position.area.id} # default
             
-
+            if self.params.clear_traded_areas:
+                position.cleared_area_ids = self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
+            else:
+                position.cleared_area_ids = self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
+        else:
+            if self.params.clear_traded_areas:
+                position.cleared_area_ids = {position.area.id} # default
+                self.touch_area_collection.terminate_area(position.area)
+            
+        # Always add the position's area to traded areas
+        self.touch_area_collection.add_traded_area(position.area)
+            
     def close_all_positions(self, current_timestamp: datetime, price_at_action: float, vwap: float, volume: float, avg_volume: float) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
         # Logic for closing all positions (similar to your original function)
         orders = []
@@ -367,7 +469,7 @@ class TradingStrategy:
             self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
             assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
             
-            self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, price_at_action)
+            self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
             if not position.is_simulated:
                 self.day_accrued_fees += fees_expected
                 
@@ -634,7 +736,9 @@ class TradingStrategy:
             is_marginable=self.is_marginable, # NOTE: when live, need to call is_security_marginable
             times_buying_power=actual_margin_multiplier,
             
-            gradual_entry_range_multiplier=self.params.gradual_entry_range_multiplier
+            gradual_entry_range_multiplier=self.params.gradual_entry_range_multiplier,
+            
+            log_level=self.log_level
             
             # # Use price_at_action for initial peak-stop
             # current_stop_price=price_at_action - area.get_range if area.is_long else price_at_action + area.get_range,
@@ -679,9 +783,9 @@ class TradingStrategy:
         
         # Add to open positions (regardless if real or simulated)
         self.open_positions.add(position)
-        self.touch_area_collection.add_open_position_area(area)
+        # self.touch_area_collection.add_open_position_area(area)
         
-        self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power), self.now_bar.close)
+        self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
         if not position.is_simulated:
             self.day_accrued_fees += fees_expected
         
@@ -770,9 +874,6 @@ class TradingStrategy:
             
             if not price_at_action:
                 should_exit, should_exit_2 = position.update_stop_price(self.now_bar, current_timestamp) # NOTE: continue using bar price here
-                
-                
-                
                 target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
                 
                 # print(target_shares, position.max_shares, should_exit)
@@ -832,7 +933,7 @@ class TradingStrategy:
                         self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                         assert qty_intended == shares_change, (qty_intended, shares_change)
                         
-                        self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl, price_at_action)
+                        self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
                         
@@ -880,7 +981,7 @@ class TradingStrategy:
                             assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
                             assert qty_intended == shares_to_buy, (qty_intended, shares_to_buy)
                             
-                            self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power), price_at_action)
+                            self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
                             if not position.is_simulated:
                                 self.day_accrued_fees += fees_expected
                             
@@ -917,13 +1018,6 @@ class TradingStrategy:
         else:
             self.day_start_time = self.day_end_time = self.day_soft_start_time = None
 
-    def update_balance(self, new_balance):
-        # if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
-        if self.balance != new_balance:
-            self.log(f"Updating balance from {self.balance:.2f} to {new_balance:.2f}")
-        self.balance = new_balance
-        
-        
     def get_quote_indices(self, all_data: pd.DataFrame, indices: pd.DatetimeIndex, seconds_offset=0) -> Tuple[pd.DataFrame, np.ndarray]:
         # Extract the timestamps from all_data
         start_date = pd.Timestamp(self.current_date, tz=ny_tz)
@@ -944,7 +1038,7 @@ class TradingStrategy:
         return daily, positions
 
     def handle_new_trading_day(self, current_timestamp):
-        # self.log(f"handle_new_trading_day start", level=logging.WARNING)
+        # self.log(f"handle_new_trading_day start", level=logging.INFO)
         self.current_date = current_timestamp.date()
         self.update_daily_parameters(self.current_date)
         self.next_position_id = 0
@@ -958,13 +1052,6 @@ class TradingStrategy:
             # daily_bars_minutes = self.all_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
             # daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
             # pass
-            
-            self.daily_quotes_raw = self.touch_detection_areas.quotes_raw
-            self.daily_quotes_agg = self.touch_detection_areas.quotes_agg
-            
-            # NOTE: dont use quotes data for live trading (for now?)
-            assert self.daily_quotes_raw.empty
-            assert self.daily_quotes_agg.empty
             
         else:
             # Use searchsorted to find start and end positions for daily_bars
@@ -993,60 +1080,73 @@ class TradingStrategy:
     def get_quotes_raw(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
         # NOTE: MAKE SURE self.handle_new_trading_day got the matching raw quotes data 
         assert self.touch_detection_areas.quotes_raw is not None
-        assert self.daily_quotes_raw is not None
         assert self.daily_bars_index is not None
+        
+        if self.is_live_trading: 
+            self.daily_quotes_raw = self.touch_detection_areas.quotes_raw
             
-        if self.is_live_trading: # NOTE: useful only if using limit pricing
+        if self.latest_quote is None:
+            assert self.daily_quotes_raw is not None and not self.daily_quotes_raw.empty, self.daily_quotes_raw
+            
+        if self.is_live_trading and self.latest_quote is not None: # if not self.simulation_mode in LiveTrader
             # raise NotImplementedError('get_quotes_raw not implemented for live trading')
             
-            if self.latest_quote is not None:
-                self.latest_quote_time = pd.Timestamp(self.latest_quote.timestamp).tz_localize(ny_tz) # TODO: ensure correct timezone
-                self.now_bid_price = self.latest_quote.bid_price
-                self.now_ask_price = self.latest_quote.ask_price
-                
-                print('LATEST QUOTE:',self.latest_quote_time, self.now_bid_price, self.now_ask_price)
+            self.latest_quote_time = pd.Timestamp(self.latest_quote.timestamp).tz_localize(ny_tz)
+            self.now_bid_price = self.latest_quote.bid_price
+            self.now_ask_price = self.latest_quote.ask_price
             
-            return pd.DataFrame()
+            # self.log(f'LATEST QUOTE: {self.latest_quote_time} {self.now_bid_price} {self.now_ask_price}',level=logging.INFO)
 
-            # self.now_time = datetime.now()
-            # delay = self.now_time - current_timestamp
-            # assert timedelta(0) <= delay < timedelta(seconds=1), f"Delay of {delay} after {current_timestamp}. In normal circumstances, delay should be < 1 second."
-            # self.latest_quote_time = self.daily_quotes_raw.index.get_level_values('timestamp')[-1]
-            # self.now_bid_price = self.daily_quotes_raw.iloc[-1]['bid_price_last'].item()
-            # self.now_ask_price = self.daily_quotes_raw.iloc[-1]['ask_price_last'].item()
-            # return filter_df_by_timerange(self.daily_quotes_raw, self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
+            self.now_time = datetime.now(ny_tz)
+            delay = self.now_time - current_timestamp
+            assert timedelta(0) <= delay < timedelta(seconds=1), f"Delay of {delay.total_seconds()} seconds after {current_timestamp}. In normal circumstances, delay should be < 1 second."
+            return self.daily_quotes_raw
+        
         else:
-            if self.daily_bars_index >= len(self.daily_quotes_raw_indices)-1:
-                return None
+            assert self.daily_quotes_raw is not None
             
-            ret = self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices[self.daily_bars_index] : self.daily_quotes_raw_indices[self.daily_bars_index + 1]]
+            if not self.is_live_trading:
+                if self.daily_bars_index >= len(self.daily_quotes_raw_indices)-1:
+                    return None
+                
+                ret = self.daily_quotes_raw.iloc[self.daily_quotes_raw_indices[self.daily_bars_index] : self.daily_quotes_raw_indices[self.daily_bars_index + 1]]
+            else:
+                ret = self.daily_quotes_raw
+                assert self.daily_quotes_raw is not None and not self.daily_quotes_raw.empty, self.daily_quotes_raw
+
+            assert not ret.empty, ret
             dqr_timestamps = ret.index.get_level_values('timestamp')
+
             
             # NOTE: assuming a constant delay when backtesting
             # self.now_time = current_timestamp + timedelta(seconds=0.4) # for average accuracy
             self.now_time = current_timestamp # for comparisons while minimally impacting live trading latency
             pos = dqr_timestamps.searchsorted(self.now_time, side='right')  # Use 'right' to include the cutoff
             if pos == 0:
-                self.latest_quote_time = None  # Or some default value indicating no valid timestamp
+                # self.latest_quote_time = None  # Or some default value indicating no valid timestamp
                 return ret.iloc[:0]
             
             self.latest_quote_time = dqr_timestamps[pos-1] # -1 since side='right'
             self.now_bid_price = ret.iloc[pos-1]['bid_price_last'].item()
             self.now_ask_price = ret.iloc[pos-1]['ask_price_last'].item()
+            
+            # self.log(f'LATEST QUOTE: {self.latest_quote_time} {self.now_bid_price} {self.now_ask_price}',level=logging.INFO)
+            
             return filter_df_by_timerange(ret.iloc[:pos], self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
         
     def get_quotes_agg(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
         # NOTE: MAKE SURE self.handle_new_trading_day got the matching raw quotes data 
         assert self.touch_detection_areas.quotes_agg is not None
-        assert self.daily_quotes_agg is not None
         assert self.daily_bars_index is not None
         
         if self.is_live_trading: # NOTE: useful only if using limit pricing
             # raise NotImplementedError('get_quotes_agg not implemented for live trading')
-            return pd.DataFrame()
+            self.daily_quotes_agg = self.touch_detection_areas.quotes_agg
+            return self.daily_quotes_agg
         
             # ret = self.daily_quotes_agg
         else:
+            assert self.daily_quotes_agg is not None
             # NOTE: excludes any delay after bar timestamp
             if self.daily_bars_index >= len(self.daily_quotes_agg_indices)-1:
                 return None
@@ -1056,18 +1156,19 @@ class TradingStrategy:
         bars_latest = self.daily_bars.iloc[self.daily_bars_index].name[1]
         assert ret_latest <= bars_latest, (ret_latest, bars_latest)
         if ret_latest < bars_latest:
-            self.log(f"Missing aggregated quotes data in last second before {current_timestamp.time()} bar. Latest at {ret_latest.time()}.",level=logging.INFO)
+            self.log(f"Missing aggregated quotes data in last second before {current_timestamp.time()} bar. Latest at {ret_latest.time()}.",level=logging.DEBUG)
         return ret
     
     def get_price_at_action(self, is_long, is_entry):
         # return self.now_bar.close # test with bar close price
         
-        if not self.is_live_trading:
+        if not self.is_live_trading or self.latest_quote is None:
             if (is_long and is_entry) or (not is_long and not is_entry): # buy
                 return self.now_ask_price
             else: # sell
                 return self.now_bid_price
         else:
+            self.log(f"Quote data not found for price at action. Falling back to close price {self.now_bar.close}", level=logging.WARNING)
             self.now_bar.close # best possible estimate with no quotes data
             
         
@@ -1103,7 +1204,8 @@ class TradingStrategy:
 
             # print(current_timestamp)
             # print(self.now_bar)
-            # print(self.now_quotes_raw.index.get_level_values('timestamp'))
+            if self.now_quotes_raw is not None and not self.now_quotes_raw.empty:
+                self.log(f"{self.now_quotes_raw.index.get_level_values('timestamp')[-1]}")
             # print(self.now_quotes_agg.index.get_level_values('timestamp'))
             # print()
 
@@ -1112,7 +1214,7 @@ class TradingStrategy:
                 continue
             assert current_timestamp == self.now_bar.timestamp, (current_timestamp, self.now_bar.timestamp)
             
-            self.log(f"{current_timestamp.strftime("%H:%M")}, price {self.now_bar.close:.4f}, H-L {self.now_bar.high:.4f}-{self.now_bar.low:.4f}:", level=logging.INFO)
+            self.log(f"{current_timestamp.strftime("%H:%M")}, price {self.now_bar.close:.4f}, H-L {self.now_bar.high:.4f}-{self.now_bar.low:.4f}, LATEST QUOTE: {self.latest_quote_time.time()} {self.now_bid_price} {self.now_ask_price}:", level=logging.INFO)
 
             if self.now_quotes_raw is not None and self.now_quotes_agg is not None and self.is_trading_time(current_timestamp, self.day_soft_start_time, self.day_end_time, self.daily_bars_index, self.daily_bars, i):
                 if self.params.soft_end_time and not self.soft_end_triggered:
@@ -1131,12 +1233,14 @@ class TradingStrategy:
                 all_orders, _ = self.close_all_positions(current_timestamp, None, self.now_bar.vwap, self.now_bar.volume, self.now_bar.avg_volume)
                 
                 self.terminated_area_ids[self.current_date] = sorted([x.id for x in self.touch_area_collection.terminated_date_areas])
+                self.traded_area_ids[self.current_date] = sorted([x.id for x in self.touch_area_collection.traded_date_areas])
                 self.log(f"    terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
                 
                 
                 if self.params.plot_day_results:
                     # plot the used touch areas in the past day
-                    plot_touch_detection_areas(self.touch_detection_areas, filter_date=self.current_date, filter_areas=self.terminated_area_ids, 
+                    
+                    plot_touch_detection_areas(self.touch_detection_areas, filter_date=self.current_date, filter_areas=self.traded_area_ids, 
                                                trades=[position for position in self.trades if position.date == self.current_date],
                                                rsi_overbought=self.params.rsi_overbought, rsi_oversold=self.params.rsi_oversold, 
                                                mfi_overbought=self.params.mfi_overbought, mfi_oversold=self.params.mfi_oversold)
@@ -1172,7 +1276,7 @@ class TradingStrategy:
         # self.log(f"terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
         # TouchArea.print_areas_list(self.touch_area_collection.terminated_date_areas) # print if in log level
         
-        # plot_touch_detection_areas(self.touch_detection_areas, filter_areas=self.terminated_area_ids)
+        # plot_touch_detection_areas(self.touch_detection_areas, filter_areas=self.traded_area_ids)
         
         
         
@@ -1203,12 +1307,15 @@ class TradingStrategy:
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp) # returns empty dataframe
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp) # returns empty dataframe
             
+            if self.now_quotes_raw is not None and not self.now_quotes_raw.empty:
+                self.log(f"{self.now_quotes_raw.index.get_level_values('timestamp')[-1]}")
+                
             # check equality by memory location
             assert self.daily_bars is self.all_bars
-            assert self.now_quotes_raw is self.daily_quotes_raw is self.touch_detection_areas.quotes_raw
-            assert self.now_quotes_agg is self.daily_quotes_agg is self.touch_detection_areas.quotes_agg
+            # if self.latest_quote is not None:
+            #     assert self.now_quotes_raw is self.daily_quotes_raw is self.touch_detection_areas.quotes_raw, self.daily_quotes_raw
+            #     assert self.now_quotes_agg is self.daily_quotes_agg is self.touch_detection_areas.quotes_agg, self.daily_quotes_agg
             
-
             if current_timestamp < self.now_bar.timestamp: # < end time, just in case misaligned
                 return [], set()
             elif current_timestamp > self.now_bar.timestamp: # > end time
@@ -1217,6 +1324,8 @@ class TradingStrategy:
             
             positions_to_remove1, positions_to_remove2 = set(), set()
 
+            self.log(f"{current_timestamp.strftime("%H:%M")}, price {self.now_bar.close:.4f}, H-L {self.now_bar.high:.4f}-{self.now_bar.low:.4f}, LATEST QUOTE: {self.latest_quote_time.time()} {self.now_bid_price} {self.now_ask_price}:", level=logging.INFO)
+            
             # if self.now_quotes_raw is not None and self.now_quotes_agg is not None and self.is_trading_time(...
             if self.is_trading_time(current_timestamp, self.day_soft_start_time, self.day_end_time, None, None, None):
                 if self.params.soft_end_time and not self.soft_end_triggered:
@@ -1225,7 +1334,9 @@ class TradingStrategy:
                 self.touch_area_collection.reset_active_areas(current_timestamp)
                 for position in self.open_positions:
                     was_switched = position.area.is_side_switched # TEST
+                    # print(position.area)
                     position.area = self.touch_area_collection.get_area(position.area) # find with hash/eq
+                    # print(position.area)
                     assert position.area is not None
                     if was_switched: # TEST
                         assert position.area.is_side_switched != was_switched
@@ -1248,7 +1359,9 @@ class TradingStrategy:
                 self.touch_area_collection.reset_active_areas(current_timestamp)
                 for position in self.open_positions: # TEST
                     was_switched = position.area.is_side_switched
+                    # print(position.area)
                     position.area = self.touch_area_collection.get_area(position.area) # find with hash/eq
+                    # print(position.area)
                     assert position.area is not None
                     if was_switched: # TEST
                         assert position.area.is_side_switched != was_switched

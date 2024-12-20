@@ -66,9 +66,18 @@ def log(message, level=logging.INFO):
 @dataclass
 class SlippageEstimationParameters:
     # slippage_factor: Optional[float] = 0.001
-    slippage_factor: Optional[float] = 0.02 # Dollar cost per share, which you can calibrate based on historical data.
-    # beta:  Optional[float] = 0.95 # An exponent typically less than 1 (commonly between 0.5 and 0.8), representing the non-linearity of the impact.
-    atr_sensitivity: Optional[float] = 12
+    # slippage_factor: Optional[float] = 0.02 # Dollar cost per share, which you can calibrate based on historical data.
+    # beta:  Optional[float] = 0.95 # An exponent typically less than 1 (commonly between 0.5 and 0.8), representing the non-linearity of the impact.]
+    
+    
+    # # Average/Representative
+    # slippage_factor: Optional[float] = 0.005
+    # atr_sensitivity: Optional[float] = 12
+    
+    # Conservative/Overestimate
+    slippage_factor: Optional[float] = 0.008  # 0.8 cents per share base slippage
+    atr_sensitivity: Optional[float] = 18.0   # higher sensitivity to catch volatile periods
+        
     
 
 @jit(nopython=True)
@@ -151,6 +160,8 @@ class OrderSizingParameters:
         # min_quote_count = max(1, np.round(self.min_quote_count * multiplier).astype(int)) # >= 1
         # if quote_count < min_quote_count:
         #     return False
+        
+        # TODO: there needs to be at least one quote
             
         return True
     
@@ -408,6 +419,7 @@ class StrategyParameters:
     plot_day_results: bool = False
     allow_reversal_detection: bool = False
     clear_passed_areas: bool = False
+    clear_traded_areas: bool = False
     
     rsi_overbought: float = 70
     rsi_oversold: float = 30
