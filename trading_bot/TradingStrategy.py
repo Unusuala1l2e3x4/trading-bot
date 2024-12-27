@@ -230,6 +230,7 @@ class TradingStrategy:
     count_exit_skip: int = 0
     day_accrued_fees: float = 0
     current_date: pd.Timestamp = None
+    initial_buying_power: float = field(init=False)
     market_open: pd.Timestamp = field(init=False)
     market_close: pd.Timestamp = field(init=False)
     day_start_time: pd.Timestamp = field(init=False)
@@ -300,20 +301,31 @@ class TradingStrategy:
 
     def log(self, message, level=logging.INFO):
         self.logger.log(level, message, exc_info=level >= logging.ERROR)
-        
+            
     def initialize_strategy(self):
-        self.balance = self.params.initial_investment
-
         if self.params.assume_marginable_and_etb:
             self.is_marginable, self.is_etb = True, True
         else:
             self.is_marginable = is_security_marginable(self.touch_detection_areas.symbol) 
             self.is_etb = is_security_shortable_and_etb(self.touch_detection_areas.symbol)
         
+        _, _, actual_margin_multiplier = calculate_margin_values(
+            self.params.use_margin, self.is_marginable, self.params.times_buying_power
+        )
+        
+        self.initial_buying_power = self.params.initial_investment * actual_margin_multiplier
+        self.balance = self.initial_buying_power
+        
         print(f'{self.touch_detection_areas.symbol} is {'NOT ' if not self.is_marginable else ''}marginable.')
         print(f'{self.touch_detection_areas.symbol} is {'NOT ' if not self.is_etb else ''}shortable and ETB.')
         
         self.initialize_touch_areas()
+
+    def get_final_cash_balance(self) -> float:
+        """Convert final buying power to base cash, preserving leveraged P&L."""
+        buying_power_change = self.balance - self.initial_buying_power
+        return self.params.initial_investment + buying_power_change
+                
 
     def initialize_touch_areas(self):
         all_touch_areas = []
@@ -334,11 +346,8 @@ class TradingStrategy:
 
     @property
     def buying_power(self):
-        _, max_leverage, _ = calculate_margin_values(
-            self.params.use_margin, self.is_marginable, self.params.times_buying_power
-        )
-        
-        return self.total_equity * max_leverage - self.total_market_value
+        """No longer needed since balance directly represents buying power."""
+        return self.balance - self.total_market_value
         
     
     def get_account_summary(self):
@@ -350,34 +359,39 @@ class TradingStrategy:
             "Buying Power": self.buying_power
         }
 
-        
+
     def rebalance(self, is_simulated: bool, cash_change: float):
         if is_simulated:
             return
         if not self.is_live_trading:
             old_balance = self.balance
             new_balance = self.balance + cash_change
-            assert new_balance >= 0, f"Negative balance encountered: {new_balance:.4f} ({old_balance:.4f} {cash_change:.4f})"
+            if new_balance < 0:
+                self.log(f"Negative buying power encountered: {new_balance:.4f} ({old_balance:.4f} {cash_change:.4f})",level=logging.WARNING)
             self.balance = new_balance
         else:
             pass
             # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
             # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
             # only the cost (cash committed/released) is adjusted with position.times_buying_power
-            # TODO: PERHAPS remove all times_buying_power adjustments and just go by buying_power.
+            # TODO: PERHAPS remove all times_buying_power adjustments and just use buying power for self.balance.
 
-        # Assert and debug printing logic here (similar to your original function)
-        
+
     @property
     def total_market_value(self):
         return sum(abs(position.market_value) for position in self.open_positions)
 
     @property
     def margin_used(self):
-        return sum(
-            abs(position.market_value) * (1 - 1/position.times_buying_power)
-            for position in self.open_positions
-        )
+        """Calculate margin used based on market value and margin multiplier."""
+        total = 0
+        for position in self.open_positions:
+            if self.params.use_margin and self.is_marginable:
+                market_value = abs(position.market_value)
+                _, _, actual_multiplier = calculate_margin_values(True, True, position.times_buying_power)
+                total += market_value * (1 - 1/actual_multiplier)
+        return total
+
 
     @property
     def total_cash_committed(self):
@@ -392,31 +406,24 @@ class TradingStrategy:
 
 
     def update_balance_from_account(self, account: TradeAccount):
-        """Updates strategy's base balance by reverse calculating from Alpaca's buying power."""
-        # Get margin values using helper function
-        _, _, actual_margin_multiplier = calculate_margin_values(
-            self.params.use_margin, self.is_marginable, self.params.times_buying_power
-        )
+        """Updates strategy's balance directly from Alpaca's buying power."""
+        new_balance = float(account.buying_power)
         
-        # Convert from margined buying power to base balance
-        base_balance = float(account.buying_power) / actual_margin_multiplier
+        # If account balance (buying power) is sufficient, do not update
+        balance_for_strategy = min(new_balance, self.balance)
         
-        # if account balance (buying power) is sufficient, do not update
-        balance_for_strategy = min(base_balance, self.balance)
-        
-        # if abs(self.balance - new_balance) > 0.01:  # Check if difference is more than 1 cent; not sure if necessary to have this check
         if self.balance != balance_for_strategy:
-            self.log(f"Updating balance from {self.balance:.2f} to {balance_for_strategy:.2f}",level=logging.WARNING)
+            self.log(f"Updating balance from {self.balance:.2f} to {balance_for_strategy:.2f}", level=logging.WARNING)
             self.balance = balance_for_strategy
  
-    def update_market_values_from_account(self, account: TradeAccount, positions: List[Position]):
-        # TODO: upate positions to matching TradePositions (matching if they are the same symbol)
-        # for the current strategy, self.open_positions and positions should all have length 1
-        pass
+    # def update_market_values_from_account(self, account: TradeAccount, positions: List[Position]):
+    #     # TODO: upate positions to matching TradePositions (matching if they are the same symbol)
+    #     # for the current strategy, self.open_positions and positions should all have length 1
+    #     pass
 
-    def update_market_values(self, current_price: float):
-        for position in self.open_positions:
-            position.update_market_value(current_price)
+    # def update_market_values(self, current_price: float):
+    #     for position in self.open_positions:
+    #         position.update_market_value(current_price)
         
 
     def exit_action(self, position: TradePosition):
@@ -469,7 +476,9 @@ class TradingStrategy:
             self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
             assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
             
-            self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
+            # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
+            # self.rebalance(position.is_simulated, cash_released + realized_pl)
+            self.rebalance(position.is_simulated, cash_released)
             if not position.is_simulated:
                 self.day_accrued_fees += fees_expected
                 
@@ -519,7 +528,7 @@ class TradingStrategy:
         )
         
         current_shares = existing_shares
-        max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)
+        max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)  
         
         # max_trade_size, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling = self.params.ordersizing.adjust_max_trade_size(self.current_timestamp, max_trade_size_by_volume, self.now_quotes_raw, self.now_quotes_agg, is_long, 
         #                                                                 self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
@@ -527,7 +536,7 @@ class TradingStrategy:
         max_trade_size, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling = max_trade_size_by_volume, 1, 1, 1, 1, 1
         
         # Adjust available balance based on current position
-        available_balance = min(self.balance, self.params.max_investment) * actual_margin_multiplier
+        available_balance = np.clip(min(self.balance, self.params.max_investment), 0, None) # * actual_margin_multiplier
 
         # Calculate max additional shares based on available balance
         max_additional_shares_by_balance = math.floor(available_balance / current_price)
@@ -559,7 +568,7 @@ class TradingStrategy:
 
         total_shares = current_shares + shares_change
         invest_amount = shares_change * current_price
-        actual_cash_used = invest_amount / actual_margin_multiplier
+        actual_cash_used = invest_amount # / actual_margin_multiplier
         estimated_entry_cost = 0  # Set to 0 as we're no longer considering entry costs
 
         if is_initial:
@@ -769,15 +778,19 @@ class TradingStrategy:
         assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
         assert qty_intended == position.shares == position.initial_shares, (qty_intended, position.shares, position.initial_shares)
         
-        # full entry:
-        # assert cash_needed == invest_amount, (cash_needed, invest_amount)
-        # assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
+        # # full entry:
+        # if self.params.slippage.slippage_factor == 0:
+        #     assert cash_needed == invest_amount, (cash_needed, invest_amount)
+        #     assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
         
         # gradual entry:
-        assert np.isclose(cash_needed, scaled_invest_amount, rtol=1e-10), \
-            (cash_needed, scaled_invest_amount)
-        assert np.isclose(cash_needed, scaled_cash_used * actual_margin_multiplier, rtol=1e-10), \
-            (cash_needed, scaled_cash_used * actual_margin_multiplier)
+        if self.params.slippage.slippage_factor == 0:
+            assert np.isclose(cash_needed, scaled_invest_amount, rtol=1e-10), \
+                (cash_needed, scaled_invest_amount)
+            # assert np.isclose(cash_needed, scaled_cash_used * actual_margin_multiplier, rtol=1e-10), \
+            #     (cash_needed, scaled_cash_used * actual_margin_multiplier)
+            assert np.isclose(cash_needed, scaled_cash_used, rtol=1e-10), \
+                (cash_needed, scaled_cash_used)
         
         self.next_position_id += 1
         
@@ -785,7 +798,8 @@ class TradingStrategy:
         self.open_positions.add(position)
         # self.touch_area_collection.add_open_position_area(area)
         
-        self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
+        # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
+        self.rebalance(position.is_simulated, -cash_needed)
         if not position.is_simulated:
             self.day_accrued_fees += fees_expected
         
@@ -873,13 +887,20 @@ class TradingStrategy:
             
             
             if not price_at_action:
-                should_exit, should_exit_2 = position.update_stop_price(self.now_bar, current_timestamp) # NOTE: continue using bar price here
+                should_exit, should_exit_2, should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2 = \
+                    position.update_stop_price(self.now_bar, current_timestamp) # NOTE: continue using bar price here
                 target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
                 
-                # print(target_shares, position.max_shares, should_exit)
+                # # NOTE: if using stop orders with updated stop price
+                # if should_have_exited:
+                #     target_shares = 0
+                #     price_at_action = prev_stop_price
+                    
+                # # print(target_shares, position.max_shares, should_exit)
+                # elif should_exit:
+                    
                 if should_exit or target_shares == 0:
                     assert target_shares == 0, target_shares
-                    # price_at_action = self.now_bar.close
                     price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
                     
                     # if using stop market order safeguard, use this:
@@ -889,13 +910,14 @@ class TradingStrategy:
                     # stop market order would have executed before the minute is up, if should_exit_2 is True
                     # worry about this in LiveTrader later, after close price logic is implemented
                     # must use TradingStream that pings frequently.
-                    
+                
+                # else: # NOTE: test no resizing, only full    
+                #     target_shares = position.max_shares
                 
             if price_at_action:
                 assert target_shares == 0, target_shares
             
             if not price_at_action:
-                # price_at_action = self.now_bar.close
                 price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
             
             # Partial exit and entry logic
@@ -914,6 +936,7 @@ class TradingStrategy:
                 continue
             
             if target_shares < position.shares:
+            # if target_shares < position.shares and target_shares == 0:
                 shares_to_adjust = position.shares - target_shares
                 if shares_to_adjust > 0:
 
@@ -933,7 +956,9 @@ class TradingStrategy:
                         self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                         assert qty_intended == shares_change, (qty_intended, shares_change)
                         
-                        self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
+                        # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
+                        # self.rebalance(position.is_simulated, cash_released + realized_pl)
+                        self.rebalance(position.is_simulated, cash_released)
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
                         
@@ -976,12 +1001,15 @@ class TradingStrategy:
                             cash_needed, fees_expected, qty_intended = position.partial_entry(current_timestamp, price_at_action, shares_to_buy, self.now_bar, 
                                                                                               self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
                             self.log(f"    cash_needed {cash_needed:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
-                            assert cash_needed == invest_amount, (cash_needed, invest_amount)
-                            assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
+                            if self.params.slippage.slippage_factor == 0:
+                                assert cash_needed == invest_amount, (cash_needed, invest_amount)
+                                # assert cash_needed == actual_cash_used * actual_margin_multiplier, (cash_needed, actual_cash_used * actual_margin_multiplier)
+                                assert cash_needed == actual_cash_used, (cash_needed, actual_cash_used)
                             assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
                             assert qty_intended == shares_to_buy, (qty_intended, shares_to_buy)
                             
-                            self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
+                            # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
+                            self.rebalance(position.is_simulated, -cash_needed)
                             if not position.is_simulated:
                                 self.day_accrued_fees += fees_expected
                             
@@ -1389,8 +1417,8 @@ class TradingStrategy:
             if self.should_close_all_positions(current_timestamp, self.day_end_time, self.daily_bars_index) and self.day_accrued_fees != 0:
                 # sum up transaction costs from the day and subtract it from balance
                 self.rebalance(False, -self.day_accrued_fees)
-                self.log(f"After ${self.day_accrued_fees:.4f} fees: ${self.balance:.4f}", level=logging.INFO)
-                self.log(f"{current_timestamp.strftime("%H:%M")}: Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
+                self.log(f"    Fees accrued on {self.current_date}: ${self.day_accrued_fees:.4f}", level=logging.INFO)
+                self.log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
                 self.day_accrued_fees = 0
             
             # assert self.daily_bars_index == len(self.daily_bars) - 1
@@ -1491,9 +1519,6 @@ class TradingStrategy:
         if trades is None:
             trades = self.trades
         trades = [a for a in trades if not a.is_simulated]
-        
-        # Calculate and return backtest results
-        balance_change = ((self.balance - self.params.initial_investment) / self.params.initial_investment) * 100
 
         # Buy and hold strategy
         start_price = self.all_bars.iloc[0].close
@@ -1508,6 +1533,7 @@ class TradingStrategy:
         total_transaction_costs = sum(trade.total_transaction_costs for trade in trades)
         total_stock_borrow_costs = sum(trade.total_stock_borrow_cost for trade in trades)
         total_commission = sum(trade.total_commission for trade in trades)
+        total_slippage_cost = sum(trade.slippage_cost for trade in trades)
         
         mean_pl = np.mean([trade.pl for trade in trades])
         # mean_plpc = np.mean([trade.plpc for trade in trades])
@@ -1533,11 +1559,26 @@ class TradingStrategy:
         print(f"{timestamps[0]} -> {timestamps[-1]}")
 
         # debug2_print(all_bars['close'])
+            
+        buying_power_change = ((self.balance - self.initial_buying_power) / self.initial_buying_power) * 100
+        
+        _, _, actual_multiplier = calculate_margin_values(
+            self.params.use_margin, self.is_marginable, self.params.times_buying_power
+        )
         
         print("\nOverall Statistics:")
-        print('Initial Investment:', self.params.initial_investment)
-        print(f'Final Balance:      {self.balance:.4f}')
-        print(f"Balance % change:   {balance_change:.4f}% ***")
+        print('Initial Investment:      ', f"${self.params.initial_investment:,.2f}")
+        print('Initial Buying Power:    ', f"${self.initial_buying_power:,.2f}")
+        print(f'Margin Multiplier:       {actual_multiplier:.2f}x')
+        print('Final Buying Power:      ', f"${self.balance:,.2f}")
+        print(f"Buying Power % Change:   {buying_power_change:,.2f}%")
+        
+        # Calculate final cash value by converting back from buying power
+        final_cash = self.get_final_cash_balance()
+        cash_change = ((final_cash - self.params.initial_investment) / self.params.initial_investment) * 100
+        print('Final Cash Balance:     ', f"${final_cash:,.2f}")
+        print(f"Cash Balance % Change:  {cash_change:,.2f}%")
+        
         print(f"Baseline % change:  {baseline_change:.4f}%")
         print('Number of Trades Executed:', self.trades_executed)
         print(f"Simultaneous close and open count: {self.simultaneous_close_open}")
@@ -1547,6 +1588,7 @@ class TradingStrategy:
         print(f"Total Transaction Costs: ${total_transaction_costs:.4f}")
         print(f"  Borrow Fees: ${total_stock_borrow_costs:.4f}")
         print(f"  Commission: ${total_commission:.4f}")
+        print(f"Value lost to slippage: ${total_slippage_cost:.4f}")
         
         print(f"\nAverage Profit/Loss per Trade (after fees): ${mean_pl:.4f}")
 
@@ -1624,6 +1666,10 @@ class TradingStrategy:
         # # print(trades)
         if self.export_trades_path:
             export_trades_to_csv(self.trades, self.export_trades_path)
+            
+        # for trade in self.trades:
+        #     print(trade.id, [a.bar_latest.close for a in trade.transactions])
+        
 
         plot_cumulative_pl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
 

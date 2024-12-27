@@ -70,13 +70,13 @@ class SlippageEstimationParameters:
     # beta:  Optional[float] = 0.95 # An exponent typically less than 1 (commonly between 0.5 and 0.8), representing the non-linearity of the impact.]
     
     
-    # # Average/Representative
-    # slippage_factor: Optional[float] = 0.005
-    # atr_sensitivity: Optional[float] = 12
+    # Average/Representative
+    slippage_factor: Optional[float] = 0.005
+    atr_sensitivity: Optional[float] = 12
     
-    # Conservative/Overestimate
-    slippage_factor: Optional[float] = 0.008  # 0.8 cents per share base slippage
-    atr_sensitivity: Optional[float] = 18.0   # higher sensitivity to catch volatile periods
+    # # Conservative/Overestimate
+    # slippage_factor: Optional[float] = 0.008  # 0.8 cents per share base slippage
+    # atr_sensitivity: Optional[float] = 18.0   # higher sensitivity to catch volatile periods
         
     
 

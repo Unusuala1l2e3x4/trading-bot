@@ -49,6 +49,8 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
     # Convert to price ratio
     slippage_ratio = total_slippage / (price * trade_size)
     
+    slippage_price_change = slippage_ratio * price
+    
     if is_long:
         if is_entry:
             pass  # Increase price for long entries
@@ -60,13 +62,41 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
         else:
             pass  # Increase price for short exits
 
-    return price * (1 + slippage_ratio), slippage_ratio * price
+    return price * (1 + slippage_ratio), slippage_price_change
 
 
+# @jit(nopython=True)
+def calculate_price_diff_sums(prices: np.ndarray, is_long: bool) -> Tuple[float, float]:
+    """
+    Wrapper to use math.fsum() for precise summation of diffs outside of numba constraints.
+
+    Args:
+        prices (np.ndarray): A numpy array of sequential floats representing prices.
+        is_long (bool): If True, return (positive_sum, negative_sum). If False, flip signs to measure profitability.
+
+    Returns:
+        Tuple[float, float]: Sum of positive differences and negative differences (flipped if not long).
+    """
+    # Get diffs from the JIT-optimized function
+    diffs = prices[1:] - prices[:-1]
+
+    # Use math.fsum for precise summation
+    positive_sum = math.fsum(diff for diff in diffs if diff > 0)
+    negative_sum = math.fsum(diff for diff in diffs if diff < 0)
+    net = prices[-1] - prices[0]
+
+    # Adjust for short positions
+    if is_long:
+        return positive_sum, negative_sum, net
+    else:
+        return -negative_sum, -positive_sum, -net
+    
+    
 @dataclass
 class Transaction:
     timestamp: datetime
     shares: int
+    price_unadjusted: float
     price: float
     is_entry: bool # Was it a buy (entry) or sell (exit)
     is_long: bool
@@ -128,9 +158,9 @@ class TradePosition:
     max_low: Optional[float] = None
     min_low: Optional[float] = None
     
-    cash_committed: float = field(init=False)
     unrealized_pl: float = field(default=0.0)
     realized_pl: float = 0.0
+    slippage_cost: float = 0.0  # Total value lost to slippage
     log_level: Optional[int] = logging.INFO
     # stock_borrow_rate: float = 0.003    # Default to 30 bps (0.3%) annually
     stock_borrow_rate: float = 0.03      # Default to 300 bps (3%) annually
@@ -182,7 +212,6 @@ class TradePosition:
         assert self.times_buying_power <= 4
         self.market_value = 0
         self.shares = 0
-        self.cash_committed = 0
         self.max_shares, self.max_max_shares, self.min_max_shares = self.target_max_shares, self.target_max_shares, self.target_max_shares
         self.logger = self.setup_logger(self.log_level)
         
@@ -197,6 +226,17 @@ class TradePosition:
         self.max_target_shares_limit = None
         self.max_shares_reached = 0
         self.initial_shares = None
+        
+        self.max_close = self.min_close = self.bar_at_entry.close
+           
+        if self.is_long:
+            self.current_stop_price = self.max_close - self.area.get_range
+            self.current_stop_price_2 = self.max_close - self.area.get_range * 3
+        else:
+            self.current_stop_price = self.min_close + self.area.get_range
+            self.current_stop_price_2 = self.min_close + self.area.get_range * 3
+            
+            
         self.update_stop_price(self.bar_at_entry, self.entry_time)
         
     def calculate_target_shares_from_price(self, current_price: float) -> int:
@@ -255,7 +295,7 @@ class TradePosition:
         
         commission = ELITE_SMART_ROUTER_RATE * shares
         
-        # TODO: also calculate borrow costs for longs if there is > 1 times_buying_power (margin usage) 
+        # https://docs.alpaca.markets/docs/margin-and-short-selling#stock-borrow-rates
         
         stock_borrow_cost = 0
         if not self.is_long and not is_entry:  # Stock borrow cost applies only to short position exits
@@ -283,21 +323,25 @@ class TradePosition:
             stock_borrow_cost = total_cost
         return finra_taf, sec_fee, stock_borrow_cost, commission
 
-    def add_transaction(self, timestamp: datetime, shares: int, price: float, slippage_price_change: float, is_entry: bool, bar: TypedBarData, realized_pl: Optional[float] = None):
+    def add_transaction(self, timestamp: datetime, shares: int, price_unadjusted: float, price: float, slippage_price_change: float, is_entry: bool, bar: TypedBarData):
         finra_taf, sec_fee, stock_borrow_cost, commission = self.calculate_transaction_cost(shares, price, is_entry, timestamp)
         transaction_cost = finra_taf + sec_fee + stock_borrow_cost + commission
-        value = -shares * price if is_entry else shares * price
         
-        transaction = Transaction(timestamp, shares, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, 
-                                  commission, value, bar, realized_pl, slippage_price_change)
+        # value is -shares * price for buys (long entry, short exit)
+        # value is shares * price for sells (long exit, short entry)  
+        value = -shares * price if ((self.is_long and is_entry) or (not self.is_long and not is_entry)) else shares * price
+        
+        # For realized P&L: value is already negative for buys and positive for sells 
+        self.realized_pl += value
+        self.slippage_cost += slippage_price_change * shares
+
+        transaction = Transaction(timestamp, shares, price_unadjusted, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, commission, 
+                                  value, bar, slippage_price_change=slippage_price_change)
         self.transactions.append(transaction)
         
-        if not is_entry and realized_pl is not None:
-            self.realized_pl += realized_pl
-
         self.log(f"Transaction added - {'Entry' if is_entry else 'Exit'}, Shares: {shares}, Price: {price:.4f}, "
-                 f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {realized_pl if realized_pl is not None else 'N/A'}", level=logging.DEBUG)
-
+                 f"Value: {value:.4f}, Cost: {transaction_cost:.4f}, Realized PnL: {self.realized_pl}", level=logging.DEBUG)
+        
         return transaction_cost
 
     def increase_max_shares(self, shares):
@@ -321,44 +365,58 @@ class TradePosition:
         self.log(f"partial_entry - Time: {entry_time}, Price: {entry_price:.4f}, Shares to buy: {shares_to_buy}", level=logging.DEBUG)
 
         adjusted_price, slippage_price_change = self.calculate_slippage(True, entry_price, shares_to_buy, bar, slippage_factor, atr_sensitivity)
-        cash_committed = shares_to_buy * entry_price
+        cash_committed = shares_to_buy * adjusted_price # buying power CAN become negative (becomes 0 with a deficit)
 
-        fees = self.add_transaction(entry_time, shares_to_buy, adjusted_price, slippage_price_change, True, bar)
+        fees = self.add_transaction(entry_time, shares_to_buy, entry_price, adjusted_price, slippage_price_change, True, bar)
         
         self.shares += shares_to_buy
-        self.cash_committed += cash_committed
         self.update_market_value(adjusted_price)
         self.partial_entry_count += 1
         self.max_shares_reached = max(self.max_shares_reached, self.shares)
         self.area_width_history.append(self.area.get_range)
 
         self.log(f"Partial entry complete - Shares added: {shares_to_buy}, New total shares: {self.shares}, "
-                 f"New cash committed: {self.cash_committed:.4f}", level=logging.DEBUG)
+                 f"New cash committed: {cash_committed:.4f}", level=logging.DEBUG)
 
         return cash_committed, fees, shares_to_buy
 
-    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
+    def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, 
+                    bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
         self.log(f"partial_exit - Time: {exit_time}, Price: {exit_price:.4f}, Shares to sell: {shares_to_sell}", level=logging.DEBUG)
+        
+        adjusted_price, slippage_price_change = self.calculate_slippage(
+            False, exit_price, shares_to_sell, bar, slippage_factor, atr_sensitivity)
 
-        adjusted_price, slippage_price_change = self.calculate_slippage(False, exit_price, shares_to_sell, bar, slippage_factor, atr_sensitivity)
-
-        cash_released = (shares_to_sell / self.shares) * self.cash_committed
-        realized_pl = (adjusted_price - self.entry_price) * shares_to_sell if self.is_long else (self.entry_price - adjusted_price) * shares_to_sell
-
-        fees = self.add_transaction(exit_time, shares_to_sell, adjusted_price, slippage_price_change, False, bar, realized_pl=realized_pl)
+        cash_released = shares_to_sell * adjusted_price
+        fees = self.add_transaction(exit_time, shares_to_sell, exit_price, adjusted_price, 
+                                  slippage_price_change, False, bar)
 
         self.shares -= shares_to_sell
-        self.cash_committed -= cash_released
         self.update_market_value(adjusted_price)
         self.partial_exit_count += 1
         self.area_width_history.append(self.area.get_range)
         
-        self.log(f"Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {realized_pl:.4f}", level=logging.DEBUG)
+        self.log(f"Partial exit complete - New shares: {self.shares}, Cash released: {cash_released:.4f}, Realized PnL: {self.realized_pl:.4f}", level=logging.DEBUG)
 
-        return realized_pl, cash_released, fees, shares_to_sell
+        return self.realized_pl, cash_released, fees, shares_to_sell
 
     # NOTE: updates stop price, as well as min/max close, max high, min low
     def update_stop_price(self, bar: TypedBarData, current_timestamp: datetime):
+        # should_exit_price = bar.close
+        # should_exit_price_2 = bar.close
+        
+        if self.is_long:
+            should_exit_price = bar.low
+            should_exit_price_2 = bar.low
+        else:
+            should_exit_price = bar.high
+            should_exit_price_2 = bar.high
+            
+        prev_stop_price = self.current_stop_price
+        prev_stop_price_2 = self.current_stop_price_2
+        should_have_exited = self.should_exit(should_exit_price)
+        should_have_exited_2 = self.should_exit_2(should_exit_price_2)
+
         self.area.update_bounds(current_timestamp)
         self.max_close = max(self.max_close or self.bar_at_entry.close, bar.close)
         self.min_close = min(self.min_close or self.bar_at_entry.close, bar.close)
@@ -396,31 +454,36 @@ class TradePosition:
                 # Check for close price crossing buy price
                 current_limit = self.max_target_shares_limit or 0 # default 0 for comparisons of limits
                 new_limit = self.calculate_target_shares_from_price(bar.close)
+                # new_limit = self.target_max_shares
+                # self.has_crossed_full_entry = True
+                # self.full_entry_time = current_timestamp
                 
                 # Scale up based on close price (when full entry not reached but close has crossed entry price)
                 # NOTE: commenting this out seems to improve performance
-                # if (self.is_long and bar.close >= self.area.get_buy_price) or \
-                # (not self.is_long and bar.close <= self.area.get_buy_price):
-                #     # Close has crossed buy price - calculate size based on movement
-                #     if new_limit > current_limit:
-                #         self.max_target_shares_limit = new_limit
-                #         self.max_shares_reached = max(self.max_shares_reached, new_limit)
-                #         if self.initial_shares is None:
-                #             self.initial_shares = new_limit
-                #         self.log(f"Close price crossed {(current_timestamp - self.entry_time).total_seconds()/60 :.2f} min after entry: {new_limit} shares ({(new_limit/self.target_max_shares)*100:.1f}%)",level=logging.INFO)
-                # else:
-                
-                # Close hasn't crossed but high/low has - start with 1 share
-                if self.max_target_shares_limit is None:
-                    self.max_target_shares_limit = 1
-                    self.max_shares_reached = self.max_target_shares_limit
-                    self.initial_shares = self.max_target_shares_limit
-                    self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
-                elif new_limit > current_limit:
-                    # Maintain current limit until close crosses buy price
-                    self.max_target_shares_limit = current_limit
+                if (self.is_long and bar.close >= self.area.get_buy_price) or \
+                (not self.is_long and bar.close <= self.area.get_buy_price):
+                    # Close has crossed buy price - calculate size based on movement
+                    if new_limit > current_limit:
+                        self.max_target_shares_limit = new_limit
+                        self.max_shares_reached = max(self.max_shares_reached, new_limit)
+                        if self.initial_shares is None:
+                            self.initial_shares = new_limit
+                        self.log(f"Close price crossed {(current_timestamp - self.entry_time).total_seconds()/60 :.0f} min after entry: {new_limit} shares ({(new_limit/self.target_max_shares)*100:.1f}%)",level=logging.INFO)
+                else:
+                    
+                    # Close hasn't crossed but high/low has - start with 1 share
+                    if self.max_target_shares_limit is None:
+                        self.max_target_shares_limit = 1
+                        self.max_shares_reached = self.max_target_shares_limit
+                        if self.initial_shares is None:
+                            self.initial_shares = self.max_target_shares_limit
+                        self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
+                    elif new_limit > current_limit:
+                        # Maintain current limit until close crosses buy price
+                        self.max_target_shares_limit = current_limit
 
-        return self.should_exit(bar.close), self.should_exit_2(bar.close)
+        return self.should_exit(bar.close), self.should_exit_2(bar.close), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
+        # return self.should_exit(should_exit_price), self.should_exit_2(should_exit_price_2), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
 
     def should_exit(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \
@@ -462,6 +525,7 @@ class TradePosition:
 
     @property
     def get_unrealized_pl(self) -> float:
+        assert self.unrealized_pl == 0
         return self.unrealized_pl
 
     @property
@@ -475,6 +539,13 @@ class TradePosition:
     @property
     def plpc(self) -> float:
         return (self.pl / self.initial_balance) * 100
+    
+    @property
+    def price_diff_sum(self) -> Tuple[float, float]:
+        assert len(self.transactions) >= 2
+        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+        return calculate_price_diff_sums(prices, self.is_long)
+    
     
 def export_trades_to_csv(trades: List[TradePosition], filename: str):
     """
@@ -492,6 +563,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         if trade.area.is_side_switched:
             side_string = '*'+side_string
 
+        incs, decs, net = trade.price_diff_sum
         
         row = {
             'sym': trade.symbol,
@@ -504,15 +576,19 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Holding Time (min)': int(trade.holding_time.total_seconds() / 60),
             'Entry Price': trade.entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
+            'Price Increases': incs,
+            'Price Decreases': decs,
+            'Price Net': net,
             'Initial Qty': trade.initial_shares,
             'Target Qty': trade.target_max_shares,
-            'Max Qty Reached (%)': trade.max_shares_reached / trade.target_max_shares,
+            'Max Qty Reached (%)': 100*(trade.max_shares_reached / trade.target_max_shares),
             'Min Area Width': min(trade.area_width_history),
             'Max Area Width': max(trade.area_width_history),
             # 'Largest Max Qty': trade.max_max_shares,
             # 'Smallest Max Qty': trade.min_max_shares,
             # 'Realized P/L': f"{trade.get_realized_pl:.6f}",
             # 'Unrealized P/L': f"{trade.get_unrealized_pl:.6f}",
+            'Slippage Costs': f"{trade.slippage_cost:.6f}",
             'Total P/L': f"{trade.pl:.6f}",
             'ROE (P/L %)': f"{trade.plpc:.12f}",
             'Cumulative P/L %': f"{cumulative_pct_change:.6f}",
@@ -576,6 +652,7 @@ class SimplifiedTradePosition:
     # min_max_shares: int
     # realized_pl: float
     # unrealized_pl: float
+    slippage_cost: float
     pl: float
     plpc: float
     cumulative_pct_change: float
@@ -641,6 +718,7 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
             # min_max_shares=row['Smallest Max Qty'],
             # realized_pl=row['Realized P/L'],
             # unrealized_pl=row['Unrealized P/L'],
+            slippage_cost=row['Slippage Costs'],
             pl=row['Total P/L'],
             plpc=row['ROE (P/L %)'],
             cumulative_pct_change=row['Cumulative P/L %'],
