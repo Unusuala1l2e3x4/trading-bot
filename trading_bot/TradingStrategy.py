@@ -360,21 +360,34 @@ class TradingStrategy:
         }
 
 
-    def rebalance(self, is_simulated: bool, cash_change: float):
+    def rebalance(self, is_simulated: bool, cash_change: float, exit_pl: Optional[float] = None, 
+                returned_borrowed: Optional[float] = None, position: Optional[TradePosition] = None):
         if is_simulated:
             return
         if not self.is_live_trading:
             old_balance = self.balance
-            new_balance = self.balance + cash_change
-            if new_balance < 0:
-                self.log(f"Negative buying power encountered: {new_balance:.4f} ({old_balance:.4f} {cash_change:.4f})",level=logging.WARNING)
-            self.balance = new_balance
-        else:
-            pass
-            # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
-            # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
-            # only the cost (cash committed/released) is adjusted with position.times_buying_power
-            # TODO: PERHAPS remove all times_buying_power adjustments and just use buying power for self.balance.
+            
+            if position and not position.is_long and (returned_borrowed is not None or exit_pl is not None):
+                # For short exits: only add returned_borrowed and exit_pl
+                if returned_borrowed is not None:
+                    self.balance += returned_borrowed  # Get back original proceeds
+                if exit_pl is not None:
+                    self.balance += exit_pl  # Add profit/loss
+            else:
+                # For long exits and all entries (both long and short)
+                self.balance += cash_change
+
+            if self.balance < 0:
+                self.log(f"Warning: Balance dropped below zero: {old_balance:.4f} -> {self.balance:.4f} " 
+                        f"(cash_change: {cash_change:.4f}, returned_borrowed: {returned_borrowed if returned_borrowed is not None else 0:.4f}, " 
+                        f"exit_pl: {exit_pl if exit_pl is not None else 0:.4f})",
+                        level=logging.WARNING)
+            else:
+                pass
+                # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
+                # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
+                # only the cost (cash committed/released) is adjusted with position.times_buying_power
+                # TODO: PERHAPS remove all times_buying_power adjustments and just use buying power for self.balance.
 
 
     @property
@@ -471,14 +484,17 @@ class TradingStrategy:
             position.update_stop_price(self.now_bar, current_timestamp) # for data recording sake
             
             remaining_shares = position.shares
-            realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(current_timestamp, price_at_action, position.shares, self.now_bar, 
-                                                                                            self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
+            realized_pl, cash_released, returned_borrowed, fees_expected, qty_intended = position.partial_exit(
+                current_timestamp, price_at_action, position.shares, self.now_bar, 
+                self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity
+            )
             self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
             assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
             
             # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
             # self.rebalance(position.is_simulated, cash_released + realized_pl)
-            self.rebalance(position.is_simulated, cash_released)
+            # self.rebalance(position.is_simulated, cash_released)
+            self.rebalance(position.is_simulated, cash_released, realized_pl, returned_borrowed, position)
             if not position.is_simulated:
                 self.day_accrued_fees += fees_expected
                 
@@ -799,7 +815,8 @@ class TradingStrategy:
         # self.touch_area_collection.add_open_position_area(area)
         
         # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
-        self.rebalance(position.is_simulated, -cash_needed)
+        # self.rebalance(position.is_simulated, -cash_needed)
+        self.rebalance(position.is_simulated, -cash_needed, position=position)
         if not position.is_simulated:
             self.day_accrued_fees += fees_expected
         
@@ -936,7 +953,7 @@ class TradingStrategy:
                 continue
             
             if target_shares < position.shares:
-            # if target_shares < position.shares and target_shares == 0:
+            # if target_shares < position.shares and target_shares == 0: # NOTE: if not decreasing until stop price reached
                 shares_to_adjust = position.shares - target_shares
                 if shares_to_adjust > 0:
 
@@ -951,14 +968,17 @@ class TradingStrategy:
                     )
                     
                     if shares_change > 0:
-                        realized_pl, cash_released, fees_expected, qty_intended = position.partial_exit(current_timestamp, price_at_action, shares_change, self.now_bar, 
-                                                                                                        self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
+                        realized_pl, cash_released, returned_borrowed, fees_expected, qty_intended = position.partial_exit(
+                            current_timestamp, price_at_action, shares_change, self.now_bar, 
+                            self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity
+                        )
                         self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                         assert qty_intended == shares_change, (qty_intended, shares_change)
                         
                         # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
                         # self.rebalance(position.is_simulated, cash_released + realized_pl)
-                        self.rebalance(position.is_simulated, cash_released)
+                        # self.rebalance(position.is_simulated, cash_released)
+                        self.rebalance(position.is_simulated, cash_released, realized_pl, returned_borrowed, position)
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
                         
@@ -981,6 +1001,7 @@ class TradingStrategy:
                         self.count_exit_skip += 1
                         
             elif target_shares > position.shares:
+            # elif target_shares > position.shares and not position.has_crossed_full_entry: # NOTE: if stop increasing after reaching full entry
                 shares_to_adjust = target_shares - position.shares
                 if shares_to_adjust > 0:
 
@@ -1009,7 +1030,8 @@ class TradingStrategy:
                             assert qty_intended == shares_to_buy, (qty_intended, shares_to_buy)
                             
                             # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
-                            self.rebalance(position.is_simulated, -cash_needed)
+                            # self.rebalance(position.is_simulated, -cash_needed)
+                            self.rebalance(position.is_simulated, -cash_needed, position=position)
                             if not position.is_simulated:
                                 self.day_accrued_fees += fees_expected
                             
