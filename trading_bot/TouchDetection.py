@@ -307,30 +307,35 @@ def np_searchsorted(a:np.ndarray,b:np.ndarray): # only used in calculate_touch_a
 
 @jit(nopython=True)
 def process_touches(touch_indices, prices, atrs, level, lmin, lmax, is_long, min_touches, touch_area_width_agg, calculate_bounds, multiplier):
-    
-    # NOTE: touches, prices, atrs are all filtered
-    
+    # Initialize array to store indices of consecutive touches
     consecutive_touch_indices = np.full(min_touches, -1, dtype=np.int64)
     count, width = 0, 0
     prev_price = None
     
     for i in range(len(prices)):
         price = prices[i]
+        
+        # A touch occurs when price crosses the level (from either direction) or equals it
         is_touch = (prev_price is not None and 
                     ((prev_price < level <= price) or (prev_price > level >= price)) or 
                     (price == level))
         
+        # Check if price is within the level's min-max range
         if lmin <= price <= lmax:
             if is_touch:
-                # Update bounds after each touch
+                # Update bounds using ATR values up to this point
                 width, touch_area_low, touch_area_high = calculate_bounds(atrs[:i+1], level, is_long, touch_area_width_agg, multiplier)
+                
                 if width > 0:
+                    # Record this touch
                     consecutive_touch_indices[count] = touch_indices[i]
                     count += 1
-                
+                    
+                    # If we have enough touches, return
                     if count == min_touches:
                         return consecutive_touch_indices[consecutive_touch_indices != -1], touch_area_low, touch_area_high
                 
+        # If price moves beyond bounds in wrong direction, reset the count
         elif width > 0:
             assert touch_area_high is not None and touch_area_low is not None
             buy_price = touch_area_high if is_long else touch_area_low
@@ -632,6 +637,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
             
             high_low_diffs = [] # only consider the diffs in the current day
+            # high_close_diffs = []
+            # low_close_diffs = []
             
             for i in range(len(day_df)):
                 row = day_df.iloc[i]
@@ -643,16 +650,24 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                 is_res = row['is_res']
                 
                 high_low_diffs.append(high - low)
+                # high_close_diffs.append(high - close)
+                # low_close_diffs.append(close - low)
                 
                 w = np.median(high_low_diffs) / 2
+                # w = np.median(high_low_diffs[-15:]) / 2
                 lmin, lmax = close - w, close + w
+                
+                # w_high = np.median(high_close_diffs)
+                # w_low = np.median(low_close_diffs)
+                # lmin, lmax = close - w_low, close + w_high
                 
                 # Check if this point falls within any existing levels
                 for level in potential_levels.values():
-                    if level.lmin <= close <= level.lmax and level.is_res == is_res:
+                    if level.is_res == is_res and level.lmin <= close <= level.lmax:
                         level.touches.append(timestamp)
 
                 if w != 0 and i not in potential_levels:
+                # if (w_high != 0 or w_low != 0) and i not in potential_levels:
                     # Add this point to its own level (match by lmin, lmax in case the same lmin, lmax is already used)
                     potential_levels[i] = Level(i, lmin, lmax, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
             
