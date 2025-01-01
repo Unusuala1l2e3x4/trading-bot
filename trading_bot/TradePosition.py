@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta, time as time2
+from datetime import datetime, date, timedelta, time as datetime_time
 from typing import List, Set, Tuple, Optional
 from trading_bot.TouchArea import TouchArea
 from trading_bot.TypedBarData import TypedBarData # , DefaultTypedBarData
@@ -107,12 +107,15 @@ class Transaction:
     commission: float
     value: float  # Positive if profit, negative if loss (before transaction costs are applied)
     
-    # Record metadata
+    # Record metadata (may or may not be transaction-specific)
     bar_latest: TypedBarData
     area_width: float
     shares_remaining: int
     max_shares: int
+    # avg_entry_price
+    # current_pl
     
+    # Record optional fields (transaction-specific)
     slippage_price_change: Optional[float] = 0.0
     realized_pl: Optional[float] = 0.0 # None if is_entry is True
 
@@ -365,10 +368,14 @@ class TradePosition:
     def increase_max_shares(self, shares):
         self.max_shares = max(self.max_shares, shares)
         self.max_max_shares = max(self.max_max_shares, self.max_shares)
+        if self.has_crossed_full_entry:
+            self.max_target_shares_limit = self.max_shares
     
     def decrease_max_shares(self, shares):
         self.max_shares = min(self.max_shares, shares)
         self.min_max_shares = min(self.min_max_shares, self.max_shares)
+        if self.has_crossed_full_entry:
+            self.max_target_shares_limit = self.max_shares
     
     def initial_entry(self, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
         """
@@ -541,6 +548,10 @@ class TradePosition:
     @property
     def holding_time(self) -> timedelta:
         return (self.exit_time or datetime.now()) - self.entry_time
+    
+    @property
+    def holding_time_minutes(self) -> int:
+        return int(self.holding_time.total_seconds() / 60)
 
     @property
     def entry_transaction_costs(self) -> float:
@@ -576,8 +587,41 @@ class TradePosition:
         prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
         return calculate_price_diff_sums(prices, self.is_long)
     
+    @property
+    def net_price_diff(self) -> float:
+        net = self.transactions[-1].price_unadjusted - self.transactions[0].price_unadjusted
+        return net if self.is_long else -net
+
+    @property
+    def positive_price_diff_sum(self) -> float:
+        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+        diffs = prices[1:] - prices[:-1]
+        positive_sum = math.fsum(diff for diff in diffs if diff > 0)
+        return positive_sum if self.is_long else -positive_sum
+
+    @property
+    def negative_price_diff_sum(self) -> float:
+        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+        diffs = prices[1:] - prices[:-1]
+        negative_sum = math.fsum(diff for diff in diffs if diff < 0)
+        return negative_sum if self.is_long else -negative_sum
     
-def export_trades_to_csv(trades: List[TradePosition], filename: str):
+    @property
+    def area_width_history(self) -> List[float]:
+        return [a.area_width for a in self.transactions]
+    
+    @property
+    def at_max_shares_count(self) -> int:
+        return sum(1 for a in self.transactions if a.shares_remaining == a.max_shares)
+
+    @property
+    def side_win_lose_str(self) -> str:
+        return f"{'Long' if self.is_long else 'Short'} {'Win' if self.pl > 0 else 'Lose'}"
+
+
+
+
+def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
     """
     Export the trades data to a CSV file using pandas.
     
@@ -593,10 +637,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
         if trade.area.is_side_switched:
             side_string = '*'+side_string
 
-        incs, decs, net = trade.price_diff_sum
-        
-        area_width_history = [a.area_width for a in trade.transactions]
-        at_max_shares_count = sum(1 for a in trade.transactions if a.shares_remaining == a.max_shares)
+        # incs, decs, net = trade.price_diff_sum
+        # at_max_shares_count = sum(1 for a in trade.transactions if a.shares_remaining == a.max_shares)
         
         row = {
             'sym': trade.symbol,
@@ -606,38 +648,44 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
             'Type': side_string,
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
-            'Holding Time (min)': int(trade.holding_time.total_seconds() / 60),
+            'Holding Time (min)': trade.holding_time_minutes,
             'Entry Price': trade.entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
-            'Price Increases': incs,
-            'Price Decreases': decs,
-            'Price Net': net,
+            
+            # 'Price Increases': incs,
+            # 'Price Decreases': decs,
+            # 'Price Net': net,
+            'Price Increases': trade.positive_price_diff_sum,
+            'Price Decreases': trade.negative_price_diff_sum,
+            'Price Net': trade.net_price_diff,
+            
             'Initial Qty': trade.initial_shares,
             'Target Qty': trade.target_max_shares,
             'Max Qty Reached (%)': 100*(trade.max_shares_reached / trade.target_max_shares),
-            'At Max Shares Count': at_max_shares_count,
-            'Min Area Width': min(area_width_history),
-            'Max Area Width': max(area_width_history),
+            'At Max Shares Count': trade.at_max_shares_count,
+            'Min Area Width': min(trade.area_width_history),
+            'Max Area Width': max(trade.area_width_history),
             # 'Largest Max Qty': trade.max_max_shares,
             # 'Smallest Max Qty': trade.min_max_shares,
-            # 'Realized P/L': f"{trade.get_realized_pl:.6f}",
-            # 'Unrealized P/L': f"{trade.get_unrealized_pl:.6f}",
-            'Slippage Costs': f"{trade.slippage_cost:.6f}",
-            'Total P/L': f"{trade.pl:.6f}",
-            'ROE (P/L %)': f"{trade.plpc:.12f}",
-            'Cumulative P/L %': f"{cumulative_pct_change:.6f}",
-            'Transaction Costs': f"{trade.total_transaction_costs:.6f}",
+            # 'Realized P/L': round(trade.get_realized_pl,6),
+            # 'Unrealized P/L': round(trade.get_unrealized_pl,6),
+            'Side Win Lose': trade.side_win_lose_str, # for easy subtotalling in excel
+            'Total P/L': round(trade.pl,6),
+            'ROE (P/L %)': round(trade.plpc,12),
+            'Cumulative P/L %': round(cumulative_pct_change,6),
+            'Slippage Costs': round(trade.slippage_cost,6),
+            'Transaction Costs': round(trade.total_transaction_costs,6),
             'Times Buying Power': trade.times_buying_power,
             
             # bar metrics
-            'shares_per_trade': f"{trade.bar_at_entry.shares_per_trade:.6f}",
-            'doji_ratio': f"{trade.bar_at_entry.doji_ratio:.6f}",
-            'abs_doji_ratio': f"{trade.bar_at_entry.doji_ratio_abs:.6f}",
-            'wick_ratio': f"{trade.bar_at_entry.wick_ratio:.6f}",
-            'nr4_hl_diff': f"{trade.bar_at_entry.nr4_hl_diff:.6f}",
-            'nr7_hl_diff': f"{trade.bar_at_entry.nr7_hl_diff:.6f}",
-            'volume_ratio': f"{trade.bar_at_entry.volume_ratio:.6f}",
-            'ATR_ratio': f"{trade.bar_at_entry.ATR_ratio:.6f}",
+            'shares_per_trade': round(trade.bar_at_entry.shares_per_trade,6),
+            'doji_ratio': round(trade.bar_at_entry.doji_ratio,6),
+            'abs_doji_ratio': round(trade.bar_at_entry.doji_ratio_abs,6),
+            'wick_ratio': round(trade.bar_at_entry.wick_ratio,6),
+            'nr4_hl_diff': round(trade.bar_at_entry.nr4_hl_diff,6),
+            'nr7_hl_diff': round(trade.bar_at_entry.nr7_hl_diff,6),
+            'volume_ratio': round(trade.bar_at_entry.volume_ratio,6),
+            'ATR_ratio': round(trade.bar_at_entry.ATR_ratio,6),
         }
         # get aggregated metrics per area
         row.update(trade.area.get_metrics(trade.entry_time, prefix=''))
@@ -652,17 +700,19 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str):
     assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time'])
     df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)
     
-    if len(os.path.dirname(filename)) > 0:
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    if filename:
+        if len(os.path.dirname(filename)) > 0:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
+        df.to_csv(filename, index=False)
+        print(f"Trade summary has been exported to {filename}")
         
-    df.to_csv(filename, index=False)
-    print(f"Trade summary has been exported to {filename}")
-    
-    # df.to_csv(filename.replace('.csv', '.tsv'), index=False, sep='\t')   # Replace the existing df.to_csv line
-    # print(f"Trade summary has been exported to {filename}")
+        # df.to_csv(filename.replace('.csv', '.tsv'), index=False, sep='\t')   # Replace the existing df.to_csv line
+        # print(f"Trade summary has been exported to {filename}")
+    return df
 
 
-def time_to_minutes(t: time2):
+def time_to_minutes(t: datetime_time):
     return t.hour * 60 + t.minute - (9 * 60 + 30)
 
 @dataclass
@@ -688,10 +738,11 @@ class SimplifiedTradePosition:
     # min_max_shares: int
     # realized_pl: float
     # unrealized_pl: float
-    slippage_cost: float
+    side_win_lose_str: str
     pl: float
     plpc: float
     cumulative_pct_change: float
+    slippage_cost: float
     total_transaction_costs: float
     times_buying_power: float
 
@@ -756,10 +807,11 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
             # min_max_shares=row['Smallest Max Qty'],
             # realized_pl=row['Realized P/L'],
             # unrealized_pl=row['Unrealized P/L'],
-            slippage_cost=row['Slippage Costs'],
+            side_win_lose_str=row['Side Win Lose'],
             pl=row['Total P/L'],
             plpc=row['ROE (P/L %)'],
             cumulative_pct_change=row['Cumulative P/L %'],
+            slippage_cost=row['Slippage Costs'],
             total_transaction_costs=row['Transaction Costs'],
             times_buying_power=row['Times Buying Power'],
             
@@ -808,8 +860,8 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
 
     # Filter df to include only intraday data and trading days
     df_intraday = df[
-        (df['time'] >= time2(9, 30)) & 
-        (df['time'] <= time2(16, 0)) &
+        (df['time'] >= datetime_time(9, 30)) & 
+        (df['time'] <= datetime_time(16, 0)) &
         (df['date'].isin(trading_days))
     ].copy()
 
@@ -825,7 +877,7 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
         volume_data = df_intraday.groupby(['date', 'half_hour'])['volume'].sum().reset_index()
         volume_data['datetime'] = volume_data.apply(lambda row: pd.Timestamp.combine(row['date'], row['half_hour']), axis=1)
         volume_data = volume_data.set_index('datetime').sort_index()
-        volume_data = volume_data[volume_data.index.time != time2(16, 0)]
+        volume_data = volume_data[volume_data.index.time != datetime_time(16, 0)]
     else:
         # Group by day
         volume_data = df_intraday.groupby('date')['volume'].sum()
@@ -1025,3 +1077,244 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
         plt.show()
         
     plt.close()
+
+
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import seaborn as sns
+from scipy import stats
+
+def extract_trade_data(trades: List['TradePosition'], 
+                      x_field: str,
+                      y_field: str = 'pl',
+                      side: Optional[str] = None) -> pd.DataFrame:
+    """
+    Extract specified fields from trades into a DataFrame.
+    
+    Args:
+        trades: List of TradePosition objects
+        x_field: Field name to extract for x-axis
+        y_field: Field name to extract for y-axis (default: 'pl')
+        side: Optional filter for trade side ('long' or 'short')
+        
+    Returns:
+        DataFrame with extracted fields
+    """
+    data = []
+    
+    for trade in trades:
+        # Filter by side if specified
+        if side == 'long' and not trade.is_long:
+            continue
+        if side == 'short' and trade.is_long:
+            continue
+            
+        row = {'is_long': trade.is_long}
+        
+        # Extract x-axis field
+        if '.' in x_field:
+            # Handle nested attributes (e.g., 'bar_at_entry.volume')
+            obj = trade
+            for attr in x_field.split('.'):
+                obj = getattr(obj, attr)
+            x_value = obj
+        else:
+            x_value = getattr(trade, x_field)
+            
+        # Handle datetime.time conversion
+        if isinstance(x_value, datetime):
+            x_value = x_value.time()
+            
+        row['x'] = x_value
+        
+        # Extract y-axis field similarly
+        if '.' in y_field:
+            obj = trade
+            for attr in y_field.split('.'):
+                obj = getattr(obj, attr)
+            y_value = obj
+        else:
+            y_value = getattr(trade, y_field)
+            
+        if isinstance(y_value, datetime):
+            y_value = y_value.time()
+            
+        row['y'] = y_value
+        
+        data.append(row)
+        
+    return pd.DataFrame(data)
+
+def calculate_correlation_stats(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Calculate correlation statistics between two variables.
+    
+    Returns:
+        Tuple of (correlation coefficient, R-squared, p-value)
+    """
+    # Remove any NaN values
+    mask = ~(np.isnan(x) | np.isnan(y))
+    x = x[mask]
+    y = y[mask]
+    
+    if len(x) < 2:
+        return 0, 0, 1
+        
+    correlation, p_value = stats.pearsonr(x, y)
+    r_squared = correlation ** 2
+    
+    return correlation, r_squared, p_value
+
+def plot_trade_correlation(trades: List['TradePosition'],
+                         x_field: str,
+                         y_field: str = 'pl',
+                         split_sides: bool = False,
+                         figsize: Tuple[int, int] = (8,7),
+                         x_label: Optional[str] = None,
+                         y_label: Optional[str] = None,
+                         title: Optional[str] = None,
+                         binwidth_x: Optional[float] = None, binwidth_y: Optional[float] = None) -> None:
+    """
+    Create correlation plots for trade attributes.
+    
+    Args:
+        trades: List of TradePosition objects
+        x_field: Field name for x-axis
+        y_field: Field name for y-axis (default: 'pl')
+        split_sides: If True, create separate plots for long/short trades
+        figsize: Figure size (width, height)
+        x_label: Custom x-axis label
+        y_label: Custom y-axis label
+        title: Custom plot title
+    """
+    if split_sides:
+        figsize = (figsize[0]*2, figsize[1])
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+        sides = ['long', 'short']
+        axes = [ax1, ax2]
+    else:
+        fig, ax = plt.subplots(figsize=figsize)
+        sides = [None]
+        axes = [ax]
+        
+    for side, ax in zip(sides, axes):
+        # Extract data
+        df = extract_trade_data(trades, x_field, y_field, side)
+        
+        if len(df) == 0:
+            continue
+            
+        # Create joint plot
+        if isinstance(df['x'].iloc[0], datetime_time):
+            # Convert time to minutes since midnight for plotting
+            df['x_minutes'] = df['x'].apply(lambda t: t.hour * 60 + t.minute)
+            del df['x']
+            df.rename(columns={'x_minutes':'x'}, inplace=True)
+            # Custom formatter for time axis
+            def format_time(x, p):
+                hours = int(x // 60)
+                minutes = int(x % 60)
+                return f"{hours:02d}:{minutes:02d}"
+            ax.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
+
+        x_data = df['x']
+        
+        # Create scatter plot
+        sns.scatterplot(data=df, x='x', y='y', 
+                       hue='is_long' if side is None else None,
+                       palette=['green', 'red'] if side is None else None,
+                       ax=ax)
+        
+        # Add trend line
+        x_values = x_data.values.reshape(-1, 1)
+        y_values = df['y'].values
+        
+        if len(x_values) > 1:  # Need at least 2 points for regression
+            model = stats.linregress(x_values.flatten(), y_values)
+            line_x = np.array([x_values.min(), x_values.max()])
+            line_y = model.slope * line_x + model.intercept
+            ax.plot(line_x, line_y, color='blue', linestyle='--', alpha=0.5)
+        
+        # Calculate and display correlation statistics
+        corr, r_squared, p_value = calculate_correlation_stats(x_values.flatten(), y_values)
+        
+        stats_text = f'Correlation: {corr:.3f}\nR²: {r_squared:.3f}\np-value: {p_value:.3f}'
+        ax.text(0.05, 0.95, stats_text,
+                transform=ax.transAxes,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # Add reference lines at x=0 and y=0
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5, zorder=0)
+        ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5, zorder=0)
+
+        # Create marginal axes
+        divider = make_axes_locatable(ax)
+        ax_histx = divider.append_axes("top", 1.2, pad=0.3)
+        ax_histy = divider.append_axes("right", 1.2, pad=0.3)
+        
+        # Turn off marginal axes labels
+        ax_histx.xaxis.set_tick_params(labelbottom=False)
+        ax_histy.yaxis.set_tick_params(labelleft=False)
+        
+        # Determine appropriate bins for x-axis
+        x_range = x_data.max() - x_data.min()
+        if binwidth_x is None:
+            binwidth_x = x_range / 20  # default to 20 bins
+
+        # For time data, start bins at 9:30 (570 minutes)
+        if 'format_time' in locals():  # Check if we're dealing with time data
+            start_minute = 570  # 9:30 AM
+            num_bins = int(np.ceil((x_data.max() - start_minute) / binwidth_x))
+            bins_x = [start_minute + i * binwidth_x for i in range(num_bins + 1)]
+            ax.set_xlim((start_minute, ax.get_xlim()[1]))
+        else:
+            # For numeric data, ensure zero is at bin edge
+            if 0 <= x_data.min() or 0 >= x_data.max():  # All positive or all negative
+                num_bins = int(np.ceil(x_range / binwidth_x))
+                if x_data.min() >= 0:
+                    bins_x = [i * binwidth_x for i in range(num_bins + 1)]
+                else:
+                    bins_x = [-i * binwidth_x for i in range(num_bins + 1)][::-1]
+            else:  # Data crosses zero
+                pos_bins = np.arange(0, x_data.max() + binwidth_x, binwidth_x)
+                neg_bins = np.arange(0, x_data.min() - binwidth_x, -binwidth_x)
+                bins_x = np.concatenate([neg_bins[:-1][::-1], pos_bins])
+        # print(bins_x)
+
+        # Similar logic for y-axis bins
+        y_range = df['y'].max() - df['y'].min()
+        if binwidth_y is None:
+            binwidth_y = y_range / 20  # default to 20 bins
+            
+        if 0 <= df['y'].min() or 0 >= df['y'].max():  # All positive or all negative
+            num_bins = int(np.ceil(y_range / binwidth_y))
+            if df['y'].min() >= 0:
+                bins_y = [i * binwidth_y for i in range(num_bins + 1)]
+            else:
+                bins_y = [-i * binwidth_y for i in range(num_bins + 1)][::-1]
+        else:  # Data crosses zero
+            pos_bins = np.arange(0, df['y'].max() + binwidth_y, binwidth_y)
+            neg_bins = np.arange(0, df['y'].min() - binwidth_y, -binwidth_y)
+            bins_y = np.concatenate([neg_bins[:-1][::-1], pos_bins])
+            
+        # Plot histograms with calculated bins
+        sns.histplot(x=x_data, ax=ax_histx, bins=bins_x, color='blue', alpha=0.3)
+        if 'format_time' in locals():
+            ax_histx.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
+            
+        sns.histplot(y=df['y'], ax=ax_histy, bins=bins_y, color='blue', alpha=0.3)
+        
+        # Match main axes limits
+        ax_histx.set_xlim(ax.get_xlim())
+        ax_histy.set_ylim(ax.get_ylim())
+        
+        # Labels and title
+        ax.set_xlabel(x_label or x_field)
+        ax.set_ylabel(y_label or y_field)
+        if side:
+            ax.set_title(f'{title or ""} ({side.capitalize()} Trades)')
+        else:
+            ax.set_title(title or f'{x_field} vs {y_field}')
+            
+    plt.tight_layout()
+    plt.show()

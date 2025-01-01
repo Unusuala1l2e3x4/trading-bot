@@ -192,7 +192,7 @@ class TouchArea:
 
     def get_time_since_min_touch(self, current_time: datetime) -> float: #
         """Return minutes since min_touches was reached"""
-        if not self.min_touches_time or current_time <= self.min_touches_time:
+        if not self.min_touches_time or current_time < self.min_touches_time:
             return float('inf')
         return (current_time - self.min_touches_time).total_seconds() / 60
 

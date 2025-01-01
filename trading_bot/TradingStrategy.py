@@ -8,7 +8,7 @@ import pandas as pd
 import math
 from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
-from trading_bot.TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price
+from trading_bot.TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price, plot_trade_correlation
 from trading_bot.TypedBarData import TypedBarData
 
 from datetime import datetime, timedelta
@@ -688,12 +688,18 @@ class TradingStrategy:
         # debug3_print(f"Execution price: {price_at_action:.4f}")
         
         switch = self.params.allow_reversal_detection and \
-            self.now_bar.shows_reversal_potential(area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
-
+            self.now_bar.shows_reversal_potential(area.is_long, pre_position=True)
+            # self.now_bar.shows_reversal_potential(area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
         # NOTE: switch must be set at this point
-
+        self.log(self.now_bar.describe_reversal_potential(not area.is_long), level=logging.INFO)
+        
+        if is_retry or (not is_retry and switch):
+            self.log('area side switched', level=logging.INFO)
+        
         # test switching but not entering, saving it for later:
         if not is_retry and switch:
+            # self.log(self.now_bar.describe_reversal_potential(not area.is_long), level=logging.INFO)
+            # self.log('area side switched', level=logging.INFO)
             if not area.is_side_switched:
                 area.switch_side(self.now_bar)
             else:
@@ -730,10 +736,12 @@ class TradingStrategy:
 
         if area.is_side_switched:
             # print(self.now_bar.close, self.now_bar.central_value, self.now_bar.is_res)
+            
             self.switch_count += 1
             
             if area.bar_at_switch is not None:
-                desc = area.bar_at_switch.describe_reversal_potential(not area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
+                # desc = area.bar_at_switch.describe_reversal_potential(not area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
+                desc = area.bar_at_switch.describe_reversal_potential(not area.is_long)
                 self.log(f'Switch #{self.switch_count} @ {current_timestamp.date()} {current_timestamp.time()} for pos {self.next_position_id}: {desc}',level=logging.WARNING)
                 # if not area.is_long:
                 #     # self.log(f'Switch #{self.switch_count} @ {current_timestamp.date()} {current_timestamp.time()} for pos {self.next_position_id}: Indecision {self.now_bar.describe_indecision} -> {indecision}, RSI {self.now_bar.RSI} >= {self.params.rsi_overbought}',level=logging.WARNING)
@@ -847,13 +855,18 @@ class TradingStrategy:
             return min(base_target_shares, position.max_target_shares_limit)
         
         return base_target_shares
+        # """
+        # Simply returns the position's target shares limit.
+        # Position sizing is now fully managed by TradePosition.
+        # """
+        # return position.max_target_shares_limit or 0
     
     
     def update_positions(self, current_timestamp: datetime) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
         positions_to_remove = set()
 
         # if using trailing stops, exit_price = None
-        def perform_exit(position, exit_price=None):
+        def perform_exit(position: TradePosition, exit_price=None):
             price = position.current_stop_price if exit_price is None else exit_price
             position.close(current_timestamp, price)
             self.trades_executed += 1
@@ -906,7 +919,8 @@ class TradingStrategy:
             if not price_at_action:
                 should_exit, should_exit_2, should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2 = \
                     position.update_stop_price(self.now_bar, current_timestamp) # NOTE: continue using bar price here
-                target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
+                # target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
+                target_shares = position.max_target_shares_limit or 0  # works better
                 
                 # # NOTE: if using stop orders with updated stop price
                 # if should_have_exited:
@@ -917,7 +931,8 @@ class TradingStrategy:
                 # elif should_exit:
                     
                 if should_exit or target_shares == 0:
-                    assert target_shares == 0, target_shares
+                    # assert target_shares == 0, target_shares
+                    target_shares = 0
                     price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
                     
                     # if using stop market order safeguard, use this:
@@ -936,6 +951,14 @@ class TradingStrategy:
             
             if not price_at_action:
                 price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
+            
+            
+            # position.update_market_value(price_at_action)
+            
+            
+            
+            
+            
             
             # Partial exit and entry logic
             assert target_shares <= position.max_shares, (target_shares, position.max_shares)
@@ -1686,8 +1709,7 @@ class TradingStrategy:
         print(combined_describe)
             
         # # print(trades)
-        if self.export_trades_path:
-            export_trades_to_csv(self.trades, self.export_trades_path)
+        df = export_trades_to_csv(trades, self.export_trades_path)
             
         # for trade in self.trades:
         #     print(trade.id, [a.bar_latest.close for a in trade.transactions])
@@ -1703,7 +1725,43 @@ class TradingStrategy:
         #     win_trades / len(self.trades) * 100, total_transaction_costs, \
         #                        avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
         
-        return trades
+        win_trades_list = [trade for trade in trades if trade.pl > 0]
+        lose_trades_list = [trade for trade in trades if trade.pl <= 0]
+
+        plot_trade_correlation(win_trades_list, x_field='entry_time', y_field='pl', 
+                            figsize=(8,7), y_label='Profit/Loss',
+                            binwidth_x=30, binwidth_y=25,
+                            title='Wins: entry_time vs Returns',split_sides=True)
+        plot_trade_correlation(lose_trades_list, x_field='entry_time', y_field='pl', 
+                            figsize=(8,7), y_label='Profit/Loss',
+                            binwidth_x=30, binwidth_y=25,
+                            title='Losses: entry_time vs Returns',split_sides=True)
+        
+        plot_trade_correlation(win_trades_list, x_field='net_price_diff', y_field='pl',
+                            figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
+                            binwidth_x=0.05, binwidth_y=25,
+                            title='Wins: Net Price Diff vs Returns',split_sides=True)
+        plot_trade_correlation(lose_trades_list, x_field='net_price_diff', y_field='pl',
+                            figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
+                            binwidth_x=0.05, binwidth_y=25,
+                            title='Losses: Net Price Diff vs Returns',split_sides=True)
+        
+        plot_trade_correlation(win_trades_list, x_field='holding_time_minutes', y_field='pl',
+                            figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
+                            binwidth_x=5, binwidth_y=25,
+                            title='Wins: Hold Time (minutes) vs Returns',split_sides=True)
+
+        plot_trade_correlation(lose_trades_list, x_field='holding_time_minutes', y_field='pl',
+                            figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
+                            binwidth_x=5, binwidth_y=25,
+                            title='Losses: Hold Time (minutes) vs Returns',split_sides=True)
+
+        
+        
+                
+        
+        # return trades
+        return df
 
         
 # # # Usage
