@@ -10,6 +10,9 @@ from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
 from trading_bot.TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price, plot_trade_correlation
 from trading_bot.TypedBarData import TypedBarData
+from trading_bot.VolumeProfile import VolumeProfile
+
+from IPython.display import clear_output
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -20,14 +23,14 @@ ny_tz = ZoneInfo("America/New_York")
 POSITION_OPENED = True
 NO_POSITION_OPENED = False
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+# from alpaca.data.historical import StockHistoricalDataClient
+# from alpaca.data.requests import StockBarsRequest
 from alpaca.trading import TradingClient
-from alpaca.trading.requests import GetCalendarRequest
+# from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.enums import OrderSide
 from alpaca.trading.models import TradeAccount, Position
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import Adjustment
+# from alpaca.data.timeframe import TimeFrame
+# from alpaca.data.enums import Adjustment
 from alpaca.data.models import Bar, Quote
 
 import logging
@@ -261,6 +264,8 @@ class TradingStrategy:
     now_bar: TypedBarData = field(init=False)
     prev_close: float = field(init=False)
     switch_count: int = field(init=False)
+    
+    volume_profile: VolumeProfile = field(default_factory=VolumeProfile)
             
     # record stats
     spread_ratios: List[float] = field(default_factory=list)
@@ -283,6 +288,8 @@ class TradingStrategy:
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         self.logger = self.setup_logger(self.log_level)
         self.initialize_strategy()
+        
+        self.volume_profile = VolumeProfile(ema_span=self.params.volume_profile_ema_span)
 
     def setup_logger(self, log_level=logging.INFO):
         logger = logging.getLogger('TradingStrategy')
@@ -337,6 +344,7 @@ class TradingStrategy:
         self.touch_area_collection = TouchAreaCollection(all_touch_areas, self.touch_detection_areas.min_touches)
 
     def update_strategy(self, touch_detection_areas: TouchDetectionAreas):
+        assert self.is_live_trading
         self.touch_detection_areas = touch_detection_areas
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
         if self.is_live_trading:
@@ -382,12 +390,12 @@ class TradingStrategy:
                         f"(cash_change: {cash_change:.4f}, returned_borrowed: {returned_borrowed if returned_borrowed is not None else 0:.4f}, " 
                         f"exit_pl: {exit_pl if exit_pl is not None else 0:.4f})",
                         level=logging.WARNING)
-            else:
-                pass
-                # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
-                # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
-                # only the cost (cash committed/released) is adjusted with position.times_buying_power
-                # TODO: PERHAPS remove all times_buying_power adjustments and just use buying power for self.balance.
+        else:
+            pass
+            # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
+            # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
+            # only the cost (cash committed/released) is adjusted with position.times_buying_power
+            # TODO: PERHAPS remove all times_buying_power adjustments and just use buying power for self.balance.
 
 
     @property
@@ -441,6 +449,7 @@ class TradingStrategy:
 
     def exit_action(self, position: TradePosition):
         # Logic for handling position exit (similar to your original function)
+        position.record_snapshot(self.now_bar)
         self.trades.append(position) # append position
         # self.touch_area_collection.del_open_position_area(position.area)
         self.open_positions.remove(position)
@@ -490,10 +499,7 @@ class TradingStrategy:
             )
             self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
             assert qty_intended == remaining_shares, (qty_intended, remaining_shares)
-            
-            # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
-            # self.rebalance(position.is_simulated, cash_released + realized_pl)
-            # self.rebalance(position.is_simulated, cash_released)
+
             self.rebalance(position.is_simulated, cash_released, realized_pl, returned_borrowed, position)
             if not position.is_simulated:
                 self.day_accrued_fees += fees_expected
@@ -822,8 +828,6 @@ class TradingStrategy:
         self.open_positions.add(position)
         # self.touch_area_collection.add_open_position_area(area)
         
-        # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
-        # self.rebalance(position.is_simulated, -cash_needed)
         self.rebalance(position.is_simulated, -cash_needed, position=position)
         if not position.is_simulated:
             self.day_accrued_fees += fees_expected
@@ -998,9 +1002,6 @@ class TradingStrategy:
                         self.log(f"    cash_released {cash_released:.4f}, realized_pl {realized_pl:.4f}, fees {fees_expected:.4f}",level=logging.INFO)
                         assert qty_intended == shares_change, (qty_intended, shares_change)
                         
-                        # self.rebalance(position.is_simulated, (cash_released / position.times_buying_power) + realized_pl)
-                        # self.rebalance(position.is_simulated, cash_released + realized_pl)
-                        # self.rebalance(position.is_simulated, cash_released)
                         self.rebalance(position.is_simulated, cash_released, realized_pl, returned_borrowed, position)
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
@@ -1052,8 +1053,6 @@ class TradingStrategy:
                             assert actual_margin_multiplier == position.times_buying_power, (actual_margin_multiplier, position.times_buying_power)
                             assert qty_intended == shares_to_buy, (qty_intended, shares_to_buy)
                             
-                            # self.rebalance(position.is_simulated, -(cash_needed / position.times_buying_power))
-                            # self.rebalance(position.is_simulated, -cash_needed)
                             self.rebalance(position.is_simulated, -cash_needed, position=position)
                             if not position.is_simulated:
                                 self.day_accrued_fees += fees_expected
@@ -1150,6 +1149,14 @@ class TradingStrategy:
             )
             assert not self.open_positions, self.open_positions # intraday only. should not have any open positions held overnight from previous day
 
+        # Reset volume profile for new day
+        day_data = self.daily_bars.iloc[:self.daily_bars_index + 1]  # Include current bar
+        self.volume_profile.reset_for_day(
+            day_data['low'].min(),
+            day_data['high'].max()
+        )
+    
+    
     def get_quotes_raw(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
         # NOTE: MAKE SURE self.handle_new_trading_day got the matching raw quotes data 
         assert self.touch_detection_areas.quotes_raw is not None
@@ -1267,8 +1274,18 @@ class TradingStrategy:
                 continue
             
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
+            self.volume_profile.update_profile(self.now_bar)
+            
+            base_atr = np.median(self.daily_bars.iloc[:self.daily_bars_index+1]['ATR'])
+            
+            self.now_bar.update_volume_metrics(self.volume_profile, base_atr)
             self.prev_close = self.daily_bars.iloc[self.daily_bars_index-1].close
 
+            # # clear_output(wait=True)
+            # if current_timestamp.minute in {30} and current_timestamp.hour > 9:
+            #     self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+            
+            
             # NOTE: quotes raw data should be passed into touch_detection_areas
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp)
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp)
@@ -1339,6 +1356,10 @@ class TradingStrategy:
                 self.log(f"    Remaining ${self.balance:.4f}, committed ${self.total_cash_committed:.4f}, total equity ${self.total_equity:.4f}.", level=logging.INFO)
                 self.day_accrued_fees = 0
                 
+            # Record metrics for all open positions
+            for position in self.open_positions:
+                position.record_snapshot(self.now_bar)
+                
             self.daily_bars_index += 1
         
         if current_timestamp >= self.day_end_time:
@@ -1375,8 +1396,19 @@ class TradingStrategy:
                 return [], set()
             
             assert self.daily_bars_index == len(self.daily_bars)-1
+            
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
+            self.volume_profile.update_profile(self.now_bar)
+            
+            base_atr = np.median(self.daily_bars.iloc[:self.daily_bars_index+1]['ATR'])
+            
+            self.now_bar.update_volume_metrics(self.volume_profile, base_atr)
             self.prev_close = self.daily_bars.iloc[self.daily_bars_index-1].close
+
+            # clear_output(wait=True)
+            if current_timestamp.minute in {0,30}:
+                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+            
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp) # returns empty dataframe
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp) # returns empty dataframe
             
@@ -1468,7 +1500,11 @@ class TradingStrategy:
             
             # assert self.daily_bars_index == len(self.daily_bars) - 1
             # self.daily_bars_index = len(self.daily_bars) - 1  # Update daily_bars_index for live trading
-
+                        
+            # Record metrics for all open positions
+            for position in self.open_positions:
+                position.record_snapshot(self.now_bar)
+    
             return all_orders, positions_to_remove1 | positions_to_remove2
             # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
             # remember to Limit consecutive stop order modifications to ~80 minutes (stop changing when close price has been monotonic in favorable direction for 80 or more minutes)
@@ -1728,37 +1764,114 @@ class TradingStrategy:
         win_trades_list = [trade for trade in trades if trade.pl > 0]
         lose_trades_list = [trade for trade in trades if trade.pl <= 0]
 
-        plot_trade_correlation(win_trades_list, x_field='entry_time', y_field='pl', 
+        # plot_trade_correlation(win_trades_list, x_field='entry_time', y_field='pl', 
+        #                     figsize=(8,7), y_label='Profit/Loss',
+        #                     binwidth_x=30, binwidth_y=25,
+        #                     title='Wins: entry_time vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='entry_time', y_field='pl', 
+        #                     figsize=(8,7), y_label='Profit/Loss',
+        #                     binwidth_x=30, binwidth_y=25,
+        #                     title='Losses: entry_time vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='entry_time', y_field='pl', 
                             figsize=(8,7), y_label='Profit/Loss',
                             binwidth_x=30, binwidth_y=25,
-                            title='Wins: entry_time vs Returns',split_sides=True)
-        plot_trade_correlation(lose_trades_list, x_field='entry_time', y_field='pl', 
-                            figsize=(8,7), y_label='Profit/Loss',
-                            binwidth_x=30, binwidth_y=25,
-                            title='Losses: entry_time vs Returns',split_sides=True)
+                            title='entry_time vs Returns',split_sides=True)
         
-        plot_trade_correlation(win_trades_list, x_field='net_price_diff', y_field='pl',
+        # plot_trade_correlation(win_trades_list, x_field='net_price_diff', y_field='pl',
+        #                     figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
+        #                     binwidth_x=0.05, binwidth_y=25,
+        #                     title='Wins: Net Price Diff vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='net_price_diff', y_field='pl',
+        #                     figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
+        #                     binwidth_x=0.05, binwidth_y=25,
+        #                     title='Losses: Net Price Diff vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='net_price_diff', y_field='pl',
                             figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
                             binwidth_x=0.05, binwidth_y=25,
-                            title='Wins: Net Price Diff vs Returns',split_sides=True)
-        plot_trade_correlation(lose_trades_list, x_field='net_price_diff', y_field='pl',
-                            figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
-                            binwidth_x=0.05, binwidth_y=25,
-                            title='Losses: Net Price Diff vs Returns',split_sides=True)
+                            title='Net Price Diff vs Returns',split_sides=True)
         
-        plot_trade_correlation(win_trades_list, x_field='holding_time_minutes', y_field='pl',
+        # plot_trade_correlation(win_trades_list, x_field='holding_time_minutes', y_field='pl',
+        #                     figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
+        #                     binwidth_x=5, binwidth_y=25,
+        #                     title='Wins: Hold Time (minutes) vs Returns',split_sides=True)
+
+        # plot_trade_correlation(lose_trades_list, x_field='holding_time_minutes', y_field='pl',
+        #                     figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
+        #                     binwidth_x=5, binwidth_y=25,
+        #                     title='Losses: Hold Time (minutes) vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='holding_time_minutes', y_field='pl',
                             figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
                             binwidth_x=5, binwidth_y=25,
-                            title='Wins: Hold Time (minutes) vs Returns',split_sides=True)
-
-        plot_trade_correlation(lose_trades_list, x_field='holding_time_minutes', y_field='pl',
-                            figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
-                            binwidth_x=5, binwidth_y=25,
-                            title='Losses: Hold Time (minutes) vs Returns',split_sides=True)
-
-        
-        
+                            title='Hold Time (minutes) vs Returns',split_sides=True)
                 
+        # Technical indicators
+        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.MACD', y_field='pl',
+        #                     figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Wins: MACD at Entry vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.MACD', y_field='pl',
+        #                     figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Losses: MACD at Entry vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='bar_at_entry.MACD', y_field='pl',
+                            figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
+                            binwidth_x=0.2, binwidth_y=25,
+                            title='MACD at Entry vs Returns',split_sides=True)
+        
+        
+        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.RSI_roc', y_field='pl',
+        #                     figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.5, binwidth_y=25,
+        #                     title='Wins: RSI Momentum at Entry vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.RSI_roc', y_field='pl',
+        #                     figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.5, binwidth_y=25,
+        #                     title='Losses: RSI Momentum at Entry vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='bar_at_entry.RSI_roc', y_field='pl',
+                            figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
+                            binwidth_x=0.5, binwidth_y=25,
+                            title='RSI Momentum at Entry vs Returns',split_sides=True)
+        
+        # # Price action
+        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.doji_ratio', y_field='pl',
+        #                     figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.1, binwidth_y=25,
+        #                     title='Wins: Doji Ratio at Entry vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.doji_ratio', y_field='pl',
+        #                     figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.1, binwidth_y=25,
+        #                     title='Losses: Doji Ratio at Entry vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='bar_at_entry.doji_ratio', y_field='pl',
+                            figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
+                            binwidth_x=0.1, binwidth_y=25,
+                            title='Doji Ratio at Entry vs Returns',split_sides=True)
+        
+        # # Volume profile
+        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.vol_balance', y_field='pl',
+        #                     figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Wins: Volume Distribution Skew at Entry vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.vol_balance', y_field='pl',
+        #                     figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Losses: Volume Distribution Skew at Entry vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='bar_at_entry.vol_balance', y_field='pl',
+                            figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
+                            binwidth_x=0.2, binwidth_y=25,
+                            title='Volume Distribution Skew at Entry vs Returns',split_sides=True)
+        
+        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.hvn_balance', y_field='pl',
+        #                     figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Wins: HVN Distribution Balance at Entry vs Returns',split_sides=True)
+        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.hvn_balance', y_field='pl',
+        #                     figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
+        #                     binwidth_x=0.2, binwidth_y=25,
+        #                     title='Losses: HVN Distribution Balance at Entry vs Returns',split_sides=True)
+        plot_trade_correlation(trades, x_field='bar_at_entry.hvn_balance', y_field='pl',
+                            figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
+                            binwidth_x=0.2, binwidth_y=25,
+                            title='HVN Distribution Balance at Entry vs Returns',split_sides=True)
         
         # return trades
         return df

@@ -3,6 +3,8 @@ from datetime import datetime, date, timedelta, time as datetime_time
 from typing import List, Set, Tuple, Optional
 from trading_bot.TouchArea import TouchArea
 from trading_bot.TypedBarData import TypedBarData # , DefaultTypedBarData
+from trading_bot.PositionMetrics import PositionMetrics, PositionSnapshot
+
 import math
 import os
 import pandas as pd
@@ -29,10 +31,10 @@ ELITE_SMART_ROUTER_RATE = 0.004 # All-In plan (safest bet)
 
 
 @jit(nopython=True)
-def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: int, avg_volume: float, rolling_atr: float,
+def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: int, avg_volume: float, ATR: float,
                        slippage_factor: float, atr_sensitivity: float) -> float:
     # Normalize ATR
-    normalized_atr = rolling_atr / price if price > 0 else 0
+    normalized_atr = ATR / price if price > 0 else 0
     
     # ATR effect (dynamic volatility adjustment)
     atr_effect = 1 + atr_sensitivity * normalized_atr
@@ -65,31 +67,31 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
     return price * (1 + slippage_ratio), slippage_price_change
 
 
-# @jit(nopython=True)
-def calculate_price_diff_sums(prices: np.ndarray, is_long: bool) -> Tuple[float, float]:
-    """
-    Wrapper to use math.fsum() for precise summation of diffs outside of numba constraints.
+# # @jit(nopython=True)
+# def calculate_price_diff_sums(prices: np.ndarray, is_long: bool) -> Tuple[float, float]:
+#     """
+#     Wrapper to use math.fsum() for precise summation of diffs outside of numba constraints.
 
-    Args:
-        prices (np.ndarray): A numpy array of sequential floats representing prices.
-        is_long (bool): If True, return (positive_sum, negative_sum). If False, flip signs to measure profitability.
+#     Args:
+#         prices (np.ndarray): A numpy array of sequential floats representing prices.
+#         is_long (bool): If True, return (positive_sum, negative_sum). If False, flip signs to measure profitability.
 
-    Returns:
-        Tuple[float, float]: Sum of positive differences and negative differences (flipped if not long).
-    """
-    # Get diffs from the JIT-optimized function
-    diffs = prices[1:] - prices[:-1]
+#     Returns:
+#         Tuple[float, float]: Sum of positive differences and negative differences (flipped if not long).
+#     """
+#     # Get diffs from the JIT-optimized function
+#     diffs = prices[1:] - prices[:-1]
 
-    # Use math.fsum for precise summation
-    positive_sum = math.fsum(diff for diff in diffs if diff > 0)
-    negative_sum = math.fsum(diff for diff in diffs if diff < 0)
-    net = prices[-1] - prices[0]
+#     # Use math.fsum for precise summation
+#     positive_sum = math.fsum(diff for diff in diffs if diff > 0)
+#     negative_sum = math.fsum(diff for diff in diffs if diff < 0)
+#     net = prices[-1] - prices[0]
 
-    # Adjust for short positions
-    if is_long:
-        return positive_sum, negative_sum, net
-    else:
-        return -negative_sum, -positive_sum, -net
+#     # Adjust for short positions
+#     if is_long:
+#         return positive_sum, negative_sum, net
+#     else:
+#         return -negative_sum, -positive_sum, -net
     
     
 @dataclass
@@ -162,6 +164,8 @@ class TradePosition:
     cleared_area_ids: Set[int] = field(default_factory=set)
     current_stop_price: Optional[float] = None
     current_stop_price_2: Optional[float] = None
+    
+    position_metrics: PositionMetrics = field(init=False)
     
     max_close: Optional[float] = None
     min_close: Optional[float] = None
@@ -250,6 +254,7 @@ class TradePosition:
             
             
         self.update_stop_price(self.bar_at_entry, self.entry_time)
+        self.position_metrics = PositionMetrics(self.is_long, self.initial_balance)
         
     def calculate_target_shares_from_price(self, current_price: float) -> int:
         """Calculate target shares based on how close price is to full entry"""
@@ -290,14 +295,18 @@ class TradePosition:
         return self.shares > 0
 
     def calculate_slippage(self, is_entry: bool, price: float, trade_size: int, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float) -> float:
-        adjusted_price, slippage_price_change = calculate_slippage(self.is_long, is_entry, price, trade_size, bar.avg_volume, bar.rolling_ATR, slippage_factor, atr_sensitivity)
+        adjusted_price, slippage_price_change = calculate_slippage(self.is_long, is_entry, price, trade_size, bar.avg_volume, bar.ATR, slippage_factor, atr_sensitivity)
         # print(f"{self.is_long} {is_entry} {trade_size} {price} -> {adjusted_price} ({slippage_price_change})")
         
         return adjusted_price, slippage_price_change
 
     def update_market_value(self, current_price: float):
-        self.market_value = self.shares * current_price if self.is_long else -self.shares * current_price
-        self.unrealized_pl = self.market_value - (self.shares * self.avg_entry_price)
+        if self.is_long:
+            self.market_value = self.shares * current_price
+            self.unrealized_pl = self.market_value - (self.shares * self.avg_entry_price)
+        else:
+            self.market_value = -self.shares * current_price  # Keep negative for accounting
+            self.unrealized_pl = (self.shares * self.avg_entry_price) + self.market_value  # Entry - Current
 
     def calculate_transaction_cost(self, shares: int, price: float, is_entry: bool, timestamp: datetime) -> float:
         is_sell = (self.is_long and not is_entry) or (not self.is_long and is_entry)
@@ -581,38 +590,57 @@ class TradePosition:
     def plpc(self) -> float:
         return (self.pl / self.initial_balance) * 100
     
-    @property
-    def price_diff_sum(self) -> Tuple[float, float]:
-        assert len(self.transactions) >= 2
-        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-        return calculate_price_diff_sums(prices, self.is_long)
+    # @property
+    # def price_diff_sum(self) -> Tuple[float, float]:
+    #     assert len(self.transactions) >= 2
+    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+    #     return calculate_price_diff_sums(prices, self.is_long)
     
     @property
     def net_price_diff(self) -> float:
         net = self.transactions[-1].price_unadjusted - self.transactions[0].price_unadjusted
         return net if self.is_long else -net
 
-    @property
-    def positive_price_diff_sum(self) -> float:
-        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-        diffs = prices[1:] - prices[:-1]
-        positive_sum = math.fsum(diff for diff in diffs if diff > 0)
-        return positive_sum if self.is_long else -positive_sum
+    # @property
+    # def positive_price_diff_sum(self) -> float:
+    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+    #     diffs = prices[1:] - prices[:-1]
+    #     positive_sum = math.fsum(diff for diff in diffs if diff > 0)
+    #     return positive_sum if self.is_long else -positive_sum
 
-    @property
-    def negative_price_diff_sum(self) -> float:
-        prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-        diffs = prices[1:] - prices[:-1]
-        negative_sum = math.fsum(diff for diff in diffs if diff < 0)
-        return negative_sum if self.is_long else -negative_sum
+    # @property
+    # def negative_price_diff_sum(self) -> float:
+    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+    #     diffs = prices[1:] - prices[:-1]
+    #     negative_sum = math.fsum(diff for diff in diffs if diff < 0)
+    #     return negative_sum if self.is_long else -negative_sum
     
-    @property
-    def area_width_history(self) -> List[float]:
-        return [a.area_width for a in self.transactions]
+    # @property
+    # def best_price_diff(self) -> float:
+    #     first_price = self.transactions[0].price_unadjusted
+    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+    #     if self.is_long:
+    #         return np.max(prices) - first_price
+    #     else:
+    #         return first_price - np.min(prices)
+        
+    # @property
+    # def worst_price_diff(self) -> float:
+    #     first_price = self.transactions[0].price_unadjusted
+    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
+    #     if self.is_long:
+    #         return np.min(prices) - first_price
+    #     else:
+    #         return first_price - np.max(prices)
     
-    @property
-    def at_max_shares_count(self) -> int:
-        return sum(1 for a in self.transactions if a.shares_remaining == a.max_shares)
+    
+    # @property
+    # def area_width_history(self) -> List[float]:
+    #     return [a.area_width for a in self.transactions]
+    
+    # @property
+    # def at_max_shares_count(self) -> int:
+    #     return sum(1 for a in self.transactions if a.shares_remaining == a.max_shares)
 
     @property
     def side_win_lose_str(self) -> str:
@@ -620,6 +648,35 @@ class TradePosition:
 
 
 
+    def record_snapshot(self, bar: TypedBarData):
+        """Record metrics for the current minute."""
+        # Ensure market value is up to date
+        if len(self.position_metrics.snapshots) == 0:
+            self.update_market_value(self.avg_entry_price)
+        else:
+            self.update_market_value(bar.close)
+        
+        snapshot = PositionSnapshot(
+            timestamp=bar.timestamp,
+            is_long=self.is_long,
+            close=bar.close,
+            high=bar.high,
+            low=bar.low,
+            shares=self.shares,
+            max_shares=self.max_shares,
+            max_target_shares_limit=self.max_target_shares_limit or 0,
+            area_width=self.area.get_range,
+            area_buy_price=self.area.get_buy_price,
+            avg_entry_price=self.avg_entry_price,
+            running_pl=self.pl,  # Includes all components
+            running_pl_pct=self.plpc,
+            realized_pl=self.realized_pl,
+            unrealized_pl=self.unrealized_pl,
+            total_fees=self.total_transaction_costs
+        )
+        
+        self.position_metrics.add_snapshot(snapshot)
+    
 
 def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
     """
@@ -637,9 +694,6 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         if trade.area.is_side_switched:
             side_string = '*'+side_string
 
-        # incs, decs, net = trade.price_diff_sum
-        # at_max_shares_count = sum(1 for a in trade.transactions if a.shares_remaining == a.max_shares)
-        
         row = {
             'sym': trade.symbol,
             'date': trade.date,
@@ -648,65 +702,86 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
             'Type': side_string,
             'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
-            'Holding Time (min)': trade.holding_time_minutes,
+            # 'Holding Time (min)': trade.holding_time_minutes,
             'Entry Price': trade.entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
-            
-            # 'Price Increases': incs,
-            # 'Price Decreases': decs,
-            # 'Price Net': net,
-            'Price Increases': trade.positive_price_diff_sum,
-            'Price Decreases': trade.negative_price_diff_sum,
-            'Price Net': trade.net_price_diff,
+            # 'Price Net': trade.net_price_diff,
             
             'Initial Qty': trade.initial_shares,
             'Target Qty': trade.target_max_shares,
             'Max Qty Reached (%)': 100*(trade.max_shares_reached / trade.target_max_shares),
-            'At Max Shares Count': trade.at_max_shares_count,
-            'Min Area Width': min(trade.area_width_history),
-            'Max Area Width': max(trade.area_width_history),
-            # 'Largest Max Qty': trade.max_max_shares,
-            # 'Smallest Max Qty': trade.min_max_shares,
-            # 'Realized P/L': round(trade.get_realized_pl,6),
-            # 'Unrealized P/L': round(trade.get_unrealized_pl,6),
-            'Side Win Lose': trade.side_win_lose_str, # for easy subtotalling in excel
+            'Side Win Lose': trade.side_win_lose_str,
             'Total P/L': round(trade.pl,6),
             'ROE (P/L %)': round(trade.plpc,12),
-            'Cumulative P/L %': round(cumulative_pct_change,6),
+            # 'Cumulative P/L %': round(cumulative_pct_change,6),
             'Slippage Costs': round(trade.slippage_cost,6),
             'Transaction Costs': round(trade.total_transaction_costs,6),
-            'Times Buying Power': trade.times_buying_power,
-            
-            # bar metrics
-            'shares_per_trade': round(trade.bar_at_entry.shares_per_trade,6),
+            # 'Times Buying Power': trade.times_buying_power,
+        }
+
+        # Add position metrics directly
+        row.update(trade.position_metrics.get_metrics_dict())
+        
+        # Add bar at entry metrics
+        row.update({
+            'market_phase': trade.bar_at_entry.market_phase,
+            # 'shares_per_trade': round(trade.bar_at_entry.shares_per_trade,6),
             'doji_ratio': round(trade.bar_at_entry.doji_ratio,6),
+            'mfi_divergence': round(trade.bar_at_entry.mfi_divergence,6),
+            'rsi_divergence': round(trade.bar_at_entry.rsi_divergence,6),
             'abs_doji_ratio': round(trade.bar_at_entry.doji_ratio_abs,6),
             'wick_ratio': round(trade.bar_at_entry.wick_ratio,6),
             'nr4_hl_diff': round(trade.bar_at_entry.nr4_hl_diff,6),
             'nr7_hl_diff': round(trade.bar_at_entry.nr7_hl_diff,6),
             'volume_ratio': round(trade.bar_at_entry.volume_ratio,6),
             'ATR_ratio': round(trade.bar_at_entry.ATR_ratio,6),
-        }
+        })
         # get aggregated metrics per area
-        row.update(trade.area.get_metrics(trade.entry_time, prefix=''))
-        # row.update(trade.area.get_metrics(trade.entry_time, prefix='entry_'))
-        # row.update(trade.area.get_metrics(trade.exit_time, prefix='exit_'))
+        row.update(trade.area.get_metrics_dict(trade.entry_time, prefix=''))
         data.append(row)
         
     df = pd.DataFrame(data)
     bardf = TypedBarData.to_dataframe([trade.bar_at_entry for trade in trades])
-    # print(df['Entry Time'])
-    # print(bardf['timestamp'].dt.time )
+    
+    
     assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time'])
     df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)
+    print(list(df.columns))
     
+    # df.sort_values(by=['Type','ID'], inplace=True) # for quicker subtotalling in excel
+
+    # Fields to flip for shorts
+    flip_fields = {
+        # Price action
+        'doji_ratio',
+        'mfi_divergence',
+        'rsi_divergence',
+        
+        # Volume profile
+        'vol_balance',
+        'hvn_balance',
+        
+        # Technical indicators
+        'MACD',
+        'MACD_signal',
+        'MACD_hist',
+        'MACD_hist_roc',
+        'RSI_roc',
+        'MFI_roc'
+    }
+    # Flip values for shorts
+    for field in flip_fields:
+        if field in df.columns:
+            df[field] = df.apply(
+                lambda row: -row[field] if not row['Type'].endswith('Long') else row[field], 
+                axis=1
+            )
+
     if filename:
         if len(os.path.dirname(filename)) > 0:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
-            
         df.to_csv(filename, index=False)
         print(f"Trade summary has been exported to {filename}")
-        
         # df.to_csv(filename.replace('.csv', '.tsv'), index=False, sep='\t')   # Replace the existing df.to_csv line
         # print(f"Trade summary has been exported to {filename}")
     return df

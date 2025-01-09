@@ -65,6 +65,7 @@ class TouchArea:
     def __post_init__(self):
         assert self.min_touches > 1, f'{self.min_touches} > 1'
         assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
+        assert self.lmin < self.level < self.lmax, f'{self.lmin} < {self.level} < {self.lmax}'
         assert len(self.valid_atr) == len(self.touches), f'{len(self.valid_atr)} == {len(self.touches)}'
         assert len(self.initial_touches) == self.min_touches, f'{len(self.initial_touches)} >= {self.min_touches}'
         self.min_touches_time = self.initial_touches[self.min_touches - 1] # if len(self.initial_touches) >= self.min_touches else None
@@ -124,6 +125,10 @@ class TouchArea:
     @property
     def get_range(self) -> float:
         return self.upper_bound - self.lower_bound
+    
+    @property
+    def get_level_range(self) -> float:
+        return self.lmax - self.lmin
     
     def current_touches(self, current_timestamp: datetime):
         return [touch for touch in self.touches if touch <= current_timestamp]
@@ -237,7 +242,7 @@ class TouchArea:
                                  for touch in touches])
         return np.polyfit(time_intervals, atr_values, 1)[0]
 
-    def get_metrics(self, current_time: datetime, prefix: str = '') -> dict:
+    def get_metrics_dict(self, current_time: datetime, prefix: str = '') -> dict:
         """
         Get all metrics for the area at current_time.
         

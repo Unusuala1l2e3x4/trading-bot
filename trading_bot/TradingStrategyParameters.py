@@ -428,6 +428,10 @@ class StrategyParameters:
     mfi_oversold: float = 20
     # mfi_overbought: float = 70
     # mfi_oversold: float = 30
+    
+    # For temporal weighting (span in minutes)
+    volume_profile_ema_span: float = 120  # ~90 minutes looks back far enough while emphasizing recent activity    volume_profile_ema: float = 90
+    
 
     def __post_init__(self):
         assert self.rsi_overbought > self.rsi_oversold

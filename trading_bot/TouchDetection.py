@@ -580,7 +580,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         df = pd.concat([df, macd_df],axis=1)
         # print(df)
         
-        df['central_value'] = (df['vwap'] + calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span) * 2) / 3
+        # df['central_value'] = (df['vwap'] + calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span) * 2) / 3
+        df['central_value'] = calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span)
         df['is_res'] = df['close'] >= df['central_value'] # if is_res, trade long
 
         # Calculate True Range (TR)
@@ -619,6 +620,44 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # Add ATR-based calculations
         df['rolling_ATR'] = df['ATR'].rolling(window=15, min_periods=1).mean()
         
+                
+        # Calculate distance to central value/EMA - positive when price above
+        df['central_value_dist'] = (df['close'] - df['central_value']) / df['close'] # Normalize by price level
+        df['central_value_dist_pct'] = df['central_value_dist'] * 100
+
+        # Calculate basic ADX components
+        df['plus_dm'] = df['high'] - df['high'].shift(1) 
+        df['minus_dm'] = df['low'].shift(1) - df['low']
+        df['plus_dm'] = np.where((df['plus_dm'] > df['minus_dm']) & (df['plus_dm'] > 0), df['plus_dm'], 0)
+        df['minus_dm'] = np.where((df['minus_dm'] > df['plus_dm']) & (df['minus_dm'] > 0), df['minus_dm'], 0)
+
+        # Smooth DMs and TR using EMA
+        df['smoothed_plus_dm'] = calculate_ema_with_cutoff(df, 'plus_dm', span=params.ema_span)
+        df['smoothed_minus_dm'] = calculate_ema_with_cutoff(df, 'minus_dm', span=params.ema_span)
+        df['smoothed_tr'] = calculate_ema_with_cutoff(df, 'TR', span=params.ema_span)
+
+        # Calculate DIs and ADX
+        df['plus_di'] = (df['smoothed_plus_dm'] / df['smoothed_tr']) * 100
+        df['minus_di'] = (df['smoothed_minus_dm'] / df['smoothed_tr']) * 100
+
+        # DX is absolute difference between the DIs divided by their sum
+        df['dx'] = abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di']) * 100
+
+        # ADX is smoothed DX
+        df['ADX'] = calculate_ema_with_cutoff(df, 'dx', span=params.ema_span)
+
+        # Directional trend strength (positive values indicate bullish, negative bearish)
+        df['trend_strength'] = df['plus_di'] - df['minus_di']
+
+        # Clean up intermediate columns
+        df = df.drop(columns=[
+            'plus_dm', 'minus_dm', 'smoothed_plus_dm', 'smoothed_minus_dm',
+            'smoothed_tr', 'plus_di', 'minus_di', 'dx',
+            'H_PC','L_PC','TR'
+        ])
+                
+                
+        
         # Group data by date
         grouped = df.groupby(timestamps.date)
         
@@ -645,15 +684,19 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                 if row['volume'] <= 0 or row['trade_count'] <= 0:
                     continue
                 
-                high, low, close = row['high'], row['low'], row['close']
+                # high, low, close = row['high'], row['low'], row['close']
+                h_l, atr, close = row['H_L'], row['ATR'], row['close']
                 timestamp = day_timestamps[i]
                 is_res = row['is_res']
                 
-                high_low_diffs.append(high - low)
+                # high_low_diffs.append(high - low)
+                # high_low_diffs.append(h_l)
+                high_low_diffs.append(atr)
                 # high_close_diffs.append(high - close)
                 # low_close_diffs.append(close - low)
                 
                 w = np.median(high_low_diffs) / 2
+                # w = atr
                 # w = np.median(high_low_diffs[-15:]) / 2
                 lmin, lmax = close - w, close + w
                 
@@ -743,7 +786,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             
         # widths = long_widths + short_widths
 
-        df = df.drop(columns=['H_PC','L_PC','TR']) # 'H_L',  ,'ATR','MTR'
+        # df = df.drop(columns=['H_PC','L_PC','TR']) # 'H_L',  ,'ATR','MTR'
         
         ret = {
             'symbol': df.index.get_level_values('symbol')[0] if isinstance(params, LiveTouchDetectionParameters) else params.symbol,

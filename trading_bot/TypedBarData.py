@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 from datetime import datetime
 import pandas as pd
 import numpy as np
+
+from trading_bot.VolumeProfile import VolumeProfile
 
 @dataclass
 class TypedBarData:
@@ -49,15 +51,71 @@ class TypedBarData:
     # Store original row for access to any additional columns
     _row: pd.Series = field(repr=False)
     
+    # Overall volume distribution metrics (using all volume)
+    vol_balance: float = 0.0      # Sign indicates if volume is mostly above/below price
+    vol_concentration: float = 0.0 # How clustered volume is near price
+    vol_kurtosis: float = 0.0     # Peakedness of distribution
+    
+    # HVN-specific metrics (using only detected peaks)
+    hvn_balance: float = 0.0      # Sign indicates if HVNs are mostly above/below price
+    hvn_concentration: float = 0.0 # How clustered HVNs are near price
+    hvn_avg_prominence: float = 0.0 # Average strength of detected HVNs
+    
+    
     # Add threshold parameters as class attributes with defaults
     doji_ratio_threshold: float = 0.1
     wick_ratio_threshold: float = 2.0
     atr_compression_threshold: float = 0.9
     volume_compression_threshold: float = 0.7
     min_indecision_signals: int = 2
-    
 
-    
+
+    def __post_init__(self):
+        self.rsi_overbought = 65
+        self.rsi_oversold = 35
+        self.mfi_overbought = 75
+        self.mfi_oversold = 25
+
+    @property 
+    def market_phase(self) -> float:
+        """
+        Market phase normalized to [0,1] where:
+        - 0.0 = market open (9:30)
+        - 0.25 = pre-lunch (11:00) 
+        - 0.5 = lunch (12:30)
+        - 0.75 = post-lunch (2:00)
+        - 1.0 = market close (16:00)
+        """
+        minutes_from_open = (self.timestamp - pd.Timestamp("9:30", tz=self.timestamp.tz)).total_seconds() / 60
+        total_market_minutes = 390  # 6.5 hours * 60
+        return np.clip(minutes_from_open / total_market_minutes, 0, 1)
+
+    def update_volume_metrics(self, volume_profile: VolumeProfile, atr: Optional[float] = None):
+        """Update all volume profile related attributes and add to _row."""
+        if volume_profile.profile is None:
+            return
+            
+        # Calculate metrics using all volume
+        self.vol_balance, self.vol_concentration, self.vol_kurtosis = \
+            volume_profile.calculate_moments_relative_to_price(
+                volume_profile.bin_centers,
+                volume_profile.profile,
+                self.close
+            )
+        
+        # Calculate metrics using only HVNs
+        self.hvn_balance, self.hvn_concentration, self.hvn_avg_prominence = \
+            volume_profile.get_hvn_metrics(self.close, self.ATR if atr is None else atr)
+        
+        # Add to _row for DataFrame conversion
+        self._row['vol_balance'] = self.vol_balance
+        self._row['vol_concentration'] = self.vol_concentration 
+        self._row['vol_kurtosis'] = self.vol_kurtosis
+        self._row['hvn_balance'] = self.hvn_balance
+        self._row['hvn_concentration'] = self.hvn_concentration
+        self._row['hvn_avg_prominence'] = self.hvn_avg_prominence
+
+
     @property
     def shares_per_trade(self) -> float:
         return self.volume / self.trade_count
@@ -88,7 +146,8 @@ class TypedBarData:
     def wick_ratio(self) -> float:
         """Calculate the ratio of the total range to the body size."""
         if self.body_size == 0:
-            return float('inf')
+            # return float('inf')
+            return self.range_size / 0.01
         return self.range_size / self.body_size
 
     @property
@@ -172,7 +231,7 @@ class TypedBarData:
         Get list of tuples containing (description, boolean) for each indecision signal.
         """
         return [
-            (f"Doji (ratio={self.doji_ratio:.3f} < {self.doji_ratio_threshold})", 
+            (f"Doji Abs (ratio={self.doji_ratio_abs:.3f} < {self.doji_ratio_threshold})", 
              self.is_doji),
             
             (f"Long Wicks (ratio={self.wick_ratio:.2f} > {self.wick_ratio_threshold})", 
@@ -230,68 +289,119 @@ class TypedBarData:
         
         return (price_trending_up and rsi_trending_down and mfi_trending_down) or \
             (price_trending_down and rsi_trending_up and mfi_trending_up)
-
-    def shows_reversal_potential(self, area_is_long, rsi_overbought: float = 70, rsi_oversold: float = 30, mfi_overbought: float = 80, mfi_oversold: float = 20) -> bool:
-        """
-        Check if the bar shows potential for reversal based on multiple factors.
-        
-        Args:
-            rsi_overbought: RSI threshold for overbought condition (default: 70)
-            rsi_oversold: RSI threshold for oversold condition (default: 30)
-            mfi_overbought: MFI threshold for overbought condition (default: 80)
-            mfi_oversold: MFI threshold for oversold condition (default: 20)
+    
+    
+    @property
+    def rsi_divergence(self) -> float:
+        """Calculate RSI price divergence strength.
         
         Returns:
-            bool: True if either:
-                - Oversold conditions with bullish price action, or
-                - Overbought conditions with bearish price action
-                AND either shows indecision or has indicator divergence
+            float: Range [-1, 1] where:
+                - Positive values indicate bullish divergence (price down, RSI up)
+                - Negative values indicate bearish divergence (price up, RSI down)
+                - Magnitude indicates strength of divergence
+                - 0 indicates no divergence
         """
-        # Check if oversold (looking for bullish reversal)
-        oversold_reversal = (
-            not area_is_long
-            and
-            self.MFI <= mfi_oversold
-            # and  # Primary indicator
-            # self.RSI <= rsi_oversold
-            # and   # Confirmation
-            # self.close >= self.open          # Current bar showing strength
-        )
+        price_change = (self.close - self.open) / self.open
+        rsi_change = self.RSI_roc / 100  # Convert to decimal
         
-        # Check if overbought (looking for bearish reversal)
-        overbought_reversal = (
-            area_is_long
-            and
-            self.MFI >= mfi_overbought
-            # and  # Primary indicator
-            # self.RSI >= rsi_overbought
-            # and  # Confirmation
-            # self.close <= self.open                 # Current bar showing weakness
-        )
+        # No divergence if price and RSI moving same direction
+        if (price_change >= 0 and rsi_change >= 0) or \
+        (price_change <= 0 and rsi_change <= 0):
+            return 0.0
+            
+        # Calculate divergence strength 
+        divergence = rsi_change - price_change
+        return np.tanh(divergence)
 
-        # Base conditions for reversal
-        base_reversal = (oversold_reversal or overbought_reversal) # mututally exclusive so never both true
+    @property
+    def mfi_divergence(self) -> float:
+        """Calculate MFI price divergence strength.
         
+        Returns:
+            float: Range [-1, 1] where:
+                - Positive values indicate bullish divergence (price down, MFI up)
+                - Negative values indicate bearish divergence (price up, MFI down)
+                - Magnitude indicates strength of divergence
+                - 0 indicates no divergence
+        """
+        price_change = (self.close - self.open) / self.open
+        mfi_change = self.MFI_roc / 100  # Convert to decimal
         
-        if base_reversal:
-            if oversold_reversal:
-                assert not overbought_reversal
-                # assert not area_is_long, (area_is_long, self.RSI, self.MFI)
-            if overbought_reversal:
-                assert not oversold_reversal
-                # assert area_is_long, (area_is_long, self.RSI, self.MFI)
-                
-        # Enhanced reversal signal requires:
-        # 1. Base reversal conditions
-        # 2. Enough indecision signals
-        # 3. Either divergence or high indecision
-        return base_reversal and (
-            self.shows_indecision or 
-            self.has_divergence
+        # No divergence if price and MFI moving same direction  
+        if (price_change >= 0 and mfi_change >= 0) or \
+        (price_change <= 0 and mfi_change <= 0):
+            return 0.0
+            
+        # Calculate divergence strength
+        divergence = mfi_change - price_change
+        return np.tanh(divergence)
+        
+    
+    
+    # TODO: needs to be adjusted based on data-driven analysis
+    def shows_reversal_potential(self, area_is_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
+                            mfi_overbought: float = 75, mfi_oversold: float = 25, 
+                            pre_position: bool = False) -> bool:
+        """
+        Check if conditions suggest trend reversal.
+        """
+        # Base momentum conditions - only need one indicator
+        oversold_reversal = (
+            not area_is_long and (
+                # MFI oversold and improving
+                (self.MFI <= mfi_oversold and self.MFI_roc > 0) or
+                # RSI oversold and improving  
+                (self.RSI <= rsi_oversold and self.RSI_roc > 0)
+            )
         )
         
-    def describe_reversal_potential(self, area_was_long, rsi_overbought: float = 70, rsi_oversold: float = 30, 
-                                mfi_overbought: float = 80, mfi_oversold: float = 20) -> str:
+        overbought_reversal = (
+            area_is_long and (
+                # MFI overbought and deteriorating
+                (self.MFI >= mfi_overbought and self.MFI_roc < 0) or
+                # RSI overbought and deteriorating
+                (self.RSI >= rsi_overbought and self.RSI_roc < 0)
+            )
+        )
+        
+        if not (oversold_reversal or overbought_reversal):
+            return False
+            
+        # Get common metrics
+        indecision_count = sum(signal[1] for signal in self.get_indecision_signals())
+        close_to_high = (self.close - self.low) / (self.high - self.low) if self.high != self.low else 0.5
+        close_to_low = (self.high - self.close) / (self.high - self.low) if self.high != self.low else 0.5
+        volume_strength = self.volume_ratio > 1.0
+        
+        if pre_position:
+            # For side switching, need ANY TWO of:
+            # 1. Indecision signals (market struggling to continue trend)
+            # 2. Volume confirmation
+            # 3. Price moving in new direction
+            
+            confirmation_count = sum([
+                indecision_count >= 1,  # Relaxed from 2 to 1
+                volume_strength,
+                oversold_reversal and close_to_high > 0.6,  # Relaxed from 0.7
+                overbought_reversal and close_to_low > 0.6   # Relaxed from 0.7
+            ])
+            
+            return confirmation_count >= 2  # Need any 2 confirmations
+                
+        else:
+            # For position scaling warnings (keep as before)
+            warning_count = sum([
+                indecision_count >= 2,
+                volume_strength,
+                oversold_reversal and close_to_low > 0.7,  # Staying near low when oversold
+                overbought_reversal and close_to_high > 0.7  # Staying near high when overbought
+            ])
+            
+            return warning_count >= 2
+        
+    def describe_reversal_potential(self, area_was_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
+                            mfi_overbought: float = 75, mfi_oversold: float = 25, ) -> str:
         """Get a readable description of reversal potential conditions."""
         conditions = []
         
@@ -330,13 +440,14 @@ class TypedBarData:
             conditions.append(f"Shows indecision - {self.describe_indecision}")
         
         if not conditions:
-            return "No reversal conditions detected"
+            return "describe_reversal_potential - No reversal conditions detected"
         
         # Determine overall reversal potential
         has_potential = self.shows_reversal_potential(area_was_long, rsi_overbought, rsi_oversold, 
-                                                    mfi_overbought, mfi_oversold)
+                                                    mfi_overbought, mfi_oversold,
+                                                    pre_position=True)
         
-        return (f"{'POTENTIAL REVERSAL' if has_potential else 'Partial conditions'} detected:\n" + 
+        return (f"describe_reversal_potential - {'POTENTIAL REVERSAL' if has_potential else 'Partial conditions'} detected:\n" + 
                 "\n".join(f"- {cond}" for cond in conditions))
         
     
