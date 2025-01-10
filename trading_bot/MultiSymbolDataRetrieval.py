@@ -864,6 +864,9 @@ if __name__=="__main__":
 
     start_date = "2024-11-01 00:00:00"
     end_date =   "2024-12-01 00:00:00"
+    
+    start_date = "2024-12-01 00:00:00"
+    end_date =   "2025-01-01 00:00:00"
 
     # start_date = "2024-09-04 00:00:00"
     # end_date =   "2024-09-05 00:00:00"
@@ -912,9 +915,13 @@ if __name__=="__main__":
     
     
     # symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA', 'TSLA']
-    symbols = ['MSTR','MARA','INTC','GOOG']
+    # symbols = ['MSTR','MARA','INTC','GOOG']
+    symbols = ['MARA','TSLA','NVDA', 'AMZN', 'AAPL']
     # symbols = ['AAPL']
     # symbols = ['QFIN']
+    
+    for symbol in symbols:
+        retrieve_multi_symbol_data(params, [symbol], return_data=False)
         
     # params.start_date = "2024-09-04 00:00:00"
     # params.end_date =   "2024-09-05 00:00:00"
@@ -942,16 +949,16 @@ if __name__=="__main__":
     #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
     
 
-    for month in range(11, 0, -1):  # Loop through months
-        start_date = f"2024-{month:02d}-01 00:00:00"
-        end_date = f"2024-{month + 1:02d}-01 00:00:00"
-        print(start_date, end_date)
+    # for month in range(11, 0, -1):  # Loop through months
+    #     start_date = f"2024-{month:02d}-01 00:00:00"
+    #     end_date = f"2024-{month + 1:02d}-01 00:00:00"
+    #     print(start_date, end_date)
         
-        params.start_date = start_date
-        params.end_date = end_date
+    #     params.start_date = start_date
+    #     params.end_date = end_date
         
-        for symbol in symbols:
-            retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    #     for symbol in symbols:
+    #         retrieve_multi_symbol_data(params, [symbol], return_data=False)
 
 
     # symbols = ['AAPL'] 

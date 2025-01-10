@@ -9,7 +9,7 @@ import math
 from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
 from trading_bot.TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price, plot_trade_correlation
-from trading_bot.TypedBarData import TypedBarData
+from trading_bot.TypedBarData import TypedBarData, PreMarketBar
 from trading_bot.VolumeProfile import VolumeProfile
 
 from IPython.display import clear_output
@@ -216,6 +216,7 @@ class TradingStrategy:
 
     # Fields with default values
     all_bars: pd.DataFrame = field(init=False)
+    premarket_bars: pd.DataFrame = field(init=False)
     logger: logging.Logger = field(init=False)
     balance: float = field(init=False) # equivalent to account buying power divided by margin multiplier
     open_positions: Set[TradePosition] = field(default_factory=set)
@@ -285,7 +286,19 @@ class TradingStrategy:
     def __post_init__(self):
         self.latest_quote_time = None
         
+        # Get all bars (including pre-market)
+        all_bars_unfiltered = self.touch_detection_areas.bars
+        # Keep intraday bars filtered
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
+        
+        # Create pre-market bars
+        # Get inverse of intraday mask and filter out post-market
+        premarket_mask = ~self.touch_detection_areas.mask & \
+            (all_bars_unfiltered.index.get_level_values('timestamp').time < time(9, 30))
+        self.premarket_bars = all_bars_unfiltered[premarket_mask].sort_index(level='timestamp')
+        
+        # print(self.premarket_bars)
+        
         self.logger = self.setup_logger(self.log_level)
         self.initialize_strategy()
         
@@ -346,7 +359,16 @@ class TradingStrategy:
     def update_strategy(self, touch_detection_areas: TouchDetectionAreas):
         assert self.is_live_trading
         self.touch_detection_areas = touch_detection_areas
+        all_bars_unfiltered = self.touch_detection_areas.bars
         self.all_bars = self.touch_detection_areas.bars[self.touch_detection_areas.mask].sort_index(level='timestamp')
+        
+        # Update pre-market bars
+        premarket_mask = ~self.touch_detection_areas.mask & \
+            (all_bars_unfiltered.index.get_level_values('timestamp').time < self.market_open.time())
+        self.premarket_bars = all_bars_unfiltered[premarket_mask].sort_index(level='timestamp')
+        
+        # print(self.premarket_bars)
+        
         if self.is_live_trading:
             self.daily_bars = self.all_bars  # In live trading, all data is "daily data"
             self.daily_bars_index = len(self.daily_bars) - 1
@@ -1116,7 +1138,12 @@ class TradingStrategy:
         self.next_position_id = 0
         self.soft_end_triggered = False
         self.log(f"Starting balance on {self.current_date}: {self.balance}", level=logging.INFO)
-
+        
+        # Process pre-market data for both live and backtest
+        start_date = pd.Timestamp(self.current_date, tz=ny_tz)
+        end_date = start_date + pd.Timedelta(days=1)
+        premarket_data = filter_df_by_timerange(self.premarket_bars, start_date, end_date)   
+            
         if self.is_live_trading: # handled in FUNCTION: update_strategy
             self.daily_bars = self.all_bars  # In live trading, all data is "daily data"
             self.daily_bars_index = len(self.daily_bars) - 1  # Current index is always the last one in live trading
@@ -1127,12 +1154,12 @@ class TradingStrategy:
             
         else:
             # Use searchsorted to find start and end positions for daily_bars
-            start_date = pd.Timestamp(self.current_date, tz=ny_tz)
-            end_date = start_date + pd.Timedelta(days=1)
+            # start_date = pd.Timestamp(self.current_date, tz=ny_tz)
+            # end_date = start_date + pd.Timedelta(days=1)
 
             # Filter the data for the current trading day based on timestamp
-            self.daily_bars = filter_df_by_timerange(self.all_bars, start_date, end_date) # self.all_bars.iloc[start_pos:end_pos]
-            self.daily_bars_index = 1  # Start from index 1 (exclude opening minute)
+            self.daily_bars = filter_df_by_timerange(self.all_bars, start_date, end_date)
+            self.daily_bars_index = 1
             # daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
             
             daily_bars_minutes = self.daily_bars.index.get_level_values('timestamp').tz_convert(ny_tz)
@@ -1149,12 +1176,27 @@ class TradingStrategy:
             )
             assert not self.open_positions, self.open_positions # intraday only. should not have any open positions held overnight from previous day
 
-        # Reset volume profile for new day
-        day_data = self.daily_bars.iloc[:self.daily_bars_index + 1]  # Include current bar
-        self.volume_profile.reset_for_day(
-            day_data['low'].min(),
-            day_data['high'].max()
-        )
+        # Initialize volume profile with pre-market and current intraday data
+        if not premarket_data.empty:
+            # Get regular session data up to current bar
+            day_data = self.daily_bars.iloc[:self.daily_bars_index]
+            
+            # Reset profile using combined range
+            combined_data = pd.concat([premarket_data, day_data])
+            self.volume_profile.reset_for_day(
+                combined_data['low'].min(),
+                combined_data['high'].max()
+            )
+            
+            # print(combined_data)
+
+            # Process pre-market bars
+            for _, row in combined_data.iterrows():
+                bar = PreMarketBar.from_row(row)
+                self.volume_profile.update_profile(bar)
+                # # clear_output(wait=True)
+                if bar.timestamp.minute == 30:
+                    self.volume_profile.plot_profile(bar.close, bar.timestamp)
     
     
     def get_quotes_raw(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
@@ -1266,7 +1308,7 @@ class TradingStrategy:
             
             if (self.current_date is None or current_timestamp.date() != self.current_date):
                 self.handle_new_trading_day(current_timestamp)
-                print(self.daily_bars.iloc[:self.daily_bars_index+1])
+                # print(self.daily_bars.iloc[:self.daily_bars_index+1])
             
             if not self.market_open or not self.market_close:
                 continue
@@ -1282,9 +1324,9 @@ class TradingStrategy:
             self.now_bar.update_volume_metrics(self.volume_profile, base_atr)
             self.prev_close = self.daily_bars.iloc[self.daily_bars_index-1].close
 
-            # # clear_output(wait=True)
-            # if current_timestamp.minute in {30} and current_timestamp.hour > 9:
-            #     self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+            # clear_output(wait=True)
+            if current_timestamp.minute == 30 or (current_timestamp.hour == 9 and current_timestamp.minute == 31):
+                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
             
             
             # NOTE: quotes raw data should be passed into touch_detection_areas
@@ -1389,7 +1431,7 @@ class TradingStrategy:
         try:
             if (self.current_date is None or current_timestamp.date() != self.current_date) and len(self.all_bars) >= 2:
                 self.handle_new_trading_day(current_timestamp)
-                print(self.daily_bars.iloc[:self.daily_bars_index+1])
+                # print(self.daily_bars.iloc[:self.daily_bars_index+1])
             
             if not self.market_open or not self.market_close:
                 return [], set()
@@ -1408,8 +1450,8 @@ class TradingStrategy:
             self.prev_close = self.daily_bars.iloc[self.daily_bars_index-1].close
 
             # # clear_output(wait=True)
-            # if current_timestamp.minute in {0,30}:
-            #     self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+            if current_timestamp.minute == 30 or (current_timestamp.hour == 9 and current_timestamp.minute == 31):
+                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
             
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp) # returns empty dataframe
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp) # returns empty dataframe

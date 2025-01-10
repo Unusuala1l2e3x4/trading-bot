@@ -273,6 +273,8 @@ class LiveTrader:
         current_date = datetime.now(self.ny_tz).date()
         self.trading_strategy.update_daily_parameters(current_date)
         
+        self.touch_detection_state = None
+        
         log("Daily data reset complete.")
     
     def is_market_open(self, check_time: Optional[datetime] = None):

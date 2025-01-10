@@ -343,7 +343,7 @@ class VolumeProfile:
 
 
 
-    def plot_profile(self, current_price: float, current_timestamp: datetime, atr: float) -> None:
+    def plot_profile(self, current_price: float, current_timestamp: datetime, atr: float = None) -> None:
         """
         Plot volume profile distribution and detected HVNs.
         
@@ -351,6 +351,7 @@ class VolumeProfile:
             current_price: Current price for reference line
             atr: ATR for HVN detection
         """
+        return
         import matplotlib.pyplot as plt
         
         if self.profile is None or len(self.profile) == 0:
@@ -365,16 +366,17 @@ class VolumeProfile:
                 alpha=0.3, color='blue', label='VP')
         
         # Find and plot HVNs
-        hvn_prices, prominences = self.find_hvns(atr)
-        if len(hvn_prices) > 0:
-            # Scale prominences for visibility
-            scale_factor = max(self.profile) / max(self.smoothed_profile)
-        
-            plt.plot(self.bin_centers, self.smoothed_profile*scale_factor,
-                    color='green', label='Smoothed VP')
-        
-            plt.scatter(hvn_prices, prominences * scale_factor, color='red', s=100,
-                    label='HVNs', zorder=3)
+        if atr:
+            hvn_prices, prominences = self.find_hvns(atr)
+            if len(hvn_prices) > 0:
+                # Scale prominences for visibility
+                scale_factor = max(self.profile) / max(self.smoothed_profile)
+            
+                plt.plot(self.bin_centers, self.smoothed_profile*scale_factor,
+                        color='green', label='Smoothed VP')
+            
+                plt.scatter(hvn_prices, prominences * scale_factor, color='red', s=100,
+                        label='HVNs', zorder=3)
             
         # Plot current price line
         plt.axvline(x=current_price, color='green', linestyle='--', 

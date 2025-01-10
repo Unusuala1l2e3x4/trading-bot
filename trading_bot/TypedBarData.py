@@ -11,6 +11,29 @@ ny_tz = ZoneInfo("America/New_York")
 
 
 @dataclass
+class PreMarketBar:
+    """Lightweight bar class for pre-market volume profile updates."""
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+    @classmethod
+    def from_row(cls, row: pd.Series) -> 'PreMarketBar':
+        timestamp = row.name[1] if isinstance(row.name, tuple) else row.name
+        return cls(
+            timestamp=timestamp,
+            open=row['open'],
+            high=row['high'],
+            low=row['low'],
+            close=row['close'],
+            volume=row['volume']
+        )
+        
+    
+@dataclass
 class TypedBarData:
     """Wrapper for bar data with proper type hints."""
     # Index fields
