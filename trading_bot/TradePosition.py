@@ -709,7 +709,7 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
             
             'Initial Qty': trade.initial_shares,
             'Target Qty': trade.target_max_shares,
-            'Max Qty Reached (%)': 100*(trade.max_shares_reached / trade.target_max_shares),
+            'Max Qty Reached (%)': round(100*(trade.max_shares_reached / trade.target_max_shares),6),
             'Side Win Lose': trade.side_win_lose_str,
             'Total P/L': round(trade.pl,6),
             'ROE (P/L %)': round(trade.plpc,12),
@@ -724,7 +724,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         
         # Add bar at entry metrics
         row.update({
-            'market_phase': trade.bar_at_entry.market_phase,
+            'market_phase_inc': round(trade.bar_at_entry.market_phase_inc,6),
+            'market_phase_dec': round(trade.bar_at_entry.market_phase_dec,6),
             # 'shares_per_trade': round(trade.bar_at_entry.shares_per_trade,6),
             'doji_ratio': round(trade.bar_at_entry.doji_ratio,6),
             'mfi_divergence': round(trade.bar_at_entry.mfi_divergence,6),
@@ -742,7 +743,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         
     df = pd.DataFrame(data)
     bardf = TypedBarData.to_dataframe([trade.bar_at_entry for trade in trades])
-    
+    float_cols = bardf.select_dtypes(include=['float']).columns
+    bardf[float_cols] = bardf[float_cols].round(10)
     
     assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time'])
     df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)
@@ -767,7 +769,12 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         'MACD_hist',
         'MACD_hist_roc',
         'RSI_roc',
-        'MFI_roc'
+        'MFI_roc',
+        
+        #
+        'trend_strength',
+        'central_value_dist'
+        
     }
     # Flip values for shorts
     for field in flip_fields:

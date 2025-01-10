@@ -5,6 +5,10 @@ import pandas as pd
 import numpy as np
 
 from trading_bot.VolumeProfile import VolumeProfile
+from zoneinfo import ZoneInfo
+
+ny_tz = ZoneInfo("America/New_York")
+
 
 @dataclass
 class TypedBarData:
@@ -47,6 +51,12 @@ class TypedBarData:
     rolling_range_min_4: float  # 4-bar minimum range
     rolling_range_min_7: float  # 7-bar minimum range
     rolling_ATR: float  # rolling ATR average
+
+    # New trend metrics
+    central_value_dist: float       # Normalized distance to central value
+    ADX: float                      # Overall trend strength (0-100)
+    trend_strength: float           # Directional trend strength (-100 to +100)
+
     
     # Store original row for access to any additional columns
     _row: pd.Series = field(repr=False)
@@ -77,7 +87,7 @@ class TypedBarData:
         self.mfi_oversold = 25
 
     @property 
-    def market_phase(self) -> float:
+    def market_phase_inc(self) -> float:
         """
         Market phase normalized to [0,1] where:
         - 0.0 = market open (9:30)
@@ -86,9 +96,17 @@ class TypedBarData:
         - 0.75 = post-lunch (2:00)
         - 1.0 = market close (16:00)
         """
-        minutes_from_open = (self.timestamp - pd.Timestamp("9:30", tz=self.timestamp.tz)).total_seconds() / 60
+        minutes_from_open = (self.timestamp - pd.Timestamp.combine(self.timestamp.date(), pd.Timestamp("9:30").time()).tz_localize(ny_tz)).total_seconds() / 60
         total_market_minutes = 390  # 6.5 hours * 60
         return np.clip(minutes_from_open / total_market_minutes, 0, 1)
+
+    @property 
+    def market_phase_dec(self) -> float:
+        """
+        Inverse of market_phase_inc (1 at open, 0 at close)
+        """
+        return 1 - self.market_phase_inc
+    
 
     def update_volume_metrics(self, volume_profile: VolumeProfile, atr: Optional[float] = None):
         """Update all volume profile related attributes and add to _row."""

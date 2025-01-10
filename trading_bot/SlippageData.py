@@ -30,25 +30,29 @@ class SlippageData:
     quote_bid_price: float
     quote_ask_price: float
     quote_timestamp: datetime
+    pre_quote_request_timestamp: datetime
+    post_quote_request_timestamp: datetime
+    
+    touch_areas_calculated_timestamp: datetime
     
     # Actual order details
     filled_qty: float
     filled_avg_price: float
-    submitted_timestamp: datetime  # When we attempted to submit
+    pre_submit_timestamp: datetime  # When we attempted to submit
     created_at: datetime      # When Alpaca created the order
     submitted_at: datetime    # When Alpaca submitted to exchange
     updated_at: datetime      # Last update timestamp
     filled_at: Optional[datetime]  # When order was completely filled
     
     # Market conditions
-    rolling_atr: float  # ATR at time of trade
+    ATR: float  # ATR at time of trade
     avg_volume: float   # Volume EMA at time of trade
     minute_volume: float  # Volume in the last minute
     
     @classmethod
     def from_order(cls, order: Order, intended_qty: float, is_entry: bool, is_long: bool,
                   quote_bid_price: float, quote_ask_price: float, quote_timestamp: datetime,
-                  submitted_timestamp: datetime, rolling_atr: float, avg_volume: float,
+                  pre_submit_timestamp: datetime, ATR: float, avg_volume: float,
                   minute_volume: float) -> 'SlippageData':
         """Creates SlippageData instance from an Alpaca Order object and trade details.
         
@@ -60,8 +64,8 @@ class SlippageData:
             quote_bid_price: Latest bid price before submission
             quote_ask_price: Latest ask price before submission
             quote_timestamp: When the quotes were recorded
-            submitted_timestamp: When we attempted to submit the order
-            rolling_atr: ATR value at time of trade
+            pre_submit_timestamp: When we attempted to submit the order
+            ATR: ATR value at time of trade
             avg_volume: Volume EMA at time of trade
             minute_volume: Volume in the last minute
         """
@@ -77,12 +81,12 @@ class SlippageData:
             quote_timestamp=quote_timestamp,
             filled_qty=float(order.filled_qty or 0),
             filled_avg_price=float(order.filled_avg_price or 0),
-            submitted_timestamp=submitted_timestamp,
+            pre_submit_timestamp=pre_submit_timestamp,
             created_at=order.created_at,
             submitted_at=order.submitted_at,
             updated_at=order.updated_at,
             filled_at=order.filled_at,
-            rolling_atr=rolling_atr,
+            ATR=ATR,
             avg_volume=avg_volume,
             minute_volume=minute_volume
         )
@@ -117,7 +121,7 @@ class SlippageData:
     @property
     def latency_to_create(self) -> timedelta:
         """Time between our submission and Alpaca creating the order."""
-        return self.created_at - self.submitted_timestamp
+        return self.created_at - self.pre_submit_timestamp
     
     @property
     def latency_to_submit(self) -> timedelta:
@@ -129,17 +133,25 @@ class SlippageData:
         """Total time from our submission to complete fill."""
         if self.filled_at is None:
             return None
-        return self.filled_at - self.submitted_timestamp
+        return self.filled_at - self.pre_submit_timestamp
     
     @property
     def quote_age(self) -> timedelta:
         """How old the quote was when we submitted."""
-        return self.submitted_timestamp - self.quote_timestamp
+        return self.pre_submit_timestamp - self.quote_timestamp
     
     def calculate_cost_impact(self) -> float:
         """Calculate total cost impact of slippage in dollars."""
         return self.actual_slippage * self.filled_qty
-    
+
+    def calculate_total_cost(self) -> float:
+        """Calculate total cost of the executed order."""
+        return self.filled_qty * self.filled_avg_price
+
+    def calculate_expected_cost(self) -> float:
+        """Calculate expected cost based on quote prices."""
+        return self.intended_qty * self.expected_price
+
     def to_dict(self) -> dict:
         """Convert to dictionary for analysis/storage."""
         base_dict = {
@@ -154,12 +166,12 @@ class SlippageData:
             'quote_timestamp': self.quote_timestamp.isoformat(),
             'filled_qty': self.filled_qty,
             'filled_avg_price': self.filled_avg_price,
-            'submitted_timestamp': self.submitted_timestamp.isoformat(),
+            'pre_submit_timestamp': self.pre_submit_timestamp.isoformat(),
             'created_at': self.created_at.isoformat(),
             'submitted_at': self.submitted_at.isoformat(),
             'updated_at': self.updated_at.isoformat(),
             'filled_at': self.filled_at.isoformat() if self.filled_at else None,
-            'rolling_atr': self.rolling_atr,
+            'ATR': self.ATR,
             'avg_volume': self.avg_volume,
             'minute_volume': self.minute_volume,
             'actual_slippage': self.actual_slippage,
@@ -168,6 +180,8 @@ class SlippageData:
             'latency_to_submit_ms': self.latency_to_submit.total_seconds() * 1000,
             'time_to_fill_ms': self.time_to_fill.total_seconds() * 1000 if self.time_to_fill else None,
             'quote_age_ms': self.quote_age.total_seconds() * 1000,
+            'actual_cost': self.calculate_total_cost(),
+            'expected_cost': self.calculate_expected_cost(),
             'cost_impact': self.calculate_cost_impact()
         }
         return base_dict

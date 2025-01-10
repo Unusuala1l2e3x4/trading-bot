@@ -8,7 +8,7 @@ from alpaca.trading.requests import GetCalendarRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 
 import matplotlib.pyplot as plt
 from collections import defaultdict
@@ -298,8 +298,7 @@ class Level:
     level: float
     is_res: bool
     touches: List[datetime]
-
-
+    
 @jit(nopython=True)
 def np_searchsorted(a:np.ndarray,b:np.ndarray): # only used in calculate_touch_area function
     return np.searchsorted(a,b)
@@ -408,6 +407,9 @@ def calculate_touch_area(levels_by_date: Dict[datetime, List[Level]], is_long, d
             
             if len(consecutive_touch_indices) == min_touches:
                 consecutive_touches = day_timestamps[consecutive_touch_indices]
+                
+                assert consecutive_touches[0] >= day_start_time
+                
                 touch_area = TouchArea(
                     date=date,
                     id=level.id, # unique since each level has unique INITIAL touch time, and at most 1 TouchArea is created per level
@@ -465,11 +467,25 @@ class TouchDetectionAreas:
 
 
 
-def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, live_bars: Optional[pd.DataFrame] = None, 
+@dataclass
+class TouchDetectionState:
+    """Maintains state between calls to calculate_touch_detection_area."""
+    current_date: date
+    potential_levels: Dict[int, Level] = field(default_factory=lambda: defaultdict(lambda: Level(0, 0, 0, 0, False, [])))
+    high_low_diffs: List[float] = field(default_factory=list)
+    last_processed_index: int = 0
+    
+    
+def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, 
+                                   live_bars: Optional[pd.DataFrame] = None, 
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
-                                   area_ids_to_remove: Optional[set] = {}) -> TouchDetectionAreas:
+                                   area_ids_to_remove: Optional[set] = {},
+                                   previous_state: Optional[TouchDetectionState] = None) -> Union[TouchDetectionAreas, Tuple[TouchDetectionAreas, TouchDetectionState]]:
     def log_live(message, level=logging.INFO):
-        if isinstance(params, LiveTouchDetectionParameters):
+        if params.__class__.__name__ == 'LiveTouchDetectionParameters':
+            logger.log(level, message, exc_info=level >= logging.ERROR)
+    def log_backtest(message, level=logging.INFO):
+        if params.__class__.__name__ == 'BacktestTouchDetectionParameters':
             logger.log(level, message, exc_info=level >= logging.ERROR)
     
     """
@@ -496,7 +512,11 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
     customization of the analysis parameters. The resulting touch areas can be used for trading strategies
     or further market analysis.
     """
-    if isinstance(params, BacktestTouchDetectionParameters) or isinstance(params, trading_bot.TouchDetectionParameters.BacktestTouchDetectionParameters):
+    is_live = params.__class__.__name__ == 'LiveTouchDetectionParameters'
+
+    if not is_live:
+        if not params.__class__.__name__ == 'BacktestTouchDetectionParameters':
+            raise ValueError("Invalid parameter type")
         assert params.end_date > params.start_date
 
         # Alpaca API setup
@@ -518,18 +538,13 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         else:
             raise ValueError(f"Quote data not found for symbol {params.symbol}")
 
-    elif isinstance(params, LiveTouchDetectionParameters) or isinstance(params, trading_bot.TouchDetectionParameters.LiveTouchDetectionParameters):
+    else:
         if live_bars is None:
             raise ValueError("Live bars data must be provided for live trading parameters")
         df = live_bars
         df_adjusted = None
         quotes_raw_df = None
         quotes_agg_df = None
-    else:
-        # print(type(params))
-        # print(isinstance(params, BacktestTouchDetectionParameters))
-        # print(isinstance(params, BacktestTouchDetectionParameters))
-        raise ValueError("Invalid parameter type")
     
     try:
         log_live('Data retrieved')
@@ -623,7 +638,6 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                 
         # Calculate distance to central value/EMA - positive when price above
         df['central_value_dist'] = (df['close'] - df['central_value']) / df['close'] # Normalize by price level
-        df['central_value_dist_pct'] = df['central_value_dist'] * 100
 
         # Calculate basic ADX components
         df['plus_dm'] = df['high'] - df['high'].shift(1) 
@@ -654,11 +668,14 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'plus_dm', 'minus_dm', 'smoothed_plus_dm', 'smoothed_minus_dm',
             'smoothed_tr', 'plus_di', 'minus_di', 'dx',
             'H_PC','L_PC','TR'
-        ])
-                
-                
+        ],errors='ignore')
         
-        # Group data by date
+        log_live('bar metrics calculated',level=logging.DEBUG)
+            
+        # Initialize state tracking
+        current_state = None
+    
+        # Group data by date (for live trading, there will only be one date)
         grouped = df.groupby(timestamps.date)
         
         all_support_levels = defaultdict(list)
@@ -673,13 +690,26 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         for date, day_df in grouped:
             day_timestamps = day_df.index.get_level_values('timestamp') # need to limit
             
-            potential_levels = defaultdict(lambda: Level(0, 0, 0, False, []))
-            
-            high_low_diffs = [] # only consider the diffs in the current day
+            # For live trading, reuse or create state
+            if is_live:
+                if previous_state is None or previous_state.current_date != date:
+                    current_state = TouchDetectionState(current_date=date)
+                else:
+                    current_state = previous_state
+                    
+                potential_levels = current_state.potential_levels
+                high_low_diffs = current_state.high_low_diffs
+                start_idx = current_state.last_processed_index
+            else:
+                potential_levels = defaultdict(lambda: Level(0, 0, 0, 0, False, []))
+                high_low_diffs = []
+                start_idx = 0
             # high_close_diffs = []
             # low_close_diffs = []
             
-            for i in range(len(day_df)):
+            for i in range(start_idx, len(day_df)):
+            # for i in range(len(day_df)):
+            # for i in tqdm(range(len(day_df))):
                 row = day_df.iloc[i]
                 if row['volume'] <= 0 or row['trade_count'] <= 0:
                     continue
@@ -716,8 +746,15 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             
             if date in area_ids_to_remove:
                 for i in area_ids_to_remove[date]:
-                    del potential_levels[i] # area id == level id
-                    
+                    if i in potential_levels:
+                        del potential_levels[i] # area id == level id
+                        
+            # Update state if live trading
+            if is_live:
+                current_state.last_processed_index = len(day_df)
+                # current_state.high_low_diffs = high_low_diffs # already aliased
+                # current_state.potential_levels = potential_levels # already aliased
+            
             # a = pd.DataFrame(pd.Series(high_low_diffs).describe()).T
             # a['date'] = date
             # high_low_diffs_list.append(a)
@@ -726,14 +763,14 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             # Classify levels as support or resistance
             # Filter for strong levels
             for level in potential_levels.values():
-                if len(level.touches) < params.min_touches: # not strong level
+                if len(level.touches) < params.min_touches:
                     continue
                 if level.is_res:
                     all_resistance_levels[date].append(level)
                 else:
                     all_support_levels[date].append(level)
 
-        log_live('Levels created')
+        log_live('Levels created',level=logging.DEBUG)
         unique_dates = list(pd.unique(timestamps.date))
         if market_hours is None:
             market_hours = get_market_hours(unique_dates)
@@ -770,19 +807,18 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             mask = (timestamps >= day_start_time) & (timestamps <= day_end_time)
             final_mask |= mask
 
-        log_live('Mask created')
-
+        log_live('Mask created',level=logging.DEBUG)
         
         long_touch_area, long_widths = calculate_touch_area(
             all_resistance_levels, True, df, params.symbol, market_hours, params.min_touches, 
             params.use_median, params.touch_area_width_agg, params.calculate_bounds, params.multiplier, start_time, end_time
         )
-        log_live(f'{len(long_touch_area)} Long touch areas calculated')
+        log_live(f'{len(long_touch_area)} Long touch areas calculated',level=logging.DEBUG)
         short_touch_area, short_widths = calculate_touch_area(
             all_support_levels, False, df, params.symbol, market_hours, params.min_touches, 
             params.use_median, params.touch_area_width_agg, params.calculate_bounds, params.multiplier, start_time, end_time
         )
-        log_live(f'{len(short_touch_area)} Short touch areas calculated')
+        log_live(f'{len(short_touch_area)} Short touch areas calculated',level=logging.DEBUG)
             
         # widths = long_widths + short_widths
 
@@ -802,7 +838,12 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             'start_time': start_time,
             'end_time': end_time,
         }
-        return TouchDetectionAreas.from_dict(ret) # , high_low_diffs_list
+        areas = TouchDetectionAreas.from_dict(ret) # , high_low_diffs_list
+        
+        # Return additional state for live trading
+        if is_live:
+            return areas, current_state
+        return areas
         
     except Exception as e:
         log(f"{type(e).__qualname__} in calculate_touch_detection_area: {e}", level=logging.ERROR)
@@ -977,15 +1018,12 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                      for t in trades if t.is_long]
         long_iswin = [t.pl > 0 for t in trades if t.is_long]
         
-        # print(pd.Series(long_iswin).value_counts())
-        
         short_entries = [(t.entry_time, df.loc[df.index.get_level_values('timestamp') == t.entry_time, 'close'].iloc[0], t.id) 
                         for t in trades if not t.is_long]
         short_exits = [(t.exit_time, df.loc[df.index.get_level_values('timestamp') == t.exit_time, 'close'].iloc[0], t.id) 
                       for t in trades if not t.is_long]
         short_iswin = [t.pl > 0 for t in trades if not t.is_long]
-        
-        # print(pd.Series(short_iswin).value_counts())
+
         if long_iswin:
             long_colors = ['lime' if iswin else 'orangered' for iswin in long_iswin]
         if short_iswin:
