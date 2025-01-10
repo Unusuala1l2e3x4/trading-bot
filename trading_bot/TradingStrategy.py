@@ -372,26 +372,26 @@ class TradingStrategy:
                 returned_borrowed: Optional[float] = None, position: Optional[TradePosition] = None):
         if is_simulated:
             return
-        if not self.is_live_trading:
-            old_balance = self.balance
-            
-            if position and not position.is_long and (returned_borrowed is not None or exit_pl is not None):
-                # For short exits: only add returned_borrowed and exit_pl
-                if returned_borrowed is not None:
-                    self.balance += returned_borrowed  # Get back original proceeds
-                if exit_pl is not None:
-                    self.balance += exit_pl  # Add profit/loss
-            else:
-                # For long exits and all entries (both long and short)
-                self.balance += cash_change
-
-            if self.balance < 0:
-                self.log(f"Warning: Balance dropped below zero: {old_balance:.4f} -> {self.balance:.4f} " 
-                        f"(cash_change: {cash_change:.4f}, returned_borrowed: {returned_borrowed if returned_borrowed is not None else 0:.4f}, " 
-                        f"exit_pl: {exit_pl if exit_pl is not None else 0:.4f})",
-                        level=logging.WARNING)
+        # if not self.is_live_trading:
+        old_balance = self.balance
+        
+        if position and not position.is_long and (returned_borrowed is not None or exit_pl is not None):
+            # For short exits: only add returned_borrowed and exit_pl
+            if returned_borrowed is not None:
+                self.balance += returned_borrowed  # Get back original proceeds
+            if exit_pl is not None:
+                self.balance += exit_pl  # Add profit/loss
         else:
-            pass
+            # For long exits and all entries (both long and short)
+            self.balance += cash_change
+
+        if self.balance < 0:
+            self.log(f"Warning: Balance dropped below zero: {old_balance:.4f} -> {self.balance:.4f} " 
+                    f"(cash_change: {cash_change:.4f}, returned_borrowed: {returned_borrowed if returned_borrowed is not None else 0:.4f}, " 
+                    f"exit_pl: {exit_pl if exit_pl is not None else 0:.4f})",
+                    level=logging.WARNING)
+        # else:
+        #     pass
             # TODO: wait for order to fill in LiveTrader, calculate cost, then rebalance with that
             # handle entries and exits differently! entries only have cost, but exits also have realized p/l.
             # only the cost (cash committed/released) is adjusted with position.times_buying_power
@@ -1264,8 +1264,9 @@ class TradingStrategy:
             current_timestamp = timestamps[i].tz_convert(ny_tz)
             self.current_timestamp = current_timestamp
             
-            if self.current_date is None or current_timestamp.date() != self.current_date:
+            if (self.current_date is None or current_timestamp.date() != self.current_date):
                 self.handle_new_trading_day(current_timestamp)
+                print(self.daily_bars.iloc[:self.daily_bars_index+1])
             
             if not self.market_open or not self.market_close:
                 continue
@@ -1324,7 +1325,7 @@ class TradingStrategy:
                 
                 self.terminated_area_ids[self.current_date] = sorted([x.id for x in self.touch_area_collection.terminated_date_areas])
                 self.traded_area_ids[self.current_date] = sorted([x.id for x in self.touch_area_collection.traded_date_areas])
-                self.log(f"    terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
+                self.log(f"    {len(self.terminated_area_ids[self.current_date])} terminated areas on {self.touch_area_collection.active_date}: {self.terminated_area_ids[self.current_date]}", level=logging.INFO)
                 
                 
                 if self.params.plot_day_results:
@@ -1386,8 +1387,9 @@ class TradingStrategy:
         assert self.touch_detection_areas.quotes_agg is not None
         
         try:
-            if self.current_date is None or current_timestamp.date() != self.current_date:
+            if (self.current_date is None or current_timestamp.date() != self.current_date) and len(self.all_bars) >= 2:
                 self.handle_new_trading_day(current_timestamp)
+                print(self.daily_bars.iloc[:self.daily_bars_index+1])
             
             if not self.market_open or not self.market_close:
                 return [], set()
@@ -1405,9 +1407,9 @@ class TradingStrategy:
             self.now_bar.update_volume_metrics(self.volume_profile, base_atr)
             self.prev_close = self.daily_bars.iloc[self.daily_bars_index-1].close
 
-            # clear_output(wait=True)
-            if current_timestamp.minute in {0,30}:
-                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+            # # clear_output(wait=True)
+            # if current_timestamp.minute in {0,30}:
+            #     self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
             
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp) # returns empty dataframe
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp) # returns empty dataframe
