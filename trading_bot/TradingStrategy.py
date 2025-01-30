@@ -263,8 +263,12 @@ class TradingStrategy:
     touch_area_collection: TouchAreaCollection = field(init=False)
 
     now_bar: TypedBarData = field(init=False)
+    daily_bar_objects: List[TypedBarData] = field(default_factory=list)
     prev_close: float = field(init=False)
     switch_count: int = field(init=False)
+    
+    prev_accum_pl: float = field(init=False)
+    prev_accum_plpc: float = field(init=False)
     
     volume_profile: VolumeProfile = field(default_factory=VolumeProfile)
             
@@ -471,7 +475,10 @@ class TradingStrategy:
 
     def exit_action(self, position: TradePosition):
         # Logic for handling position exit (similar to your original function)
-        position.record_snapshot(self.now_bar)
+        exit_quote_price = self.get_price_at_action(position.is_long, False)
+        position.record_snapshot(self.now_bar, exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
+        self.prev_accum_pl += position.pl
+        self.prev_accum_plpc += position.plpc
         self.trades.append(position) # append position
         # self.touch_area_collection.del_open_position_area(position.area)
         self.open_positions.remove(position)
@@ -479,12 +486,17 @@ class TradingStrategy:
         
     # NOTE: may customize
     def clear_areas(self, position: TradePosition, current_timestamp: datetime):
+        if not position.has_entered:
+            return
         if self.params.clear_passed_areas:
-            low = min(position.bar_at_entry.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
-            high = max(position.bar_at_entry.high, self.now_bar.high)
+            low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
+            high = max(position.bar_at_commit.high, self.now_bar.high)
             
-            # low = min(position.bar_at_entry.close, self.now_bar.close) # For mid/losing stocks: 4th overall (worst)
-            # high = max(position.bar_at_entry.close, self.now_bar.close)
+            low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
+            high = max(position.bar_at_commit.high, self.now_bar.high)
+            
+            # low = min(position.bar_at_commit.close, self.now_bar.close) # For mid/losing stocks: 4th overall (worst)
+            # high = max(position.bar_at_commit.close, self.now_bar.close)
             
             # low = position.min_low # For mid/losing stocks: 2nd w/o switching, 3rd w/ switching
             # high = position.max_high
@@ -493,16 +505,17 @@ class TradingStrategy:
             # high = position.min_high
             
             if self.params.clear_traded_areas:
-                position.cleared_area_ids = self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
+                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
             else:
-                position.cleared_area_ids = self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
+                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
         else:
             if self.params.clear_traded_areas:
-                position.cleared_area_ids = {position.area.id} # default
+                position.cleared_area_ids |= {position.area.id} # default
                 self.touch_area_collection.terminate_area(position.area)
             
         # Always add the position's area to traded areas
-        self.touch_area_collection.add_traded_area(position.area)
+        if position.has_entered:
+            self.touch_area_collection.add_traded_area(position.area)
             
     def close_all_positions(self, current_timestamp: datetime, price_at_action: float, vwap: float, volume: float, avg_volume: float) -> Tuple[List[IntendedOrder], Set[TradePosition]]:
         # Logic for closing all positions (similar to your original function)
@@ -527,10 +540,12 @@ class TradingStrategy:
                 self.day_accrued_fees += fees_expected
                 
             position.close(current_timestamp, price_at_action)
-            self.trades_executed += 1
-            position.area.record_entry_exit(position.entry_time, position.entry_price, current_timestamp, price_at_action)
             self.clear_areas(position, current_timestamp)
             
+            if not position.is_simulated and len(position.transactions) > 0:
+                assert position.has_entered
+                self.trades_executed += 1
+                
             # self.touch_area_collection.terminate_area(position.area)
             positions_to_remove.add(position)
             
@@ -736,7 +751,7 @@ class TradingStrategy:
             # *** if not switching immediately, try current area before moving on
             try_create = self.create_new_position(area, current_timestamp, True) # try area again with new side. If doesn't work, it may work in future minute.
             if try_create:
-                self.log('immediate current area switched',level=logging.WARNING)
+                self.log('immediate current area switched',level=logging.INFO)
                 # return try_create
             return try_create # better
         
@@ -770,7 +785,7 @@ class TradingStrategy:
             if area.bar_at_switch is not None:
                 # desc = area.bar_at_switch.describe_reversal_potential(not area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
                 desc = area.bar_at_switch.describe_reversal_potential(not area.is_long)
-                self.log(f'Switch #{self.switch_count} @ {current_timestamp.date()} {current_timestamp.time()} for pos {self.next_position_id}: {desc}',level=logging.WARNING)
+                self.log(f'Switch #{self.switch_count} @ {current_timestamp.date()} {current_timestamp.time()} for pos {self.next_position_id}: {desc}',level=logging.INFO)
                 # if not area.is_long:
                 #     # self.log(f'Switch #{self.switch_count} @ {current_timestamp.date()} {current_timestamp.time()} for pos {self.next_position_id}: Indecision {self.now_bar.describe_indecision} -> {indecision}, RSI {self.now_bar.RSI} >= {self.params.rsi_overbought}',level=logging.WARNING)
                 #     if not self.now_bar.is_res:
@@ -780,7 +795,7 @@ class TradingStrategy:
                 #     if self.now_bar.is_res:
                 #         self.log(f'is_res has flipped',level=logging.WARNING)
 
-                    
+
         # Create the position
         position = TradePosition(
             symbol=self.touch_detection_areas.symbol,
@@ -792,14 +807,21 @@ class TradingStrategy:
             initial_balance=actual_cash_used,
             target_max_shares=target_max_shares,  # This becomes max_shares
             entry_price=price_at_action,
-            bar_at_entry=self.now_bar,
+            bar_at_commit=self.now_bar,
+            prior_relevant_bars=[a for a in self.daily_bar_objects if a.timestamp >= area.touches[0] and a.timestamp < current_timestamp],
+            
             use_margin=self.params.use_margin,
             is_marginable=self.is_marginable, # NOTE: when live, need to call is_security_marginable
             times_buying_power=actual_margin_multiplier,
             
             gradual_entry_range_multiplier=self.params.gradual_entry_range_multiplier,
             
-            log_level=self.log_level
+            log_level=self.log_level,
+            
+            prev_accum_pl=self.prev_accum_pl,
+            prev_accum_plpc=self.prev_accum_plpc,
+            
+            
             
             # # Use price_at_action for initial peak-stop
             # current_stop_price=price_at_action - area.get_range if area.is_long else price_at_action + area.get_range,
@@ -819,6 +841,16 @@ class TradingStrategy:
             position.is_simulated = False
         else:
             position.is_simulated = True
+
+            
+        # if self.now_bar.rsi_divergence >= 0 or self.now_bar.mfi_divergence >= 0:
+        #     position.is_simulated = True
+        # if self.now_bar.rsi_divergence >= 0 and self.now_bar.mfi_divergence >= 0:
+        #     position.is_simulated = True
+        
+        # if (self.now_bar.mfi_divergence >= 0 and position.is_long) or (self.now_bar.mfi_divergence <= 0 and not position.is_long):
+        #     position.is_simulated = True
+        
 
         # Recalculate cash and investment amounts for actual entry size
         scaled_cash_used = (position.initial_shares / target_max_shares) * actual_cash_used
@@ -892,15 +924,17 @@ class TradingStrategy:
         positions_to_remove = set()
 
         # if using trailing stops, exit_price = None
-        def perform_exit(position: TradePosition, exit_price=None):
+        def perform_exit(position: TradePosition, exit_price=None, should_exit=True):
             price = position.current_stop_price if exit_price is None else exit_price
             position.close(current_timestamp, price)
-            self.trades_executed += 1
-            position.area.record_entry_exit(position.entry_time, position.entry_price, current_timestamp, price)
             self.clear_areas(position, current_timestamp)
-            
+                
             # self.touch_area_collection.terminate_area(position.area)
-            positions_to_remove.add(position)
+            if should_exit: # exit and stop holding position
+                if not position.is_simulated and len(position.transactions) > 0:
+                    assert position.has_entered
+                    self.trades_executed += 1
+                positions_to_remove.add(position)
         
         def get_price_at_action_from_shares_diff(current_shares, target_shares, is_long):
             if target_shares < current_shares:
@@ -943,20 +977,52 @@ class TradingStrategy:
             
             
             if not price_at_action:
-                should_exit, should_exit_2, should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2 = \
-                    position.update_stop_price(self.now_bar, current_timestamp) # NOTE: continue using bar price here
+                exit_quote_price = self.get_price_at_action(position.is_long, False)
+                
+            
+                should_exit_early, should_exit, should_exit_2, should_have_exited_halfway, should_have_exited, should_have_exited_2, prev_halfway_price, prev_stop_price, prev_stop_price_2 = \
+                    position.update_stop_price(self.now_bar, current_timestamp, 
+                                               exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity) # NOTE: continue using bar price here
                 # target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
                 target_shares = position.max_target_shares_limit or 0  # works better
+                
+                
+                # if nothing below: pass positive to negative only, can exit early but still hold until stop price
+                
+                # should_exit_early = False # original functionality
+                # should_exit = should_exit_early or should_exit # bad
+                should_exit = should_exit_early # can exit early and dont hold. best?
+                    
+                # if should_exit_early:
+                #     should_exit = True # can exit early and dont hold
+                
+                
+                
                 
                 # # NOTE: if using stop orders with updated stop price
                 # if should_have_exited:
                 #     target_shares = 0
                 #     price_at_action = prev_stop_price
+                
+                # NOTE: using :
+                # prev_stop_price = self.avg_entry_price
+                # should_have_exited = self.wick_reached_avg_entry_price(should_exit_price)
+                
+                
+                if should_have_exited_halfway: 
+                    target_shares = 0
+                    price_at_action = prev_halfway_price
+                
+                
                     
                 # # print(target_shares, position.max_shares, should_exit)
                 # elif should_exit:
+
                     
-                if should_exit or target_shares == 0:
+                if not price_at_action and (should_exit_early or should_exit or position.has_exited or target_shares == 0):
+                # if not price_at_action and (should_exit or position.has_exited or target_shares == 0):
+
+                    
                     # assert target_shares == 0, target_shares
                     target_shares = 0
                     price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
@@ -1038,7 +1104,8 @@ class TradingStrategy:
                             fees = fees_expected
                         ))
                         if position.shares == 0:
-                            perform_exit(position, price_at_action)
+                            assert len(position.transactions) > 0, len(position.transactions) # should not exit if committed to area with 0 shares
+                            perform_exit(position, price_at_action, should_exit)
 
                         if shares_change < shares_to_adjust:
 
@@ -1100,6 +1167,23 @@ class TradingStrategy:
                         self.count_entry_skip += 1
                         position.decrease_max_shares(position.shares) # Entry not possible. Decrease max_shares.
                         
+            elif should_exit: # exiting committed area if close price never passed buy price
+                assert target_shares == position.shares == 0, (target_shares, position.shares)
+                if not position.has_exited:
+                    assert len(position.transactions) == 0, len(position.transactions)
+                
+                perform_exit(position, price_at_action, should_exit)
+                orders.append(IntendedOrder(
+                    action = 'close',
+                    side = OrderSide.SELL if position.is_long else OrderSide.BUY,
+                    symbol = self.touch_detection_areas.symbol,
+                    qty = 0,
+                    price = price_at_action,
+                    position = position,
+                    fees = 0
+                ))
+                
+                
         for position in positions_to_remove:
             self.exit_action(position)
 
@@ -1139,10 +1223,15 @@ class TradingStrategy:
         self.soft_end_triggered = False
         self.log(f"Starting balance on {self.current_date}: {self.balance}", level=logging.INFO)
         
+        self.prev_accum_pl = 0.0
+        self.prev_accum_plpc = 0.0
+        
         # Process pre-market data for both live and backtest
         start_date = pd.Timestamp(self.current_date, tz=ny_tz)
         end_date = start_date + pd.Timedelta(days=1)
         premarket_data = filter_df_by_timerange(self.premarket_bars, start_date, end_date)   
+        
+        self.daily_bar_objects = []
             
         if self.is_live_trading: # handled in FUNCTION: update_strategy
             self.daily_bars = self.all_bars  # In live trading, all data is "daily data"
@@ -1196,7 +1285,8 @@ class TradingStrategy:
                 self.volume_profile.update_profile(bar)
                 # # clear_output(wait=True)
                 if bar.timestamp.minute == 30:
-                    self.volume_profile.plot_profile(bar.close, bar.timestamp)
+                    if self.params.plot_volume_profiles:
+                        self.volume_profile.plot_profile(bar.close, bar.vwap, bar.timestamp)
     
     
     def get_quotes_raw(self, current_timestamp: datetime) -> Tuple[pd.DataFrame, pd.DatetimeIndex]:
@@ -1303,6 +1393,7 @@ class TradingStrategy:
         
         # for i in tqdm(range(1, len(timestamps)), desc='run_backtest'):
         for i in range(1, len(timestamps)):
+            assert len(self.open_positions) <= 1, len(self.open_positions)
             current_timestamp = timestamps[i].tz_convert(ny_tz)
             self.current_timestamp = current_timestamp
             
@@ -1317,6 +1408,7 @@ class TradingStrategy:
                 continue
             
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
+            self.daily_bar_objects.append(self.now_bar)
             self.volume_profile.update_profile(self.now_bar)
             
             base_atr = np.median(self.daily_bars.iloc[:self.daily_bars_index+1]['ATR'])
@@ -1326,7 +1418,8 @@ class TradingStrategy:
 
             # clear_output(wait=True)
             if current_timestamp.minute == 30 or (current_timestamp.hour == 9 and current_timestamp.minute == 31):
-                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+                if self.params.plot_volume_profiles:
+                    self.volume_profile.plot_profile(self.now_bar.close, self.now_bar.vwap, current_timestamp, base_atr)
             
             
             # NOTE: quotes raw data should be passed into touch_detection_areas
@@ -1374,7 +1467,7 @@ class TradingStrategy:
                     # plot the used touch areas in the past day
                     
                     plot_touch_detection_areas(self.touch_detection_areas, filter_date=self.current_date, filter_areas=self.traded_area_ids, 
-                                               trades=[position for position in self.trades if position.date == self.current_date],
+                                               trades=[position for position in self.trades if position.date == self.current_date and position.has_entered],
                                                rsi_overbought=self.params.rsi_overbought, rsi_oversold=self.params.rsi_oversold, 
                                                mfi_overbought=self.params.mfi_overbought, mfi_oversold=self.params.mfi_oversold)
                 
@@ -1401,7 +1494,9 @@ class TradingStrategy:
                 
             # Record metrics for all open positions
             for position in self.open_positions:
-                position.record_snapshot(self.now_bar)
+                # Get quote price for hypothetical exit
+                exit_quote_price = self.get_price_at_action(position.is_long, False)
+                position.record_snapshot(self.now_bar, exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
                 
             self.daily_bars_index += 1
         
@@ -1442,6 +1537,7 @@ class TradingStrategy:
             assert self.daily_bars_index == len(self.daily_bars)-1
             
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
+            self.daily_bar_objects.append(self.now_bar)
             self.volume_profile.update_profile(self.now_bar)
             
             base_atr = np.median(self.daily_bars.iloc[:self.daily_bars_index+1]['ATR'])
@@ -1451,7 +1547,8 @@ class TradingStrategy:
 
             # # clear_output(wait=True)
             if current_timestamp.minute == 30 or (current_timestamp.hour == 9 and current_timestamp.minute == 31):
-                self.volume_profile.plot_profile(self.now_bar.close, current_timestamp, base_atr)
+                if self.params.plot_volume_profiles:
+                    self.volume_profile.plot_profile(self.now_bar.close, self.now_bar.vwap, current_timestamp, base_atr)
             
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp) # returns empty dataframe
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp) # returns empty dataframe
@@ -1547,7 +1644,9 @@ class TradingStrategy:
                         
             # Record metrics for all open positions
             for position in self.open_positions:
-                position.record_snapshot(self.now_bar)
+                # Get quote price for hypothetical exit
+                exit_quote_price = self.get_price_at_action(position.is_long, False)
+                position.record_snapshot(self.now_bar, exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
     
             return all_orders, positions_to_remove1 | positions_to_remove2
             # if using stop market order safeguard, need to also modify existing stop market order (in LiveTrader)
@@ -1603,8 +1702,8 @@ class TradingStrategy:
         #     return []
         
         assert len(pending_orders) <= 1, len(pending_orders)
-        pending_long_close = any([a.action == 'close' and a.position.is_long for a in pending_orders])
-        pending_short_close = any([a.action == 'close' and not a.position.is_long for a in pending_orders])
+        pending_long_close = any([a.action == 'close' and a.position.is_long and len(a.position.transactions) > 0 for a in pending_orders])
+        pending_short_close = any([a.action == 'close' and not a.position.is_long and len(a.position.transactions) > 0 for a in pending_orders])
         
         for area in self.touch_area_collection.active_date_areas:
             if area.min_touches_time is None or area.min_touches_time > current_timestamp:
@@ -1643,7 +1742,7 @@ class TradingStrategy:
     def generate_backtest_results(self, trades: Optional[list[TradePosition]] = None):
         if trades is None:
             trades = self.trades
-        trades = [a for a in trades if not a.is_simulated]
+        trades = [a for a in trades if not a.is_simulated and a.has_entered]
 
         # Buy and hold strategy
         start_price = self.all_bars.iloc[0].close
@@ -1653,7 +1752,7 @@ class TradingStrategy:
         total_pl = sum(trade.pl for trade in trades)
         
         total_profit = sum(trade.pl for trade in trades if trade.pl > 0)
-        total_loss = sum(trade.pl for trade in trades if trade.pl <= 0)
+        total_loss = sum(trade.pl for trade in trades if trade.pl < 0)
         
         total_transaction_costs = sum(trade.total_transaction_costs for trade in trades)
         total_stock_borrow_costs = sum(trade.total_stock_borrow_cost for trade in trades)
@@ -1664,17 +1763,17 @@ class TradingStrategy:
         # mean_plpc = np.mean([trade.plpc for trade in trades])
 
         # win_mean_plpc = np.mean([trade.plpc for trade in trades if trade.pl > 0])
-        # lose_mean_plpc = np.mean([trade.plpc for trade in trades if trade.pl <= 0])
+        # lose_mean_plpc = np.mean([trade.plpc for trade in trades if trade.pl < 0])
         
         win_trades = sum(1 for trade in trades if trade.pl > 0)
-        lose_trades = sum(1 for trade in trades if trade.pl <= 0)
+        lose_trades = sum(1 for trade in trades if trade.pl < 0)
         win_longs = sum(1 for trade in trades if trade.is_long and trade.pl > 0)
-        lose_longs = sum(1 for trade in trades if trade.is_long and trade.pl <= 0)
+        lose_longs = sum(1 for trade in trades if trade.is_long and trade.pl < 0)
         win_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl > 0)
-        lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl <= 0)
+        lose_shorts = sum(1 for trade in trades if not trade.is_long and trade.pl < 0)
         avg_transact = np.mean([len(trade.transactions) for trade in trades])
         
-        assert self.trades_executed == len(self.trades)
+        assert self.trades_executed == len(trades), (self.trades_executed, len(trades), len(self.trades))
 
         # Print statistics
         print(f"END\nStrategy: {'Long' if self.params.do_longs else ''}{'&' if self.params.do_longs and self.params.do_shorts else ''}{'Short' if self.params.do_shorts else ''}")
@@ -1705,7 +1804,8 @@ class TradingStrategy:
         print(f"Cash Balance % Change:  {cash_change:,.2f}%")
         
         print(f"Baseline % change:  {baseline_change:.4f}%")
-        print('Number of Trades Executed:', self.trades_executed)
+        # print('Number of Trades Executed:', self.trades_executed)
+        print('Number of Trades Executed:', len(trades))
         print(f"Simultaneous close and open count: {self.simultaneous_close_open}")
         print(f"\nTotal Profit/Loss (after fees): ${total_pl:.4f}")
         print(f"  Total Profit: ${total_profit:.4f}")
@@ -1723,11 +1823,11 @@ class TradingStrategy:
             # 'Long': [trade.plpc for trade in trades if trade.is_long],
             # 'Short': [trade.plpc for trade in trades if not trade.is_long],
             'Win': [trade.plpc for trade in trades if trade.pl > 0],
-            'Lose': [trade.plpc for trade in trades if trade.pl <= 0],
+            'Lose': [trade.plpc for trade in trades if trade.pl < 0],
             'Lwin': [trade.plpc for trade in trades if trade.is_long and trade.pl > 0],
             'Swin': [trade.plpc for trade in trades if not trade.is_long and trade.pl > 0],
-            'Llose': [trade.plpc for trade in trades if trade.is_long and trade.pl <= 0],
-            'Slose': [trade.plpc for trade in trades if not trade.is_long and trade.pl <= 0]
+            'Llose': [trade.plpc for trade in trades if trade.is_long and trade.pl < 0],
+            'Slose': [trade.plpc for trade in trades if not trade.is_long and trade.pl < 0]
         }
 
         describe_results = pd.DataFrame({category: pd.Series(data).describe() for category, data in trade_categories.items()})
@@ -1761,7 +1861,7 @@ class TradingStrategy:
         print(f"Number of Losing Trades:  {lose_trades} ({lose_longs} long, {lose_shorts} short)")
         
         
-        print(f"Win Rate: {win_trades / len(self.trades) * 100:.4f}%" if self.trades else "Win Rate: N/A")
+        print(f"Win Rate: {win_trades / len(trades) * 100:.4f}%" if trades else "Win Rate: N/A")
         print(f"\nMargin Usage:")
         print(f"Margin Enabled: {'Yes' if self.params.use_margin else 'No'}")
         print(f"Max Buying Power: {self.params.times_buying_power}x")
@@ -1790,12 +1890,20 @@ class TradingStrategy:
             
         # # print(trades)
         df = export_trades_to_csv(trades, self.export_trades_path)
-            
+        trades_unentered = [a for a in self.trades if not a.is_simulated and not a.has_entered]
+        if trades_unentered:
+            export_trades_to_csv(trades_unentered, self.export_trades_path.replace('trades','trades_unentered'))
+        
         # for trade in self.trades:
         #     print(trade.id, [a.bar_latest.close for a in trade.transactions])
         
 
-        plot_cumulative_pl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
+        # plot_cumulative_pl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
+        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+                                     use_plpc=False)
+        if not self.export_graph_path:
+            plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+                                        use_plpc=True)
 
         # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
         #     win_trades / len(self.trades) * 100,  \
@@ -1805,118 +1913,89 @@ class TradingStrategy:
         #     win_trades / len(self.trades) * 100, total_transaction_costs, \
         #                        avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip, key_stats
         
-        win_trades_list = [trade for trade in trades if trade.pl > 0]
-        lose_trades_list = [trade for trade in trades if trade.pl <= 0]
 
-        # plot_trade_correlation(win_trades_list, x_field='entry_time', y_field='pl', 
-        #                     figsize=(8,7), y_label='Profit/Loss',
-        #                     binwidth_x=30, binwidth_y=25,
-        #                     title='Wins: entry_time vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='entry_time', y_field='pl', 
-        #                     figsize=(8,7), y_label='Profit/Loss',
-        #                     binwidth_x=30, binwidth_y=25,
-        #                     title='Losses: entry_time vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='entry_time', y_field='pl', 
-                            figsize=(8,7), y_label='Profit/Loss',
-                            binwidth_x=30, binwidth_y=25,
-                            title='entry_time vs Returns',split_sides=True)
         
-        # plot_trade_correlation(win_trades_list, x_field='net_price_diff', y_field='pl',
-        #                     figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
-        #                     binwidth_x=0.05, binwidth_y=25,
-        #                     title='Wins: Net Price Diff vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='net_price_diff', y_field='pl',
-        #                     figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
-        #                     binwidth_x=0.05, binwidth_y=25,
-        #                     title='Losses: Net Price Diff vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='net_price_diff', y_field='pl',
-                            figsize=(8,7), x_label='net_price_diff', y_label='Profit/Loss', 
-                            binwidth_x=0.05, binwidth_y=25,
-                            title='Net Price Diff vs Returns',split_sides=True)
+        # for field in [
+        #     'buy_vol_balance',
+        #     'sell_vol_balance',
+        #     'buy_vol_concentration',
+        #     'sell_vol_concentration',
+        #     'buy_vol_kurtosis',
+        #     'sell_vol_kurtosis',
+        #     'buy_hvn_balance',
+        #     'sell_hvn_balance',
+        #     'buy_hvn_concentration',
+        #     'sell_hvn_concentration',
+        #     'buy_hvn_avg_prominence',
+        #     'sell_hvn_avg_prominence'
+        #     ]:
+            
+        #     if field.endswith('kurtosis'):
+        #         binwidth_x = 0.1
+        #     elif field.endswith('avg_prominence'):
+        #         binwidth_x = 0.0001
+        #     elif field.endswith('concentration'):
+        #         binwidth_x = 0.01
+        #     else:
+        #         binwidth_x = 0.05
+            
+        #     # plot_trade_correlation(trades, x_field=f'bar_at_entry.{field}', y_field='position_metrics.max_pl_body_pct',
+        #     #                     figsize=(8,7), x_label=field, y_label='max_pl_body_pct',
+        #     #                     binwidth_x=binwidth_x, binwidth_y=0.05,
+        #     #                     title=f'{field} at Entry vs max_pl_body_pct',split_sides=True,
+        #     #                     color_field='plpc', is_trinary=True)
+            
+        #     # plot_trade_correlation(trades, x_field=f'bar_at_entry.{field}', y_field='position_metrics.max_pl_body_pct',
+        #     #                     figsize=(8,7), x_label=field, y_label='max_pl_body_pct',
+        #     #                     binwidth_x=binwidth_x, binwidth_y=0.05,
+        #     #                     title=f'{field} at Entry vs max_pl_body_pct',split_sides=True,
+        #     #                     color_field='pl', is_trinary=False)
+            
+        #     plot_trade_correlation(trades, x_field=f'bar_at_entry.{field}', y_field='position_metrics.best_price_diff_body',
+        #                         figsize=(8,7), x_label=field, y_label='best_price_diff_body %',
+        #                         binwidth_x=binwidth_x, binwidth_y=0.1,
+        #                         title=f'{field} at Entry vs best_price_diff_body',split_sides=True,
+        #                         color_field='pl', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
+            
+        #     # plot_trade_correlation(trades, x_field=f'bar_at_entry.{field}', y_field='position_metrics.best_price_diff_body',
+        #     #                     figsize=(8,7), x_label=field, y_label='best_price_diff_body %',
+        #     #                     binwidth_x=binwidth_x, binwidth_y=0.1,
+        #     #                     title=f'{field} at Entry vs best_price_diff_body',split_sides=True,
+        #     #                     color_field='plpc', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
+            
+            
+        plot_trade_correlation(trades, x_field='exit_time', y_field='position_metrics.best_price_diff_body',
+                            figsize=(8,7), x_label='exit_time', y_label='best_price_diff_body %',
+                            binwidth_x=15, binwidth_y=0.2,
+                            title='exit_time vs best_price_diff_body %',split_sides=True,
+                            color_field='pl', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
+    
+        # plot_trade_correlation(trades, x_field='position_metrics.avg_prior_central_value_dist', y_field='position_metrics.best_price_diff_body',
+        #                     figsize=(8,7), x_label='avg_prior_central_value_dist', y_label='best_price_diff_body %',
+        #                     binwidth_x=0.1, binwidth_y=0.1,
+        #                     title='avg_prior_central_value_dist vs best_price_diff_body',split_sides=True,
+        #                     color_field='pl', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
         
-        # plot_trade_correlation(win_trades_list, x_field='holding_time_minutes', y_field='pl',
-        #                     figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
-        #                     binwidth_x=5, binwidth_y=25,
-        #                     title='Wins: Hold Time (minutes) vs Returns',split_sides=True)
+        # plot_trade_correlation(trades, x_field='position_metrics.avg_central_value_dist', y_field='position_metrics.best_price_diff_body',
+        #                     figsize=(8,7), x_label='avg_central_value_dist', y_label='best_price_diff_body %',
+        #                     binwidth_x=0.1, binwidth_y=0.1,
+        #                     title='avg_central_value_dist vs best_price_diff_body',split_sides=True,
+        #                     color_field='pl', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
 
-        # plot_trade_correlation(lose_trades_list, x_field='holding_time_minutes', y_field='pl',
-        #                     figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
-        #                     binwidth_x=5, binwidth_y=25,
-        #                     title='Losses: Hold Time (minutes) vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='holding_time_minutes', y_field='pl',
-                            figsize=(8,7), x_label='holding_time_minutes', y_label='Profit/Loss',
-                            binwidth_x=5, binwidth_y=25,
-                            title='Hold Time (minutes) vs Returns',split_sides=True)
-                
-        # Technical indicators
-        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.MACD', y_field='pl',
-        #                     figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Wins: MACD at Entry vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.MACD', y_field='pl',
-        #                     figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Losses: MACD at Entry vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='bar_at_entry.MACD', y_field='pl',
-                            figsize=(8,7), x_label='MACD at Entry', y_label='Profit/Loss',
-                            binwidth_x=0.2, binwidth_y=25,
-                            title='MACD at Entry vs Returns',split_sides=True)
+
+        plot_trade_correlation(trades, x_field='exit_time', y_field='accum_pl',
+                            figsize=(8,7), x_label='exit_time', y_label='accum_pl',
+                            binwidth_x=15, binwidth_y=25,
+                            title='exit_time vs accum_pl',split_sides=True,
+                            color_field='pl', is_trinary=False)
         
-        
-        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.RSI_roc', y_field='pl',
-        #                     figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.5, binwidth_y=25,
-        #                     title='Wins: RSI Momentum at Entry vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.RSI_roc', y_field='pl',
-        #                     figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.5, binwidth_y=25,
-        #                     title='Losses: RSI Momentum at Entry vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='bar_at_entry.RSI_roc', y_field='pl',
-                            figsize=(8,7), x_label='RSI Rate of Change at Entry', y_label='Profit/Loss',
-                            binwidth_x=0.5, binwidth_y=25,
-                            title='RSI Momentum at Entry vs Returns',split_sides=True)
-        
-        # # Price action
-        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.doji_ratio', y_field='pl',
-        #                     figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.1, binwidth_y=25,
-        #                     title='Wins: Doji Ratio at Entry vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.doji_ratio', y_field='pl',
-        #                     figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.1, binwidth_y=25,
-        #                     title='Losses: Doji Ratio at Entry vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='bar_at_entry.doji_ratio', y_field='pl',
-                            figsize=(8,7), x_label='Doji Ratio at Entry', y_label='Profit/Loss',
-                            binwidth_x=0.1, binwidth_y=25,
-                            title='Doji Ratio at Entry vs Returns',split_sides=True)
-        
-        # # Volume profile
-        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.vol_balance', y_field='pl',
-        #                     figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Wins: Volume Distribution Skew at Entry vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.vol_balance', y_field='pl',
-        #                     figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Losses: Volume Distribution Skew at Entry vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='bar_at_entry.vol_balance', y_field='pl',
-                            figsize=(8,7), x_label='Volume Skew at Entry', y_label='Profit/Loss',
-                            binwidth_x=0.2, binwidth_y=25,
-                            title='Volume Distribution Skew at Entry vs Returns',split_sides=True)
-        
-        # plot_trade_correlation(win_trades_list, x_field='bar_at_entry.hvn_balance', y_field='pl',
-        #                     figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Wins: HVN Distribution Balance at Entry vs Returns',split_sides=True)
-        # plot_trade_correlation(lose_trades_list, x_field='bar_at_entry.hvn_balance', y_field='pl',
-        #                     figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
-        #                     binwidth_x=0.2, binwidth_y=25,
-        #                     title='Losses: HVN Distribution Balance at Entry vs Returns',split_sides=True)
-        plot_trade_correlation(trades, x_field='bar_at_entry.hvn_balance', y_field='pl',
-                            figsize=(8,7), x_label='HVN Balance at Entry', y_label='Profit/Loss',
-                            binwidth_x=0.2, binwidth_y=25,
-                            title='HVN Distribution Balance at Entry vs Returns',split_sides=True)
-        
+        plot_trade_correlation(trades, x_field='exit_time', y_field='accum_plpc',
+                            figsize=(8,7), x_label='exit_time', y_label='accum_plpc',
+                            binwidth_x=15, binwidth_y=0.5,
+                            title='exit_time vs accum_plpc',split_sides=True,
+                            color_field='pl', is_trinary=False)
+
+
         # return trades
         return df
 

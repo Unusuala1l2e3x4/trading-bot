@@ -59,6 +59,7 @@ class TouchArea:
     is_side_switched: bool = False
     bar_at_switch: TypedBarData = None
     min_touches_time: datetime = field(init=False)
+    last_bounds_update_time: datetime = datetime.min
     entries_exits: List[EntryExit] = field(default_factory=list)
     
         
@@ -145,7 +146,11 @@ class TouchArea:
             self.is_side_switched = False
             self.bar_at_switch = None
         
-    def update_bounds(self, current_timestamp: datetime, monotonic_duration: Optional[int] = 0):        
+    def update_bounds(self, current_timestamp: datetime, monotonic_duration: Optional[int] = 0):
+        if self.last_bounds_update_time == current_timestamp:
+            return
+        
+        self.last_bounds_update_time = current_timestamp
         current_atr = self.valid_atr[:len(self.current_touches(current_timestamp))]
         
         _, new_lower_bound, new_upper_bound = self.calculate_bounds(

@@ -73,6 +73,9 @@ class LiveTouchDetectionParameters:
     ema_span: float = 12
     price_ema_span: float = 26
     
+    exit_ema_span: float = 26
+    # exit_ema_span: float = 13
+    
     # New parameters for volume processing
     volume_window: int = 15  # Window for spike detection
     volume_std_threshold: float = 3.0  # Number of standard deviations for spike detection

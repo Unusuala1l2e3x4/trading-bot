@@ -3,7 +3,7 @@ import zipfile
 import pandas as pd
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import Adjustment
 from alpaca.data.models import Bar, Quote
 from datetime import datetime, time, timedelta
@@ -176,11 +176,10 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
                         log(f"Error retrieving unadjusted bars from file for {symbol}: {str(e)}", level=logging.ERROR)
                         df_unadjusted = None
                     
-                    
-    def fetch_bars(adjustment):
+    def fetch_bars(adjustment: Adjustment, timeframe_amount: int = 1, timeframe_unit: TimeFrameUnit = TimeFrameUnit.Minute):
         request_params = StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
+            timeframe=TimeFrame(timeframe_amount, timeframe_unit),
             start=params.start_date.tz_convert('UTC'),
             end=params.end_date.tz_convert('UTC'),
             adjustment=adjustment,
@@ -885,17 +884,17 @@ if __name__=="__main__":
         symbol='',
         start_date=start_date,
         end_date=end_date,
-        atr_period=15,
-        level1_period=15,
-        multiplier=1.4,
-        min_touches=3,
+        # atr_period=15,
+        # level1_period=15,
+        # multiplier=1.4,
+        # min_touches=3,
         start_time=None,
         end_time='15:55',
-        use_median=True,
-        touch_area_width_agg=None,
+        # use_median=True,
+        # touch_area_width_agg=None,
         
-        ema_span=15,
-        price_ema_span=26,
+        # ema_span=12,
+        # price_ema_span=26,
         
         export_bars_path=f'bars/',
         export_quotes_path=f'quotes/'

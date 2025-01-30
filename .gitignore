@@ -12,6 +12,7 @@ __pycache__/
 *.svg
 *.lnk
 *.pdf
+*.html
 bars
 quotes
 quotes2

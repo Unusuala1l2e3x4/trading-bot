@@ -19,6 +19,8 @@ class PreMarketBar:
     low: float
     close: float
     volume: float
+    vwap: float
+    ATR: float
 
     @classmethod
     def from_row(cls, row: pd.Series) -> 'PreMarketBar':
@@ -29,7 +31,9 @@ class PreMarketBar:
             high=row['high'],
             low=row['low'],
             close=row['close'],
-            volume=row['volume']
+            volume=row['volume'],
+            vwap=row['vwap'],
+            ATR=row['ATR'],
         )
         
     
@@ -48,6 +52,7 @@ class TypedBarData:
     volume: float
     trade_count: float
     vwap: float
+    VWAP: float
     MACD: float
     MACD_signal: float
     MACD_hist: float
@@ -57,6 +62,7 @@ class TypedBarData:
     MFI: float
     MFI_roc: float
     central_value: float
+    exit_ema: float
     is_res: bool
     # shares_per_trade: float
     avg_volume: float # (EMA)
@@ -77,6 +83,7 @@ class TypedBarData:
 
     # New trend metrics
     central_value_dist: float       # Normalized distance to central value
+    exit_ema_dist: float
     ADX: float                      # Overall trend strength (0-100)
     trend_strength: float           # Directional trend strength (-100 to +100)
 
@@ -85,14 +92,20 @@ class TypedBarData:
     _row: pd.Series = field(repr=False)
     
     # Overall volume distribution metrics (using all volume)
-    vol_balance: float = 0.0      # Sign indicates if volume is mostly above/below price
-    vol_concentration: float = 0.0 # How clustered volume is near price
-    vol_kurtosis: float = 0.0     # Peakedness of distribution
+    buy_vol_balance: float = 0.0      # Sign indicates if volume is mostly above/below price
+    buy_vol_concentration: float = 0.0 # How clustered volume is near price
+    buy_vol_kurtosis: float = 0.0     # Peakedness of distribution
+    sell_vol_balance: float = 0.0
+    sell_vol_concentration: float = 0.0
+    sell_vol_kurtosis: float = 0.0
     
     # HVN-specific metrics (using only detected peaks)
-    hvn_balance: float = 0.0      # Sign indicates if HVNs are mostly above/below price
-    hvn_concentration: float = 0.0 # How clustered HVNs are near price
-    hvn_avg_prominence: float = 0.0 # Average strength of detected HVNs
+    buy_hvn_balance: float = 0.0      # Sign indicates if HVNs are mostly above/below price
+    buy_hvn_concentration: float = 0.0 # How clustered HVNs are near price
+    buy_hvn_avg_prominence: float = 0.0 # Average strength of detected HVNs
+    sell_hvn_balance: float = 0.0 
+    sell_hvn_concentration: float = 0.0
+    sell_hvn_avg_prominence: float = 0.0
     
     
     # Add threshold parameters as class attributes with defaults
@@ -133,28 +146,37 @@ class TypedBarData:
 
     def update_volume_metrics(self, volume_profile: VolumeProfile, atr: Optional[float] = None):
         """Update all volume profile related attributes and add to _row."""
-        if volume_profile.profile is None:
+        if volume_profile.buy_profile is None or volume_profile.sell_profile is None:
             return
-            
-        # Calculate metrics using all volume
-        self.vol_balance, self.vol_concentration, self.vol_kurtosis = \
-            volume_profile.calculate_moments_relative_to_price(
-                volume_profile.bin_centers,
-                volume_profile.profile,
-                self.close
-            )
+                
+        # Calculate moments for both profiles
+        (
+            (self.buy_vol_balance, self.buy_vol_concentration, self.buy_vol_kurtosis),
+            (self.sell_vol_balance, self.sell_vol_concentration, self.sell_vol_kurtosis)
+        ) = volume_profile.calculate_profile_moments(self.close)
         
-        # Calculate metrics using only HVNs
-        self.hvn_balance, self.hvn_concentration, self.hvn_avg_prominence = \
-            volume_profile.get_hvn_metrics(self.close, self.ATR if atr is None else atr)
+        # Calculate HVN metrics for both profiles
+        (
+            (self.buy_hvn_balance, self.buy_hvn_concentration, self.buy_hvn_avg_prominence),
+            (self.sell_hvn_balance, self.sell_hvn_concentration, self.sell_hvn_avg_prominence)
+        ) = volume_profile.get_hvn_metrics(self.close, self.ATR if atr is None else atr)
         
-        # Add to _row for DataFrame conversion
-        self._row['vol_balance'] = self.vol_balance
-        self._row['vol_concentration'] = self.vol_concentration 
-        self._row['vol_kurtosis'] = self.vol_kurtosis
-        self._row['hvn_balance'] = self.hvn_balance
-        self._row['hvn_concentration'] = self.hvn_concentration
-        self._row['hvn_avg_prominence'] = self.hvn_avg_prominence
+        # Add all metrics to _row for DataFrame conversion
+        # Buy volume metrics
+        self._row['buy_vol_balance'] = self.buy_vol_balance
+        self._row['buy_vol_concentration'] = self.buy_vol_concentration
+        self._row['buy_vol_kurtosis'] = self.buy_vol_kurtosis
+        self._row['buy_hvn_balance'] = self.buy_hvn_balance
+        self._row['buy_hvn_concentration'] = self.buy_hvn_concentration
+        self._row['buy_hvn_avg_prominence'] = self.buy_hvn_avg_prominence
+        
+        # Sell volume metrics
+        self._row['sell_vol_balance'] = self.sell_vol_balance
+        self._row['sell_vol_concentration'] = self.sell_vol_concentration
+        self._row['sell_vol_kurtosis'] = self.sell_vol_kurtosis
+        self._row['sell_hvn_balance'] = self.sell_hvn_balance
+        self._row['sell_hvn_concentration'] = self.sell_hvn_concentration
+        self._row['sell_hvn_avg_prominence'] = self.sell_hvn_avg_prominence
 
 
     @property
@@ -387,59 +409,70 @@ class TypedBarData:
         """
         Check if conditions suggest trend reversal.
         """
-        # Base momentum conditions - only need one indicator
-        oversold_reversal = (
-            not area_is_long and (
-                # MFI oversold and improving
-                (self.MFI <= mfi_oversold and self.MFI_roc > 0) or
-                # RSI oversold and improving  
-                (self.RSI <= rsi_oversold and self.RSI_roc > 0)
-            )
-        )
+        # if self.rsi_divergence >= 0 and self.mfi_divergence >= 0:
+        if area_is_long and (self.rsi_divergence >= 0 or self.mfi_divergence >= 0):
+            return True
+        if not area_is_long and (self.rsi_divergence <= 0 or self.mfi_divergence <= 0):
+            return True
+        return False
+    
+        # probably better to just not trade instead of reverse
+        # unclear effect for positions that remain unentered if didnt switch
+    
         
-        overbought_reversal = (
-            area_is_long and (
-                # MFI overbought and deteriorating
-                (self.MFI >= mfi_overbought and self.MFI_roc < 0) or
-                # RSI overbought and deteriorating
-                (self.RSI >= rsi_overbought and self.RSI_roc < 0)
-            )
-        )
+        # # Base momentum conditions - only need one indicator
+        # oversold_reversal = (
+        #     not area_is_long and (
+        #         # MFI oversold and improving
+        #         (self.MFI <= mfi_oversold and self.MFI_roc > 0) or
+        #         # RSI oversold and improving  
+        #         (self.RSI <= rsi_oversold and self.RSI_roc > 0)
+        #     )
+        # )
         
-        if not (oversold_reversal or overbought_reversal):
-            return False
-            
-        # Get common metrics
-        indecision_count = sum(signal[1] for signal in self.get_indecision_signals())
-        close_to_high = (self.close - self.low) / (self.high - self.low) if self.high != self.low else 0.5
-        close_to_low = (self.high - self.close) / (self.high - self.low) if self.high != self.low else 0.5
-        volume_strength = self.volume_ratio > 1.0
+        # overbought_reversal = (
+        #     area_is_long and (
+        #         # MFI overbought and deteriorating
+        #         (self.MFI >= mfi_overbought and self.MFI_roc < 0) or
+        #         # RSI overbought and deteriorating
+        #         (self.RSI >= rsi_overbought and self.RSI_roc < 0)
+        #     )
+        # )
         
-        if pre_position:
-            # For side switching, need ANY TWO of:
-            # 1. Indecision signals (market struggling to continue trend)
-            # 2. Volume confirmation
-            # 3. Price moving in new direction
+        # if not (oversold_reversal or overbought_reversal):
+        #     return False
             
-            confirmation_count = sum([
-                indecision_count >= 1,  # Relaxed from 2 to 1
-                volume_strength,
-                oversold_reversal and close_to_high > 0.6,  # Relaxed from 0.7
-                overbought_reversal and close_to_low > 0.6   # Relaxed from 0.7
-            ])
+        # # Get common metrics
+        # indecision_count = sum(signal[1] for signal in self.get_indecision_signals())
+        # close_to_high = (self.close - self.low) / (self.high - self.low) if self.high != self.low else 0.5
+        # close_to_low = (self.high - self.close) / (self.high - self.low) if self.high != self.low else 0.5
+        # volume_strength = self.volume_ratio > 1.0
+        
+        # if pre_position:
+        #     # For side switching, need ANY TWO of:
+        #     # 1. Indecision signals (market struggling to continue trend)
+        #     # 2. Volume confirmation
+        #     # 3. Price moving in new direction
             
-            return confirmation_count >= 2  # Need any 2 confirmations
+        #     confirmation_count = sum([
+        #         indecision_count >= 1,  # Relaxed from 2 to 1
+        #         volume_strength,
+        #         oversold_reversal and close_to_high > 0.6,  # Relaxed from 0.7
+        #         overbought_reversal and close_to_low > 0.6   # Relaxed from 0.7
+        #     ])
+            
+        #     return confirmation_count >= 2  # Need any 2 confirmations
                 
-        else:
-            # For position scaling warnings (keep as before)
-            warning_count = sum([
-                indecision_count >= 2,
-                volume_strength,
-                oversold_reversal and close_to_low > 0.7,  # Staying near low when oversold
-                overbought_reversal and close_to_high > 0.7  # Staying near high when overbought
-            ])
+        # else:
+        #     # For position scaling warnings (keep as before)
+        #     warning_count = sum([
+        #         indecision_count >= 2,
+        #         volume_strength,
+        #         oversold_reversal and close_to_low > 0.7,  # Staying near low when oversold
+        #         overbought_reversal and close_to_high > 0.7  # Staying near high when overbought
+        #     ])
             
-            return warning_count >= 2
+        #     return warning_count >= 2
         
     def describe_reversal_potential(self, area_was_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
                             mfi_overbought: float = 75, mfi_oversold: float = 25, ) -> str:
@@ -591,3 +624,12 @@ class TypedBarData:
         #     df.set_index('timestamp', inplace=True)
             
         return df
+
+
+
+
+
+    # @staticmethod
+    # def shows_reversal_potential(area_is_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
+    #                         mfi_overbought: float = 75, mfi_oversold: float = 25, 
+    #                         pre_position: bool = False) -> bool:

@@ -417,6 +417,7 @@ class StrategyParameters:
     # lunch_resume_entry_time: Optional[time] = time(12, 15)
     
     plot_day_results: bool = False
+    plot_volume_profiles: bool = False
     allow_reversal_detection: bool = False
     clear_passed_areas: bool = False
     clear_traded_areas: bool = False
@@ -431,6 +432,8 @@ class StrategyParameters:
     
     # For temporal weighting (span in minutes)
     volume_profile_ema_span: float = 120  # ~90 minutes looks back far enough while emphasizing recent activity    volume_profile_ema: float = 90
+    # volume_profile_ema_span: float = np.inf
+    # volume_profile_ema_span: float = 240
     
 
     def __post_init__(self):

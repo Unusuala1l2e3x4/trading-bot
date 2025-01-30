@@ -66,32 +66,6 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
 
     return price * (1 + slippage_ratio), slippage_price_change
 
-
-# # @jit(nopython=True)
-# def calculate_price_diff_sums(prices: np.ndarray, is_long: bool) -> Tuple[float, float]:
-#     """
-#     Wrapper to use math.fsum() for precise summation of diffs outside of numba constraints.
-
-#     Args:
-#         prices (np.ndarray): A numpy array of sequential floats representing prices.
-#         is_long (bool): If True, return (positive_sum, negative_sum). If False, flip signs to measure profitability.
-
-#     Returns:
-#         Tuple[float, float]: Sum of positive differences and negative differences (flipped if not long).
-#     """
-#     # Get diffs from the JIT-optimized function
-#     diffs = prices[1:] - prices[:-1]
-
-#     # Use math.fsum for precise summation
-#     positive_sum = math.fsum(diff for diff in diffs if diff > 0)
-#     negative_sum = math.fsum(diff for diff in diffs if diff < 0)
-#     net = prices[-1] - prices[0]
-
-#     # Adjust for short positions
-#     if is_long:
-#         return positive_sum, negative_sum, net
-#     else:
-#         return -negative_sum, -positive_sum, -net
     
     
 @dataclass
@@ -136,15 +110,19 @@ class TradePosition:
     is_marginable: bool
     times_buying_power: float
     entry_price: float
-    bar_at_entry: TypedBarData
+    bar_at_commit: TypedBarData
     
+    prior_relevant_bars: List[TypedBarData]
+    
+    bar_at_entry: TypedBarData = None
     market_value: float = 0.0
     shares: int = 0 # no fractional trading
     partial_entry_count: int = 0
     partial_exit_count: int = 0
     is_simulated: Optional[bool] = None
     max_shares: Optional[int] = None
-    max_shares_reached: Optional[int] = None
+    # max_shares_reached: Optional[int] = None
+    # max_shares_reached_time: Optional[datetime] = None
     max_max_shares: Optional[int] = None
     min_max_shares: Optional[int] = None
     initial_shares: Optional[int] = None  # actual shares bought at first entry
@@ -154,18 +132,32 @@ class TradePosition:
     avg_entry_price: Optional[float] = None  # Weighted average of partial entries
     borrowed_amount: float = 0.0  # Track total value borrowed
     
+    cost_basis_sold_accum: float = 0.0  # Sum of (avg_entry_price * shares_sold) for each exit
+    
     full_entry_price: Optional[float] = None # target price for max shares to hold
     max_target_shares_limit: Optional[int] = None
     has_crossed_full_entry: bool = False
     full_entry_time: Optional[datetime] = None
     gradual_entry_range_multiplier: Optional[float] = 1.0 # Adjust this to control how far price needs to move
     
+    prev_shares: int = 0  # Track shares before last transaction
+    prev_pl: float = 0.0
+    prev_avg_entry_price: Optional[float] = None
+    prev_cost_basis_sold_accum: float = 0.0
+    halfway_price: Optional[float] = None
+    
+    prev_accum_pl: Optional[float] = 0.0
+    prev_accum_plpc: Optional[float] = 0.0
+    
+    has_entered: bool = False
+    has_exited: bool = False
+    
     transactions: List[Transaction] = field(default_factory=list)
     cleared_area_ids: Set[int] = field(default_factory=set)
     current_stop_price: Optional[float] = None
     current_stop_price_2: Optional[float] = None
     
-    position_metrics: PositionMetrics = field(init=False)
+    position_metrics: PositionMetrics = None
     
     max_close: Optional[float] = None
     min_close: Optional[float] = None
@@ -240,21 +232,23 @@ class TradePosition:
         # Initial setup only - update_stop_price will handle the rest
         self.has_crossed_full_entry = False
         self.max_target_shares_limit = None
-        self.max_shares_reached = 0
+        # self.max_shares_reached = 0
+        # self.max_shares_reached_time = self.entry_time
         self.initial_shares = None
         
-        self.max_close = self.min_close = self.bar_at_entry.close
+        self.max_close = self.min_close = self.bar_at_commit.close
            
         if self.is_long:
-            self.current_stop_price = self.max_close - self.area.get_range
-            self.current_stop_price_2 = self.max_close - self.area.get_range * 3
+            self.current_stop_price = -np.inf
+            self.current_stop_price_2 = -np.inf
         else:
-            self.current_stop_price = self.min_close + self.area.get_range
-            self.current_stop_price_2 = self.min_close + self.area.get_range * 3
+            self.current_stop_price = np.inf
+            self.current_stop_price_2 = np.inf
             
-            
-        self.update_stop_price(self.bar_at_entry, self.entry_time)
-        self.position_metrics = PositionMetrics(self.is_long, self.initial_balance)
+        self.update_stop_price(self.bar_at_commit, self.entry_time)
+        self.position_metrics = PositionMetrics(self.is_long, prior_relevant_bars=self.prior_relevant_bars)
+        
+        
         
     def calculate_target_shares_from_price(self, current_price: float) -> int:
         """Calculate target shares based on how close price is to full entry"""
@@ -301,6 +295,8 @@ class TradePosition:
         return adjusted_price, slippage_price_change
 
     def update_market_value(self, current_price: float):
+        """Update market value and unrealized P&L using current market price."""
+        assert self.avg_entry_price is not None
         if self.is_long:
             self.market_value = self.shares * current_price
             self.unrealized_pl = self.market_value - (self.shares * self.avg_entry_price)
@@ -397,13 +393,26 @@ class TradePosition:
         
     def partial_entry(self, entry_time: datetime, entry_price: float, shares_to_buy: int, 
                      bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
+        
+        self.prev_shares = self.shares
+        self.prev_pl = self.pl
+        self.prev_avg_entry_price = self.avg_entry_price
+        # self.prev_cost_basis_sold_accum = self.cost_basis_sold_accum
+        if shares_to_buy == 0:
+            return 0, 0, 0
+        
         adjusted_price, slippage_price_change = self.calculate_slippage(
             True, entry_price, shares_to_buy, bar, slippage_factor, atr_sensitivity)
         
         # Update weighted average entry price
         if self.shares == 0:
+            assert not self.has_entered
+            assert self.avg_entry_price is None
             self.avg_entry_price = adjusted_price
+            self.has_entered = True
+            self.bar_at_entry = bar
         else:
+            assert self.has_entered
             old_value = self.shares * self.avg_entry_price
             new_value = shares_to_buy * adjusted_price
             self.avg_entry_price = (old_value + new_value) / (self.shares + shares_to_buy)
@@ -415,39 +424,86 @@ class TradePosition:
             self.borrowed_amount += cash_needed
         
         self.shares += shares_to_buy
-        self.update_market_value(adjusted_price)
+        self.update_market_value(bar.close)
         self.partial_entry_count += 1
-        self.max_shares_reached = max(self.max_shares_reached, self.shares)
+        # if self.shares > self.max_shares_reached:
+        #     self.max_shares_reached = self.shares
+        #     self.max_shares_reached_time = entry_time
         fees = self.add_transaction(entry_time, shares_to_buy, entry_price, adjusted_price, True, bar, slippage_price_change)
         
         return cash_needed, fees, shares_to_buy
 
     def partial_exit(self, exit_time: datetime, exit_price: float, shares_to_sell: int, 
                     bar: TypedBarData, slippage_factor: float, atr_sensitivity: float):
+                    
+        self.prev_shares = self.shares
+        self.prev_pl = self.pl
+        # self.prev_avg_entry_price = self.avg_entry_price
+        self.prev_cost_basis_sold_accum = self.cost_basis_sold_accum
+        if shares_to_sell == 0:
+            return 0, 0, 0, 0, 0
+
         adjusted_price, slippage_price_change = self.calculate_slippage(
             False, exit_price, shares_to_sell, bar, slippage_factor, atr_sensitivity)
 
+        # Calculate cost basis and cash values first
+        cost_basis_sold = self.avg_entry_price * shares_to_sell
+        self.cost_basis_sold_accum += cost_basis_sold
+        cash_released = shares_to_sell * adjusted_price
+
+        # Calculate exit pl using the values we already computed
         if not self.is_long:
-            # Calculate portion of borrowed amount being returned
             portion = shares_to_sell / self.shares
             returned_borrowed = self.borrowed_amount * portion
             self.borrowed_amount -= returned_borrowed
-            exit_pl = (self.avg_entry_price - adjusted_price) * shares_to_sell
+            exit_pl = cost_basis_sold - cash_released
         else:
             returned_borrowed = 0
-            exit_pl = (adjusted_price - self.avg_entry_price) * shares_to_sell
+            exit_pl = cash_released - cost_basis_sold
 
-        cash_released = shares_to_sell * adjusted_price
         self.shares -= shares_to_sell
-        self.update_market_value(adjusted_price)
+        self.update_market_value(bar.close)
         self.partial_exit_count += 1
         
         fees = self.add_transaction(exit_time, shares_to_sell, exit_price, adjusted_price, False, bar, slippage_price_change, realized_pl=exit_pl)
         
         return exit_pl, cash_released, returned_borrowed, fees, shares_to_sell
 
+    def calculate_exit_values(self, exit_time: datetime, exit_price: float, shares_to_sell: int, 
+                            bar: TypedBarData, slippage_factor: float, atr_sensitivity: float,
+                            use_prev_avg_entry: bool = False) -> Tuple[float, float]:
+        """Calculate expected realized P&L and fees for an exit without executing it."""
+        
+        if shares_to_sell == 0:
+            return 0.0, 0.0
+        
+        # Calculate P&L using appropriate entry price
+        entry_price = self.prev_avg_entry_price if use_prev_avg_entry else self.avg_entry_price
+        if entry_price is None:
+            return 0.0, 0.0
+        
+        # Calculate slippage-adjusted price 
+        adjusted_price, _ = self.calculate_slippage(
+            False, exit_price, shares_to_sell, bar, slippage_factor, atr_sensitivity
+        )
+
+        if not self.is_long:
+            exit_pl = (entry_price - adjusted_price) * shares_to_sell
+        else:
+            exit_pl = (adjusted_price - entry_price) * shares_to_sell
+            
+        # Calculate fees
+        finra_taf, sec_fee, stock_borrow_cost, commission = self.calculate_transaction_cost(
+            shares_to_sell, adjusted_price, False, exit_time
+        )
+        fees_expected = finra_taf + sec_fee + stock_borrow_cost + commission
+        
+        return exit_pl, fees_expected
+
+
     # NOTE: updates stop price, as well as min/max close, max high, min low
-    def update_stop_price(self, bar: TypedBarData, current_timestamp: datetime):
+    def update_stop_price(self, bar: TypedBarData, current_timestamp: datetime, 
+                          exit_quote_price: float = None, slippage_factor: float = None, atr_sensitivity: float = None):
         # should_exit_price = bar.close
         # should_exit_price_2 = bar.close
         
@@ -457,30 +513,50 @@ class TradePosition:
         else:
             should_exit_price = bar.high
             should_exit_price_2 = bar.high
-            
+        
+        prev_halfway_price = self.halfway_price
         prev_stop_price = self.current_stop_price
+        # prev_stop_price = self.avg_entry_price
         prev_stop_price_2 = self.current_stop_price_2
-        should_have_exited = self.should_exit(should_exit_price)
-        should_have_exited_2 = self.should_exit_2(should_exit_price_2)
+        
+        should_have_exited = self.reached_current_stop_price(should_exit_price)
+        # should_have_exited = self.reached_avg_entry_price(should_exit_price)
+        should_have_exited_2 = self.reached_current_stop_price_2(should_exit_price_2)
+        
+        should_have_exited_halfway = self.reached_halfway_price(should_exit_price) and \
+            self.shares >= self.max_shares * 0.75
+        # and \
+        #     (
+        #         (self.is_long and prev_halfway_price > prev_stop_price) or \
+        #         (not self.is_long and prev_halfway_price < prev_stop_price)
+        #     )
+        
+        
 
         self.area.update_bounds(current_timestamp)
-        self.max_close = max(self.max_close or self.bar_at_entry.close, bar.close)
-        self.min_close = min(self.min_close or self.bar_at_entry.close, bar.close)
+        self.max_close = max(self.max_close or self.bar_at_commit.close, bar.close)
+        self.min_close = min(self.min_close or self.bar_at_commit.close, bar.close)
         
-        self.max_high = max(self.max_high or self.bar_at_entry.high, bar.high)
-        self.min_high = min(self.min_high or self.bar_at_entry.high, bar.high)
+        self.max_high = max(self.max_high or self.bar_at_commit.high, bar.high)
+        self.min_high = min(self.min_high or self.bar_at_commit.high, bar.high)
         
-        self.max_low = max(self.max_low or self.bar_at_entry.low, bar.low)
-        self.min_low = min(self.min_low or self.bar_at_entry.low, bar.low)
-           
+        self.max_low = max(self.max_low or self.bar_at_commit.low, bar.low)
+        self.min_low = min(self.min_low or self.bar_at_commit.low, bar.low)
+
         if self.is_long:
             self.current_stop_price = self.max_close - self.area.get_range
+            # self.current_stop_price = max(self.max_close - self.area.get_range, self.area.get_buy_price)
+            # self.current_stop_price = max(self.max_close - self.area.get_range, self.set_halfway_price())
             self.current_stop_price_2 = self.max_close - self.area.get_range * 3
         else:
             self.current_stop_price = self.min_close + self.area.get_range
+            # self.current_stop_price = min(self.min_close + self.area.get_range, self.area.get_buy_price)
+            # self.current_stop_price = min(self.min_close + self.area.get_range, self.set_halfway_price())
             self.current_stop_price_2 = self.min_close + self.area.get_range * 3
         
-        # self.update_market_value(quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
+        self.set_halfway_price()
+        
+        # self.update_market_value(exit_quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
         self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}",level=logging.DEBUG)
             
         # Check if price has crossed full entry threshold
@@ -521,7 +597,8 @@ class TradePosition:
                     
                     # Close hasn't crossed but high/low has - start with 1 share
                     if self.max_target_shares_limit is None:
-                        self.max_target_shares_limit = 1
+                        # self.max_target_shares_limit = 1
+                        self.max_target_shares_limit = 0
                         if self.initial_shares is None:
                             self.initial_shares = self.max_target_shares_limit
                         self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
@@ -529,20 +606,103 @@ class TradePosition:
                         # Maintain current limit until close crosses buy price
                         self.max_target_shares_limit = current_limit
 
-        return self.should_exit(bar.close), self.should_exit_2(bar.close), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
-        # return self.should_exit(should_exit_price), self.should_exit_2(should_exit_price_2), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
+        # return self.reached_current_stop_price(bar.close), self.reached_current_stop_price_2(bar.close), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
+        return self.reached_exit_ema(bar, exit_quote_price, slippage_factor, atr_sensitivity), self.reached_current_stop_price(bar.close), self.reached_current_stop_price_2(bar.close), \
+            should_have_exited_halfway, \
+            should_have_exited, should_have_exited_2, prev_halfway_price, prev_stop_price, prev_stop_price_2
+        
+        # return self.reached_current_stop_price(should_exit_price), self.reached_current_stop_price_2(should_exit_price_2), should_have_exited, should_have_exited_2, prev_stop_price, prev_stop_price_2
 
-    def should_exit(self, current_price: float) -> bool:
+
+
+    def reached_exit_ema(self, bar: TypedBarData, exit_quote_price: float = None, slippage_factor: float = None, atr_sensitivity: float = None) -> bool:
+        if (not self.position_metrics or self.position_metrics.num_snapshots == 0) or (exit_quote_price is None or slippage_factor is None or atr_sensitivity is None):
+            return self.reached_current_stop_price(bar.close)
+        
+        # # Calculate hypothetical cost basis once
+        # hypothetical_cost_basis = (self.prev_cost_basis_sold_accum + 
+        #                         (self.prev_shares * self.prev_avg_entry_price 
+        #                         if self.prev_avg_entry_price else 0))
+        
+        
+        #         # Calculate P/L for each category
+        # quote_pl, quote_plpc = self.calculate_exit_pl_values(
+        #     bar.timestamp, exit_quote_price, bar, 
+        #     slippage_factor, atr_sensitivity, 
+        #     hypothetical_cost_basis
+        # )
+
+        prev_snapshot = self.position_metrics.snapshots[-1]
+        assert prev_snapshot.timestamp == bar.timestamp - timedelta(minutes=1)
+
+        # # if quote_pl > 0:
+        if self.is_long:
+            # if prev_snapshot.central_value_dist > 0 and bar.central_value_dist <= 0:
+            if prev_snapshot.bar.exit_ema_dist > 0 and bar.exit_ema_dist <= 0:
+                return True
+        else:
+            if prev_snapshot.bar.exit_ema_dist < 0 and bar.exit_ema_dist >= 0:
+                return True
+        
+        # if prev_snapshot.central_value_dist != bar.central_value_dist:
+        #     if prev_snapshot.central_value_dist >= 0 and bar.central_value_dist <= 0:
+        #         return True
+
+        #     if prev_snapshot.central_value_dist <= 0 and bar.central_value_dist >= 0:
+        #         return True
+        
+        return False
+
+
+    def reached_current_stop_price(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price) or \
                (not self.is_long and current_price >= self.current_stop_price)
 
-    def should_exit_2(self, current_price: float) -> bool:
+    def reached_current_stop_price_2(self, current_price: float) -> bool:
         return (self.is_long and current_price <= self.current_stop_price_2) or \
                (not self.is_long and current_price >= self.current_stop_price_2)
 
+    def reached_avg_entry_price(self, current_price: float) -> bool:
+        return self.avg_entry_price is not None and \
+                (
+                    (self.is_long and current_price <= self.avg_entry_price) or \
+                    (not self.is_long and current_price >= self.avg_entry_price)
+                )
+                
+    def reached_halfway_price(self, current_price: float) -> bool:
+        return self.avg_entry_price is not None and \
+                (
+                    (self.is_long and current_price <= self.halfway_price) or \
+                    (not self.is_long and current_price >= self.halfway_price)
+                )
+
+
+    def set_halfway_price(self):
+        if self.is_long:
+            if self.avg_entry_price is None:
+                ret = -np.inf
+            else:
+                ret = (self.max_close + self.avg_entry_price) / 2
+        else:
+            if self.avg_entry_price is None:
+                ret = np.inf
+            else:
+                ret = (self.min_close + self.avg_entry_price) / 2
+        self.halfway_price = ret
+        return ret
+            
     def close(self, exit_time: datetime, exit_price: float):
-        self.exit_time = exit_time
-        self.exit_price = exit_price
+        if not self.has_exited:
+            if self.has_entered:
+                self.area.record_entry_exit(self.actual_entry_time, self.actual_entry_price, exit_time, exit_price)
+            if not self.has_entered:
+                assert self.pl == 0
+                self.bar_at_entry = self.bar_at_commit # no better value
+                self.position_metrics.finalize_metrics()
+            self.exit_time = exit_time
+            self.exit_price = exit_price
+            self.has_exited = True
+            
 
     @property
     def total_commission(self) -> float:
@@ -557,6 +717,20 @@ class TradePosition:
     @property
     def holding_time(self) -> timedelta:
         return (self.exit_time or datetime.now()) - self.entry_time
+    
+    @property
+    def actual_entry_time(self) -> datetime:
+        if self.transactions:
+            return self.transactions[0].timestamp
+        else:
+            return self.entry_time
+    
+    @property
+    def actual_entry_price(self) -> float:
+        if self.transactions:
+            return self.transactions[0].price_unadjusted
+        else:
+            return self.entry_price
     
     @property
     def holding_time_minutes(self) -> int:
@@ -582,101 +756,176 @@ class TradePosition:
     def get_realized_pl(self) -> float:
         return self.realized_pl
 
-    @property
+    @property 
     def pl(self) -> float:
-        return self.get_unrealized_pl + self.get_realized_pl - self.total_transaction_costs
+        # Only include realized P&L and transaction costs
+        return self.get_realized_pl - self.total_transaction_costs
+        # return self.get_unrealized_pl + self.get_realized_pl - self.total_transaction_costs
 
-    @property
+    @property 
     def plpc(self) -> float:
-        return (self.pl / self.initial_balance) * 100
+        # Only include total sold cost basis
+        if self.cost_basis_sold_accum <= 0:
+            return 0.0
+        return (self.pl / self.cost_basis_sold_accum) * 100
     
-    # @property
-    # def price_diff_sum(self) -> Tuple[float, float]:
-    #     assert len(self.transactions) >= 2
-    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-    #     return calculate_price_diff_sums(prices, self.is_long)
+    @property 
+    def accum_pl(self) -> float:
+        return self.pl + self.prev_accum_pl
     
-    @property
-    def net_price_diff(self) -> float:
-        net = self.transactions[-1].price_unadjusted - self.transactions[0].price_unadjusted
-        return net if self.is_long else -net
-
-    # @property
-    # def positive_price_diff_sum(self) -> float:
-    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-    #     diffs = prices[1:] - prices[:-1]
-    #     positive_sum = math.fsum(diff for diff in diffs if diff > 0)
-    #     return positive_sum if self.is_long else -positive_sum
-
-    # @property
-    # def negative_price_diff_sum(self) -> float:
-    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-    #     diffs = prices[1:] - prices[:-1]
-    #     negative_sum = math.fsum(diff for diff in diffs if diff < 0)
-    #     return negative_sum if self.is_long else -negative_sum
-    
-    # @property
-    # def best_price_diff(self) -> float:
-    #     first_price = self.transactions[0].price_unadjusted
-    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-    #     if self.is_long:
-    #         return np.max(prices) - first_price
-    #     else:
-    #         return first_price - np.min(prices)
+    @property 
+    def accum_plpc(self) -> float:
+        return self.plpc + self.prev_accum_plpc
         
-    # @property
-    # def worst_price_diff(self) -> float:
-    #     first_price = self.transactions[0].price_unadjusted
-    #     prices = np.array([a.price_unadjusted for a in self.transactions], dtype=np.float64)
-    #     if self.is_long:
-    #         return np.min(prices) - first_price
-    #     else:
-    #         return first_price - np.max(prices)
+    @property
+    def total_pl(self) -> float:
+        return self.get_realized_pl + self.get_unrealized_pl - self.total_transaction_costs
+
+    @property
+    def current_cost_basis(self) -> float:
+        """Total cost basis including unsold shares"""
+        return self.cost_basis_sold_accum + (self.shares * self.avg_entry_price if self.avg_entry_price else 0)
+
+    @property
+    def total_plpc(self) -> float:
+        basis = self.current_cost_basis
+        if basis <= 0:
+            return 0.0
+        return (self.total_pl / basis) * 100
     
-    
     # @property
-    # def area_width_history(self) -> List[float]:
-    #     return [a.area_width for a in self.transactions]
-    
-    # @property
-    # def at_max_shares_count(self) -> int:
-    #     return sum(1 for a in self.transactions if a.shares_remaining == a.max_shares)
+    # def net_price_diff(self) -> float:
+    #     # net = self.transactions[-1].price_unadjusted - self.transactions[0].price_unadjusted
+    #     # return net if self.is_long else -net
+    #     return self.position_metrics.net_price_diff_body
 
     @property
     def side_win_lose_str(self) -> str:
+        if not self.has_entered:
+            return f"{'Long' if self.is_long else 'Short'} Unentered"
+        if self.pl == 0:
+            return f"{'Long' if self.is_long else 'Short'} Breakeven"
         return f"{'Long' if self.is_long else 'Short'} {'Win' if self.pl > 0 else 'Lose'}"
+    
+        
+    def calculate_exit_pl_values(self, exit_time: datetime, exit_price: float, 
+                            bar: TypedBarData, slippage_factor: float, 
+                            atr_sensitivity: float,
+                            hypothetical_cost_basis: float) -> Tuple[float, float]:
+        """Calculate total P/L and P/L% for exiting all shares at given price."""
+        exit_pl, fees = (0.0, 0.0)
+
+        # Determine if we just executed a transaction in this bar
+        latest_transaction_time = (self.transactions[-1].timestamp 
+                                if self.transactions else None)
+        had_transaction_this_bar = (latest_transaction_time == bar.timestamp 
+                                if latest_transaction_time else False)
+
+        # Choose appropriate shares and entry price
+        shares_to_exit = self.prev_shares if had_transaction_this_bar else self.shares
+        use_prev_entry = had_transaction_this_bar
+
+        if shares_to_exit > 0:
+            exit_pl, fees = self.calculate_exit_values(
+                exit_time, exit_price, shares_to_exit,
+                bar, slippage_factor, atr_sensitivity,
+                use_prev_avg_entry=use_prev_entry
+            )
+            exit_pl += self.prev_pl if had_transaction_this_bar else self.pl
+
+        total_pl = exit_pl - fees
+        plpc = (total_pl / hypothetical_cost_basis * 100 
+                if hypothetical_cost_basis > 0 else 0.0)
+                
+        return total_pl, plpc
 
 
-
-    def record_snapshot(self, bar: TypedBarData):
-        """Record metrics for the current minute."""
-        # Ensure market value is up to date
+    def record_snapshot(self, bar: TypedBarData, exit_quote_price: float, slippage_factor: float, atr_sensitivity: float, append: bool = True):
+        """Record metrics for the current minute.
+        
+        Should only be called after actions for the current timestamp, if any.
+        
+        """
+        # we want to record even if no trades yet
+        self.area.update_bounds(bar.timestamp)
+        
         if len(self.position_metrics.snapshots) == 0:
-            self.update_market_value(self.avg_entry_price)
-        else:
+            # For first snapshot or no trades yet
+            self.market_value = 0  # Reset/initialize
+            self.unrealized_pl = 0
+        elif self.avg_entry_price is not None:
+            # Only call update_market_value once we have trades
             self.update_market_value(bar.close)
+                    
+
+        # Check if we had a transaction this bar
+        latest_transaction_time = (self.transactions[-1].timestamp 
+                                if self.transactions else None)
+        had_transaction_this_bar = (latest_transaction_time == bar.timestamp 
+                                if latest_transaction_time else False)
+
+        # Calculate cost basis appropriately
+        if had_transaction_this_bar:
+            hypothetical_cost_basis = (self.prev_cost_basis_sold_accum + 
+                                    (self.prev_shares * self.prev_avg_entry_price 
+                                    if self.prev_avg_entry_price else 0))
+        else:
+            hypothetical_cost_basis = (self.cost_basis_sold_accum + 
+                                    (self.shares * self.avg_entry_price 
+                                    if self.avg_entry_price else 0))
+
+        # Calculate P/L for each category
+        quote_pl, quote_plpc = self.calculate_exit_pl_values(
+            bar.timestamp, exit_quote_price, bar, 
+            slippage_factor, atr_sensitivity, 
+            hypothetical_cost_basis
+        )
+        
+        best_wick_price = bar.high if self.is_long else bar.low
+        best_wick_pl, best_wick_plpc = self.calculate_exit_pl_values(
+            bar.timestamp, best_wick_price, bar,
+            slippage_factor, atr_sensitivity,
+            hypothetical_cost_basis
+        )
+        
+        worst_wick_price = bar.low if self.is_long else bar.high
+        worst_wick_pl, worst_wick_plpc = self.calculate_exit_pl_values(
+            bar.timestamp, worst_wick_price, bar,
+            slippage_factor, atr_sensitivity,
+            hypothetical_cost_basis
+        )
         
         snapshot = PositionSnapshot(
             timestamp=bar.timestamp,
             is_long=self.is_long,
-            close=bar.close,
-            high=bar.high,
-            low=bar.low,
+            bar=bar,
+            
             shares=self.shares,
+            prev_shares=self.prev_shares if had_transaction_this_bar else self.shares,
             max_shares=self.max_shares,
             max_target_shares_limit=self.max_target_shares_limit or 0,
             area_width=self.area.get_range,
             area_buy_price=self.area.get_buy_price,
             avg_entry_price=self.avg_entry_price,
-            running_pl=self.pl,  # Includes all components
-            running_pl_pct=self.plpc,
+            
+            running_pl=quote_pl,  # More accurate running_pl
+            cost_basis_sold_accum=self.cost_basis_sold_accum,
+            running_plpc=quote_plpc,  # Use hypothetical full exit percentage
+            
             realized_pl=self.realized_pl,
             unrealized_pl=self.unrealized_pl,
-            total_fees=self.total_transaction_costs
+            total_fees=self.total_transaction_costs,
+            has_entered = self.has_entered,
+            has_exited = self.has_exited
         )
         
-        self.position_metrics.add_snapshot(snapshot)
-    
+        # assert best_wick_pl >= quote_pl >= worst_wick_pl, f"{best_wick_pl} >= {quote_pl} >= {worst_wick_pl}"
+        # assert best_wick_plpc >= quote_plpc >= worst_wick_plpc, f"{best_wick_plpc} >= {quote_plpc} >= {worst_wick_plpc}"
+        # NOTE: dont assert; treat wick metrics as approximations
+        
+        if append:
+            self.position_metrics.add_snapshot(snapshot, best_wick_pl, worst_wick_pl, best_wick_plpc, worst_wick_plpc)
+        
 
 def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
     """
@@ -700,22 +949,28 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
             'ID': trade.id,
             'AreaID': trade.area.id,
             'Type': side_string,
-            'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
+            # 'Entry Time': trade.entry_time.time().strftime('%H:%M:%S'),
+            'Entry Time': trade.actual_entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
             # 'Holding Time (min)': trade.holding_time_minutes,
-            'Entry Price': trade.entry_price,
+            # 'Entry Price': trade.entry_price,
+            'Entry Price': trade.actual_entry_price,
             'Exit Price': trade.exit_price if trade.exit_price else None,
+            'Avg Entry Price': trade.avg_entry_price,
             # 'Price Net': trade.net_price_diff,
+            
+            'Num Transact': len(trade.transactions),
             
             'Initial Qty': trade.initial_shares,
             'Target Qty': trade.target_max_shares,
-            'Max Qty Reached (%)': round(100*(trade.max_shares_reached / trade.target_max_shares),6),
+            # 'Max Qty Reached (%)': round(100*(trade.max_shares_reached / trade.target_max_shares),6),
+            # 'Max Qty Time': trade.max_shares_reached_time.time().strftime('%H:%M:%S'),
             'Side Win Lose': trade.side_win_lose_str,
             'Total P/L': round(trade.pl,6),
             'ROE (P/L %)': round(trade.plpc,12),
             # 'Cumulative P/L %': round(cumulative_pct_change,6),
-            'Slippage Costs': round(trade.slippage_cost,6),
-            'Transaction Costs': round(trade.total_transaction_costs,6),
+            # 'Slippage Costs': round(trade.slippage_cost,6), # commented out
+            # 'Transaction Costs': round(trade.total_transaction_costs,6), # commented out
             # 'Times Buying Power': trade.times_buying_power,
         }
 
@@ -745,10 +1000,8 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
     bardf = TypedBarData.to_dataframe([trade.bar_at_entry for trade in trades])
     float_cols = bardf.select_dtypes(include=['float']).columns
     bardf[float_cols] = bardf[float_cols].round(10)
-    
-    assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time'])
+    # assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time']), f"{bardf['timestamp'].dt.strftime('%H:%M:%S')}\n{df['Entry Time']}"
     df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)
-    print(list(df.columns))
     
     # df.sort_values(by=['Type','ID'], inplace=True) # for quicker subtotalling in excel
 
@@ -760,8 +1013,10 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         'rsi_divergence',
         
         # Volume profile
-        'vol_balance',
-        'hvn_balance',
+        'buy_vol_balance',
+        'buy_hvn_balance',
+        'sell_vol_balance',
+        'sell_hvn_balance',
         
         # Technical indicators
         'MACD',
@@ -812,7 +1067,7 @@ class SimplifiedTradePosition:
     bar_at_entry: TypedBarData
     initial_shares: int
     target_max_shares: int
-    max_shares_reached: float
+    # max_shares_reached: float
     at_max_shares_count: float
     min_area_width: float
     max_area_width: float
@@ -881,7 +1136,7 @@ def csv_to_trade_positions(csv_file_path) -> List[SimplifiedTradePosition]:
 
             initial_shares=row['Initial Shares'],
             target_max_shares=row['Target Qty'],
-            max_shares_reached=row['Max Qty Reached (%)'],
+            # max_shares_reached=row['Max Qty Reached (%)'],
             at_max_shares_count=row['At Max Shares Count'],
             min_area_width=row['Min Area Width'],
             max_area_width=row['Max Area Width'],
@@ -916,7 +1171,10 @@ import matplotlib.patches as mpatches
 def is_trading_day(date: date):
     return date.weekday() < 5
 
-def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
+def plot_cumulative_pl_and_price(trades: List[TradePosition], df: pd.DataFrame, initial_investment: float, 
+                                 when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None,
+                                 use_plpc=False):
+# def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePosition], df: pd.DataFrame, initial_investment: float, when_above_max_investment: Optional[List[pd.Timestamp]]=None, filename: Optional[str]=None):
     """
     Create a graph that plots the cumulative profit/loss (summed percentages) at each corresponding exit time
     overlaid on the close price and volume from the DataFrame, using a triple y-axis.
@@ -987,14 +1245,27 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
     running_pl_longs = 0
     running_pl_shorts = 0
     
+    if use_plpc:
+        title_str = 'Cumulative P/L % Change'
+    else:
+        title_str = 'Cumulative P/L $'
+        
+    
+    
     for trade in trades:
         if trade.exit_time and trade.exit_time.date() in trading_days:
-            exit_times.append(trade.exit_time)
-            running_pl += trade.plpc
-            if trade.is_long:
-                running_pl_longs += trade.plpc
+            if use_plpc:
+                val = trade.plpc
             else:
-                running_pl_shorts += trade.plpc
+                val = trade.pl
+            
+            
+            exit_times.append(trade.exit_time)
+            running_pl += val
+            if trade.is_long:
+                running_pl_longs += val
+            else:
+                running_pl_shorts += val
             cumulative_pl.append(running_pl)
             cumulative_pl_longs.append(running_pl_longs)
             cumulative_pl_shorts.append(running_pl_shorts)
@@ -1082,7 +1353,7 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
     else:
         print("Warning: No valid exit times found in the trading days.")
     
-    ax2.set_ylabel('Cumulative P/L % Change', color='black')
+    ax2.set_ylabel(f'{title_str}', color='black')
     ax2.tick_params(axis='y', labelcolor='black')
     
     # Create tertiary y-axis for volume
@@ -1113,7 +1384,7 @@ def plot_cumulative_pl_and_price(trades: List[TradePosition | SimplifiedTradePos
     ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',')))
     
     # Set title and legend
-    plt.title(f'{symbol}: Cumulative P/L % Change vs Close Price and {volume_label}')
+    plt.title(f'{symbol}: {title_str} vs Close Price and {volume_label}')
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax3_patch = mpatches.Patch(color='purple', alpha=0.3, label=volume_label)
@@ -1168,6 +1439,8 @@ from scipy import stats
 def extract_trade_data(trades: List['TradePosition'], 
                       x_field: str,
                       y_field: str = 'pl',
+                      color_field: Optional[str] = None,
+                      y_divisor_field: Optional[str] = None,
                       side: Optional[str] = None) -> pd.DataFrame:
     """
     Extract specified fields from trades into a DataFrame.
@@ -1192,36 +1465,26 @@ def extract_trade_data(trades: List['TradePosition'],
             
         row = {'is_long': trade.is_long}
         
-        # Extract x-axis field
-        if '.' in x_field:
-            # Handle nested attributes (e.g., 'bar_at_entry.volume')
-            obj = trade
-            for attr in x_field.split('.'):
-                obj = getattr(obj, attr)
-            x_value = obj
-        else:
-            x_value = getattr(trade, x_field)
-            
-        # Handle datetime.time conversion
-        if isinstance(x_value, datetime):
-            x_value = x_value.time()
+        def extract_field_value(field_name):
+            if '.' in field_name:
+                obj = trade
+                for attr in field_name.split('.'):
+                    obj = getattr(obj, attr)
+                return obj
+            return getattr(trade, field_name)
+        
+        # Extract values for x, y, and color fields
+        x_value = extract_field_value(x_field)
+        y_value = extract_field_value(y_field)
+        if y_divisor_field:
+            y_divisor_value = extract_field_value(y_divisor_field)
+            y_value /= y_divisor_value
+        if color_field:
+            color_value = extract_field_value(color_field)
+            row['color'] = color_value
             
         row['x'] = x_value
-        
-        # Extract y-axis field similarly
-        if '.' in y_field:
-            obj = trade
-            for attr in y_field.split('.'):
-                obj = getattr(obj, attr)
-            y_value = obj
-        else:
-            y_value = getattr(trade, y_field)
-            
-        if isinstance(y_value, datetime):
-            y_value = y_value.time()
-            
         row['y'] = y_value
-        
         data.append(row)
         
     return pd.DataFrame(data)
@@ -1254,7 +1517,13 @@ def plot_trade_correlation(trades: List['TradePosition'],
                          x_label: Optional[str] = None,
                          y_label: Optional[str] = None,
                          title: Optional[str] = None,
-                         binwidth_x: Optional[float] = None, binwidth_y: Optional[float] = None) -> None:
+                         binwidth_x: Optional[float] = None, 
+                         binwidth_y: Optional[float] = None,
+                         color_field: Optional[str] = None,
+                         cmap: str = 'seismic_r',
+                         center_colormap: Optional[float] = 0,
+                         is_trinary: bool = False,
+                         y_divisor_field: Optional[str] = None) -> None:
     """
     Create correlation plots for trade attributes.
     
@@ -1267,6 +1536,8 @@ def plot_trade_correlation(trades: List['TradePosition'],
         x_label: Custom x-axis label
         y_label: Custom y-axis label
         title: Custom plot title
+        binwidth_x: Custom bin width for x-axis histogram
+        binwidth_y: Custom bin width for y-axis histogram
     """
     if split_sides:
         figsize = (figsize[0]*2, figsize[1])
@@ -1277,34 +1548,142 @@ def plot_trade_correlation(trades: List['TradePosition'],
         fig, ax = plt.subplots(figsize=figsize)
         sides = [None]
         axes = [ax]
+    
+    
+    dfs = []
         
     for side, ax in zip(sides, axes):
         # Extract data
-        df = extract_trade_data(trades, x_field, y_field, side)
-        
+        df = extract_trade_data(trades, x_field, y_field, color_field, y_divisor_field, side)
         if len(df) == 0:
             continue
             
-        # Create joint plot
-        if isinstance(df['x'].iloc[0], datetime_time):
-            # Convert time to minutes since midnight for plotting
+        dfs.append((side, ax, df))
+    
+    df_all = pd.concat([a[2] for a in dfs])
+    
+    # Calculate global ranges and bins once for all plots
+    x_data_clean = df_all['x'][~(np.isnan(df_all['x']) | np.isinf(df_all['x']))]
+    y_data_clean = df_all['y'][~(np.isnan(df_all['y']) | np.isinf(df_all['y']))]
+    
+    # Handle time data conversion
+    is_time_data = isinstance(df_all['x'].iloc[0], (datetime_time, pd.Timestamp))
+    if is_time_data:
+        if isinstance(df_all['x'].iloc[0], pd.Timestamp):
+            x_data_minutes = x_data_clean.apply(lambda t: t.hour * 60 + t.minute)
+        else:
+            x_data_minutes = x_data_clean.apply(lambda t: t.hour * 60 + t.minute)
+        start_minute = 570  # 9:30 AM
+        x_range = x_data_minutes.max() - start_minute
+        if binwidth_x is None:
+            binwidth_x = x_range / 20
+        num_bins = int(np.ceil(x_range / binwidth_x))
+        bins_x = [start_minute + i * binwidth_x for i in range(num_bins + 1)]
+        global_xlim = (start_minute, x_data_minutes.max())
+    else:
+        x_range = x_data_clean.max() - x_data_clean.min()
+        if binwidth_x is None:
+            binwidth_x = x_range / 20
+            
+        # Calculate global x bins
+        if 0 <= x_data_clean.min() or 0 >= x_data_clean.max():
+            num_bins = int(np.ceil(x_range / binwidth_x))
+            if x_data_clean.min() >= 0:
+                bins_x = [i * binwidth_x for i in range(num_bins + 1)]
+            else:
+                bins_x = [-i * binwidth_x for i in range(num_bins + 1)][::-1]
+        else:
+            pos_bins = np.arange(0, x_data_clean.max() + binwidth_x, binwidth_x)
+            neg_bins = np.arange(0, x_data_clean.min() - binwidth_x, -binwidth_x)
+            bins_x = np.concatenate([neg_bins[:-1][::-1], pos_bins])
+        global_xlim = (x_data_clean.min(), x_data_clean.max())
+            
+    # Calculate global y bins
+    y_range = y_data_clean.max() - y_data_clean.min()
+    if binwidth_y is None:
+        binwidth_y = y_range / 20
+        
+    if 0 <= y_data_clean.min() or 0 >= y_data_clean.max():
+        num_bins = int(np.ceil(y_range / binwidth_y))
+        if y_data_clean.min() >= 0:
+            bins_y = [i * binwidth_y for i in range(num_bins + 1)]
+        else:
+            bins_y = [-i * binwidth_y for i in range(num_bins + 1)][::-1]
+    else:
+        pos_bins = np.arange(0, y_data_clean.max() + binwidth_y, binwidth_y)
+        neg_bins = np.arange(0, y_data_clean.min() - binwidth_y, -binwidth_y)
+        bins_y = np.concatenate([neg_bins[:-1][::-1], pos_bins])
+        
+    global_ylim = (y_data_clean.min(), y_data_clean.max())
+    
+    # Time formatter for x-axis if needed
+    if is_time_data:
+        def format_time(x, p):
+            hours = int(x // 60)
+            minutes = int(x % 60)
+            return f"{hours:02d}:{minutes:02d}"
+
+    for side, ax, df in dfs:
+        if is_time_data:
+            # Convert time to minutes for this subplot
             df['x_minutes'] = df['x'].apply(lambda t: t.hour * 60 + t.minute)
             del df['x']
             df.rename(columns={'x_minutes':'x'}, inplace=True)
-            # Custom formatter for time axis
-            def format_time(x, p):
-                hours = int(x // 60)
-                minutes = int(x % 60)
-                return f"{hours:02d}:{minutes:02d}"
             ax.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
 
         x_data = df['x']
         
-        # Create scatter plot
-        sns.scatterplot(data=df, x='x', y='y', 
-                       hue='is_long' if side is None else None,
-                       palette=['green', 'red'] if side is None else None,
-                       ax=ax)
+        # Create scatter plot with color mapping if specified
+        if color_field:
+            if pd.api.types.is_numeric_dtype(df['color']):
+                if is_trinary and center_colormap is not None:
+                    # Convert numeric to categorical based on comparison with center
+                    def categorize(val):
+                        if val > center_colormap:
+                            return f'Above {center_colormap}'
+                        elif val < center_colormap:
+                            return f'Below {center_colormap}'
+                        return f'Equal to {center_colormap}'
+                    
+                    df['color_cat'] = df['color'].map(categorize)
+                    # Use categorical palette with meaningful colors
+                    sns.scatterplot(data=df, x='x', y='y', hue='color_cat', 
+                                  palette={f'Above {center_colormap}': 'green', f'Below {center_colormap}': 'red', f'Equal to {center_colormap}': 'gray'},
+                                  ax=ax)
+                else:
+                    # For numeric fields, use continuous colormap
+                    if center_colormap is not None:
+                        # Sort by absolute distance from center so extreme values appear on top
+                        df = df.copy()
+                        df['dist_from_center'] = abs(df['color'] - center_colormap)
+                        df = df.sort_values('dist_from_center')
+                        
+                        # Create diverging colormap centered at specified value
+                        vmin = df['color'].min()
+                        vmax = df['color'].max()
+                        max_abs = max(abs(vmin - center_colormap), abs(vmax - center_colormap))
+                        norm = plt.Normalize(center_colormap - max_abs, center_colormap + max_abs)
+                        
+                        # Choose appropriate colormap for centered data
+                        if cmap == 'viridis':  # If default not changed, use better colormap for centered data
+                            cmap = 'RdYlBu_r'  # Blue for negative, Red for positive
+                    else:
+                        # Sort by absolute value so extreme values appear on top
+                        df = df.copy()
+                        df = df.sort_values('color', key=abs)
+                        norm = plt.Normalize(df['color'].min(), df['color'].max())
+                        
+                    scatter = ax.scatter(df['x'], df['y'], c=df['color'], cmap=cmap, norm=norm, alpha=0.8, edgecolor='gray', linewidth=1)
+                    plt.colorbar(scatter, ax=ax, label=color_field)
+            else:
+                # For categorical fields, use discrete palette
+                sns.scatterplot(data=df, x='x', y='y', hue='color', ax=ax)
+        else:
+            # Default behavior using is_long for color
+            sns.scatterplot(data=df, x='x', y='y', 
+                          hue='is_long' if side is None else None,
+                          palette=['green', 'red'] if side is None else None,
+                          ax=ax)
         
         # Add trend line
         x_values = x_data.values.reshape(-1, 1)
@@ -1339,44 +1718,45 @@ def plot_trade_correlation(trades: List['TradePosition'],
         ax_histy.yaxis.set_tick_params(labelleft=False)
         
         # Determine appropriate bins for x-axis
-        x_range = x_data.max() - x_data.min()
+        x_data_clean = x_data[~(np.isnan(x_data) | np.isinf(x_data))]
+        x_range = x_data_clean.max() - x_data_clean.min()
         if binwidth_x is None:
             binwidth_x = x_range / 20  # default to 20 bins
 
         # For time data, start bins at 9:30 (570 minutes)
         if 'format_time' in locals():  # Check if we're dealing with time data
             start_minute = 570  # 9:30 AM
-            num_bins = int(np.ceil((x_data.max() - start_minute) / binwidth_x))
+            num_bins = int(np.ceil((x_data_clean.max() - start_minute) / binwidth_x))
             bins_x = [start_minute + i * binwidth_x for i in range(num_bins + 1)]
             ax.set_xlim((start_minute, ax.get_xlim()[1]))
         else:
             # For numeric data, ensure zero is at bin edge
-            if 0 <= x_data.min() or 0 >= x_data.max():  # All positive or all negative
+            if 0 <= x_data_clean.min() or 0 >= x_data_clean.max():  # All positive or all negative
                 num_bins = int(np.ceil(x_range / binwidth_x))
-                if x_data.min() >= 0:
+                if x_data_clean.min() >= 0:
                     bins_x = [i * binwidth_x for i in range(num_bins + 1)]
                 else:
                     bins_x = [-i * binwidth_x for i in range(num_bins + 1)][::-1]
             else:  # Data crosses zero
-                pos_bins = np.arange(0, x_data.max() + binwidth_x, binwidth_x)
-                neg_bins = np.arange(0, x_data.min() - binwidth_x, -binwidth_x)
+                pos_bins = np.arange(0, x_data_clean.max() + binwidth_x, binwidth_x)
+                neg_bins = np.arange(0, x_data_clean.min() - binwidth_x, -binwidth_x)
                 bins_x = np.concatenate([neg_bins[:-1][::-1], pos_bins])
-        # print(bins_x)
 
         # Similar logic for y-axis bins
-        y_range = df['y'].max() - df['y'].min()
+        y_data_clean = df['y'][~(np.isnan(df['y']) | np.isinf(df['y']))]
+        y_range = y_data_clean.max() - y_data_clean.min()
         if binwidth_y is None:
             binwidth_y = y_range / 20  # default to 20 bins
             
-        if 0 <= df['y'].min() or 0 >= df['y'].max():  # All positive or all negative
+        if 0 <= y_data_clean.min() or 0 >= y_data_clean.max():  # All positive or all negative
             num_bins = int(np.ceil(y_range / binwidth_y))
-            if df['y'].min() >= 0:
+            if y_data_clean.min() >= 0:
                 bins_y = [i * binwidth_y for i in range(num_bins + 1)]
             else:
                 bins_y = [-i * binwidth_y for i in range(num_bins + 1)][::-1]
         else:  # Data crosses zero
-            pos_bins = np.arange(0, df['y'].max() + binwidth_y, binwidth_y)
-            neg_bins = np.arange(0, df['y'].min() - binwidth_y, -binwidth_y)
+            pos_bins = np.arange(0, y_data_clean.max() + binwidth_y, binwidth_y)
+            neg_bins = np.arange(0, y_data_clean.min() - binwidth_y, -binwidth_y)
             bins_y = np.concatenate([neg_bins[:-1][::-1], pos_bins])
             
         # Plot histograms with calculated bins
@@ -1386,9 +1766,9 @@ def plot_trade_correlation(trades: List['TradePosition'],
             
         sns.histplot(y=df['y'], ax=ax_histy, bins=bins_y, color='blue', alpha=0.3)
         
-        # Match main axes limits
-        ax_histx.set_xlim(ax.get_xlim())
-        ax_histy.set_ylim(ax.get_ylim())
+        # Match axes limits for both plots
+        ax.set_xlim(global_xlim)
+        ax.set_ylim(global_ylim)
         
         # Labels and title
         ax.set_xlabel(x_label or x_field)
@@ -1397,6 +1777,32 @@ def plot_trade_correlation(trades: List['TradePosition'],
             ax.set_title(f'{title or ""} ({side.capitalize()} Trades)')
         else:
             ax.set_title(title or f'{x_field} vs {y_field}')
+            
+        # Add reference lines at x=0 and y=0
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5, zorder=0)
+        ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5, zorder=0)
+
+        # Create marginal axes
+        divider = make_axes_locatable(ax)
+        ax_histx = divider.append_axes("top", 1.2, pad=0.3)
+        ax_histy = divider.append_axes("right", 1.2, pad=0.3)
+        
+        # Turn off marginal axes labels
+        ax_histx.xaxis.set_tick_params(labelbottom=False)
+        ax_histy.yaxis.set_tick_params(labelleft=False)
+        
+        # Plot histograms with calculated bins
+        if is_time_data:
+            sns.histplot(x=x_data, ax=ax_histx, bins=bins_x, color='blue', alpha=0.3)
+            ax_histx.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
+        else:
+            sns.histplot(x=x_data, ax=ax_histx, bins=bins_x, color='blue', alpha=0.3)
+            
+        sns.histplot(y=df['y'], ax=ax_histy, bins=bins_y, color='blue', alpha=0.3)
+        
+        # Match marginal axes limits
+        ax_histx.set_xlim(global_xlim)
+        ax_histy.set_ylim(global_ylim)
             
     plt.tight_layout()
     plt.show()

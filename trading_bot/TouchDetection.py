@@ -11,6 +11,7 @@ from alpaca.data.enums import Adjustment
 from typing import List, Tuple, Optional, Dict, Union
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from collections import defaultdict
 import numpy as np
 import toml
@@ -124,7 +125,7 @@ def calculate_ema_with_cutoff(df: pd.DataFrame, field: str, span: int, window: i
     
 
 
-def calculate_macd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd.Series, 
+def calculate_macd(dfs: List[pd.DataFrame], 
                   fast=12, slow=26, signal=9, hist_ema_span=3, rsi_period=14, rsi_ema_span=3, 
                   mfi_period=14, mfi_ema_span=3):
     """
@@ -147,11 +148,6 @@ def calculate_macd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd
     Returns:
     - pd.DataFrame: A DataFrame with columns ['MACD', 'MACD_signal', 'MACD_hist', 'MACD_hist_roc', 'RSI', 'MFI'].
     """
-    # Calculate typical price
-    typical_price = (high + low + close) / 3
-    
-    # Calculate raw money flow
-    raw_money_flow = typical_price * volume
         
     def calculate_mfi(tp: pd.Series, mf: pd.Series, period: int, smoothing: int):
         # Calculate positive and negative money flow
@@ -181,16 +177,7 @@ def calculate_macd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd
         smoothed_mfi = pd.Series(mfi).ewm(span=smoothing, adjust=False).mean()
         
         return smoothed_mfi.fillna(50)  # Fill NaN values with 50
-
-    # MACD calculations (unchanged)
-    fast_ema = close.ewm(span=fast, adjust=False).mean()
-    slow_ema = close.ewm(span=slow, adjust=False).mean()
-    macd_line = fast_ema - slow_ema
-    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
-    raw_hist = macd_line - macd_signal
-    macd_hist = raw_hist.ewm(span=hist_ema_span, adjust=False).mean()
-    macd_hist_roc = macd_hist.diff().fillna(0)
-
+    
     def calculate_rsi(series, period, smoothing):
         delta = series.diff()
         gain = delta.where(delta > 0, 0)
@@ -203,29 +190,53 @@ def calculate_macd(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd
         # Apply smoothing
         smoothed_rsi = rsi.ewm(span=smoothing, adjust=False).mean()
         return smoothed_rsi
-
-    rsi = calculate_rsi(close, rsi_period, rsi_ema_span)
-    mfi = calculate_mfi(typical_price, raw_money_flow, mfi_period, mfi_ema_span)
     
-    # Calculate ROC for both RSI and MFI
-    rsi_roc = rsi.diff().fillna(0)
-    mfi_roc = mfi.diff().fillna(0)
-    
-    mfi.index = rsi.index.copy()
-    mfi_roc.index = rsi.index.copy()
+    results = []
+    for df in dfs:
+        if df is None:
+            results.append(None)
+            continue
+        
+        close, high, low, volume = df['close'], df['high'], df['low'], df['volume']
 
-    # Combine into a DataFrame
-    result = pd.DataFrame({
-        'MACD': macd_line.fillna(0),
-        'MACD_signal': macd_signal.fillna(0),
-        'MACD_hist': macd_hist.fillna(0),
-        'MACD_hist_roc': macd_hist_roc,
-        'RSI': rsi.fillna(50),
-        'RSI_roc': rsi_roc,
-        'MFI': mfi.fillna(50),
-        'MFI_roc': mfi_roc
-    })
-    return result
+        # Calculate typical price
+        typical_price = (high + low + close) / 3
+        
+        # Calculate raw money flow
+        raw_money_flow = typical_price * volume
+
+        # MACD calculations (unchanged)
+        fast_ema = close.ewm(span=fast, adjust=False).mean()
+        slow_ema = close.ewm(span=slow, adjust=False).mean()
+        macd_line = fast_ema - slow_ema
+        macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+        raw_hist = macd_line - macd_signal
+        macd_hist = raw_hist.ewm(span=hist_ema_span, adjust=False).mean()
+        macd_hist_roc = macd_hist.diff().fillna(0)
+
+        rsi = calculate_rsi(close, rsi_period, rsi_ema_span)
+        mfi = calculate_mfi(typical_price, raw_money_flow, mfi_period, mfi_ema_span)
+        
+        # Calculate ROC for both RSI and MFI
+        rsi_roc = rsi.diff().fillna(0)
+        mfi_roc = mfi.diff().fillna(0)
+        
+        mfi.index = rsi.index.copy()
+        mfi_roc.index = rsi.index.copy()
+
+        # Combine into a DataFrame
+        result = pd.DataFrame({
+            'MACD': macd_line.fillna(0),
+            'MACD_signal': macd_signal.fillna(0),
+            'MACD_hist': macd_hist.fillna(0),
+            'MACD_hist_roc': macd_hist_roc,
+            'RSI': rsi.fillna(50),
+            'RSI_roc': rsi_roc,
+            'MFI': mfi.fillna(50),
+            'MFI_roc': mfi_roc
+        })
+        results.append(result)
+    return results
 
 @dataclass
 class Level:
@@ -498,8 +509,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=4)
         # macd_df = calculate_macd(df['close'], fast=5, slow=13, signal=4, hist_ema_span=5, rsi_period=5, rsi_ema_span=6)
                 
-        macd_df = calculate_macd(
-            df['close'], df['high'], df['low'], df['volume'],
+        macd_dfs = calculate_macd(
+            [df,df_adjusted],
             fast=5, slow=13, signal=4,
             hist_ema_span=5,
             # rsi_period=5, 
@@ -515,11 +526,51 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         # print(macd_df)
         
-        df = pd.concat([df, macd_df],axis=1)
+        df = pd.concat([df, macd_dfs[0]],axis=1)
+        df_adjusted = pd.concat([df_adjusted, macd_dfs[1]],axis=1)
         # print(df)
+
+        # df.drop(columns=['vwap'],errors='ignore',inplace=True) # seems incorrect. calculate vwap manually:
+        
+        def calculate_vwap(df: pd.DataFrame):
+
+            # Get typical price
+            # df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+            # Calculate price * volume 
+            # df['pv'] = df['typical_price'] * df['volume']
+            # Group by date to reset calculations daily
+            grouped = df.groupby(df.index.get_level_values('timestamp').date)
+            # Calculate running sums within each day
+            # df['VWAP'] = grouped.apply(lambda x: x['pv'].cumsum() / x['volume'].cumsum()).T.values
+            df['VWAP'] = grouped.apply(lambda x: (x['vwap'] * x['volume']).cumsum() / x['volume'].cumsum()).T.values
+            
+            df.drop(columns=['typical_price', 'pv'],errors='ignore',inplace=True)
+            
+            
+        calculate_vwap(df)
+        calculate_vwap(df_adjusted)
+        
+        # vwap is bar vwap
+        # VWAP is day vwap
+        
+        # central_value_var = 'close'
+        central_value_var = 'vwap'
+        
         
         # df['central_value'] = (df['vwap'] + calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span) * 2) / 3
-        df['central_value'] = calculate_ema_with_cutoff(df, 'close', span=params.price_ema_span)
+        df['central_value'] = calculate_ema_with_cutoff(df, central_value_var, span=params.price_ema_span)
+        # df['central_value'] = df['vwap']
+
+        df_adjusted['central_value'] = calculate_ema_with_cutoff(df_adjusted, central_value_var, span=params.price_ema_span)
+        
+        
+        exit_ema_var = 'close'
+        # exit_ema_var = 'vwap'
+        
+        df['exit_ema'] = calculate_ema_with_cutoff(df, exit_ema_var, span=params.exit_ema_span)
+        df_adjusted['exit_ema'] = calculate_ema_with_cutoff(df_adjusted, exit_ema_var, span=params.exit_ema_span)
+        
+        
         df['is_res'] = df['close'] >= df['central_value'] # if is_res, trade long
 
         # Calculate True Range (TR)
@@ -560,7 +611,12 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
                 
         # Calculate distance to central value/EMA - positive when price above
-        df['central_value_dist'] = (df['close'] - df['central_value']) / df['close'] # Normalize by price level
+        # df['central_value_dist'] = (df[central_value_var] - df['central_value']) / df[central_value_var] # Normalize by price level
+        df['central_value_dist'] = (df['close'] - df['central_value']) # / df['MTR' if params.use_median else 'ATR']# Normalize by price level
+        # df['central_value_dist'] = (df[central_value_var] - df['central_value'])
+        
+        
+        df['exit_ema_dist'] = (df[exit_ema_var] - df['exit_ema'])
 
         # Calculate basic ADX components
         df['plus_dm'] = df['high'] - df['high'].shift(1) 
@@ -587,12 +643,12 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         df['trend_strength'] = df['plus_di'] - df['minus_di']
 
         # Clean up intermediate columns
-        df = df.drop(columns=[
+        df.drop(columns=[
             'plus_dm', 'minus_dm', 'smoothed_plus_dm', 'smoothed_minus_dm',
             'smoothed_tr', 'plus_di', 'minus_di', 'dx',
-            'H_PC','L_PC','TR'
-        ],errors='ignore')
-        
+            'H_PC','L_PC','TR', 'typical_price', 'pv'
+        ],errors='ignore',inplace=True)
+
         log_live('bar metrics calculated',level=logging.DEBUG)
         
         
@@ -828,8 +884,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     long_touch_area = touch_detection_areas.long_touch_area
     short_touch_area = touch_detection_areas.short_touch_area
     market_hours = touch_detection_areas.market_hours
-    df = touch_detection_areas.bars
-    # df = touch_detection_areas.bars_adjusted
+    # df = touch_detection_areas.bars
+    df = touch_detection_areas.bars_adjusted
     # df_adjusted = touch_detection_areas.bars_adjusted
     mask = touch_detection_areas.mask
     # min_touches = touch_detection_areas.min_touches
@@ -837,23 +893,104 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     end_time = touch_detection_areas.end_time
     # use_median = touch_detection_areas.use_median
 
+
+    timestamps = df.index.get_level_values('timestamp')
+    # Calculate bar width based on time intervals
+
+    
     # plt.figure(figsize=(14, 7))
     # Create figure with 3 subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 14), height_ratios=[3, 1, 1], sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 15), height_ratios=[4, 1, 1], sharex=True)
     plt.subplots_adjust(hspace=0.05)
+    
+
 
     if filter_date:
         df = df.loc[df.index.get_level_values('timestamp').date == filter_date]
         mask = mask.loc[mask.index.get_level_values('timestamp').date == filter_date]
+        timestamps = df.index.get_level_values('timestamp')
+        
     
+    grouped = df.groupby(df.index.get_level_values('timestamp').date)
+    if len(grouped) == 1:
+        # Convert timestamps once to matplotlib format
+        dates = mdates.date2num(timestamps.to_pydatetime())
+        time_diff = dates[1] - dates[0]  # Use converted dates for width
+        bar_width = time_diff  # No need to convert to days, already in right format
+        
+        # Create a secondary y-axis for volume
+        ax1_volume = ax1.twinx()
+        max_volume = df['volume'].max()
+
+        # Plot volume bars at the bottom 15% of the chart
+        up_mask = df['close'] >= df['open']
+        down_mask = ~up_mask
+
+        # Plot all up volume bars at once
+        ax1_volume.bar(dates[up_mask], 
+                    df['volume'][up_mask] * 0.15 / max_volume,
+                    width=bar_width,
+                    color='lightgreen',
+                    edgecolor='green',
+                    alpha=0.75,
+                    linewidth=0.4)
+
+        # Plot all down volume bars at once
+        ax1_volume.bar(dates[down_mask],
+                    df['volume'][down_mask] * 0.15 / max_volume,
+                    width=bar_width,
+                    color='lightcoral',
+                    edgecolor='red',
+                    alpha=0.75,
+                    linewidth=0.4)
+
+        # Make the volume axis invisible but keep the bars
+        ax1_volume.set_ylim(0, 1)  # Full height of chart
+        ax1_volume.set_ylabel('')
+        ax1_volume.set_yticklabels([])
+        
+        # Plot all price bars at once
+        up_idx = np.where(up_mask)[0]
+        down_idx = np.where(down_mask)[0]
+    
+        
+        # Plot up bars
+        if len(up_idx) > 0:
+            body_bottom = df['open'].iloc[up_idx]
+            body_height = df['close'].iloc[up_idx] - df['open'].iloc[up_idx]
+            ax1.bar(dates[up_idx], body_height, bottom=body_bottom,
+                    width=bar_width, color='green', edgecolor='green', linewidth=0)
+            
+            # Plot up wicks
+            for idx in up_idx:
+                x = dates[idx]
+                ax1.vlines(x, df['low'].iloc[idx], df['high'].iloc[idx],
+                        color='green', linewidth=0.5)
+
+        # Plot down bars
+        if len(down_idx) > 0:
+            body_bottom = df['close'].iloc[down_idx]
+            body_height = df['open'].iloc[down_idx] - df['close'].iloc[down_idx]
+            ax1.bar(dates[down_idx], body_height, bottom=body_bottom,
+                    width=bar_width, color='red', edgecolor='red', linewidth=0)
+            
+            # Plot down wicks
+            for idx in down_idx:
+                x = dates[idx]
+                ax1.vlines(x, df['low'].iloc[idx], df['high'].iloc[idx],
+                        color='red', linewidth=0.5)
+
+
     # Main price plot (ax1)
     ax1.plot(df.index.get_level_values('timestamp'), df['central_value'], label='Central Value', color='yellow', linewidth=1)
-    ax1.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue', linewidth=1)
+    ax1.plot(df.index.get_level_values('timestamp'), df['vwap'], label='VWAP', color='purple', linewidth=1)
+    if len(grouped) != 1:
+        ax1.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue', linewidth=1)
             
     # MACD plot with ROC (ax2)
     ax2_twin = ax2.twinx()
-    timestamps = df.index.get_level_values('timestamp')
-    
+
+
     # Get the values for both metrics
     macd_hist = df['MACD_hist'].values
     macd_roc = df['MACD_hist_roc'].values
@@ -1140,11 +1277,12 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
             if color == 'blue_alpha':
                 ax1.plot(x, y, color='blue', linestyle='-', alpha=0.20)
             else:
-                ax1.plot(x, y, color='blue', linestyle='-')
+                ax1.plot(x, y, color='blue', linestyle='-', alpha=0.60)
 
     ax1.set_title(f'{symbol} Price Chart with Touch Detection Areas')
     ax1.set_ylabel('Price')
     ax1.legend().remove()
+    # ax1.legend()
     ax1.grid(True)
 
     # Set x-axis limits for all subplots
@@ -1172,8 +1310,12 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
         if timestamps[i] >= zend:
             ymax = i
             break
-    ys = df['close'].iloc[max(ymin, 0):min(ymax, len(df))]
-    ax1.set_ylim(min(ys), max(ys))
+    highs = df['high'].iloc[max(ymin, 0):min(ymax, len(df))]
+    lows = df['low'].iloc[max(ymin, 0):min(ymax, len(df))]
+    
+    ys_min, ys_max = min(lows), max(highs)
+    ys_diff = ys_max - ys_min
+    ax1.set_ylim(ys_min - (ys_diff * 0.12), ys_max + (ys_diff * 0.01))
     
     if save_path:
         plt.savefig(save_path)
