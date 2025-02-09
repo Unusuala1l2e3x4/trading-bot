@@ -572,6 +572,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         
         df['is_res'] = df['close'] >= df['central_value'] # if is_res, trade long
+        # df['is_res'] = df['close'] < df['central_value'] # mean reversion strategy
 
         # Calculate True Range (TR)
         df['H_L'] = df['high'] - df['low']

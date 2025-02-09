@@ -65,7 +65,7 @@ class TouchArea:
         
     def __post_init__(self):
         assert self.min_touches > 1, f'{self.min_touches} > 1'
-        assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
+        # assert self.lower_bound < self.level < self.upper_bound, f'{self.lower_bound} < {self.level} < {self.upper_bound}'
         assert self.lmin < self.level < self.lmax, f'{self.lmin} < {self.level} < {self.lmax}'
         assert len(self.valid_atr) == len(self.touches), f'{len(self.valid_atr)} == {len(self.touches)}'
         assert len(self.initial_touches) == self.min_touches, f'{len(self.initial_touches)} >= {self.min_touches}'
@@ -190,6 +190,7 @@ class TouchArea:
             high, low = low, high
         return low <= self.lower_bound <= high and low <= self.upper_bound <= high # Better??? or amplifies gain or loss
         # return low <= self.level <= high
+        # return low <= self.lower_bound and self.upper_bound <= high
 
 
     def get_time_since_latest_touch(self, current_time: datetime, touches: List[datetime] = None) -> float:
@@ -381,7 +382,8 @@ class TouchAreaCollection:
         if area not in self.traded_date_areas:
             self.traded_date_areas.append(area)
             
-    def remove_areas_in_range(self, low: float, high: float, current_time: datetime, other_areas_to_remove: List[TouchArea] = None) -> Set[int]:
+    def remove_areas_in_range(self, low: float, high: float, current_time: datetime, other_areas_to_remove: List[TouchArea] = None,
+                              is_long: bool=False, filter_side: bool=False) -> Set[int]:
         """
         Remove areas whose bounds lie completely within the given price range,
         plus any additional areas specified. Only removes areas that were already active
@@ -409,7 +411,7 @@ class TouchAreaCollection:
         
         for area in self.active_date_areas:
             # Only consider removing areas that were active before current_time
-            if area.min_touches_time < current_time:
+            if area.min_touches_time < current_time and ((filter_side and is_long == area.is_long) or not filter_side):
             # if area.min_touches_time <= current_time:
                 area.update_bounds(current_time) # added, need to test
                 if area.is_within_range(low, high) or area.id in other_ids_to_remove:

@@ -8,7 +8,8 @@ import pandas as pd
 import math
 from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
-from trading_bot.TradePosition import TradePosition, export_trades_to_csv, plot_cumulative_pl_and_price, plot_trade_correlation
+from trading_bot.TradePosition import TradePosition, export_trades_to_csv
+from trading_bot.TradePositionPlotting import plot_cumulative_pl_and_price, plot_cumulative_pl_and_price_from_snapshots, plot_trade_correlation
 from trading_bot.TypedBarData import TypedBarData, PreMarketBar
 from trading_bot.VolumeProfile import VolumeProfile
 
@@ -206,6 +207,43 @@ def calculate_margin_values(use_margin: bool, is_marginable: bool, times_buying_
     return initial_margin_requirement, max_leverage, actual_margin_multiplier
 
 
+def approximate_stop_execution(position: TradePosition, quotes_agg: pd.DataFrame, prev_halfway_price: float, adjustment_factor: float = 0.6666666666666666):
+    # midpoints = (quotes_agg['bid_price_last'] + quotes_agg['ask_price_last']) / 2
+    if position.shares == 0:
+        return None
+    
+    
+    midpoints = quotes_agg['midpoint']
+    timestamps = quotes_agg.index.get_level_values('timestamp')
+    
+    if position.is_long:
+        # Find crossing or closest point below prev_halfway_price
+        pos = midpoints.searchsorted(prev_halfway_price, side='right')
+        
+        if pos < len(midpoints):  # Found crossing
+            cross_time = timestamps[pos]
+        else:
+            # Find closest point if no crossing
+            closest_idx = (midpoints - prev_halfway_price).abs().argmin()
+            cross_time = timestamps[closest_idx]
+            
+        # Selling, so subtract half spread
+        return prev_halfway_price - (quotes_agg.loc[(position.symbol, cross_time), 'spread_twap'] * adjustment_factor)
+    else:
+        # Find crossing or closest point above prev_halfway_price
+        pos = midpoints.searchsorted(prev_halfway_price, side='left')
+        
+        if pos < len(midpoints):  # Found crossing
+            cross_time = timestamps[pos]
+        else:
+            # Find closest point if no crossing
+            closest_idx = (midpoints - prev_halfway_price).abs().argmin()
+            cross_time = timestamps[closest_idx]
+            
+        # Buying, so add half spread
+        return prev_halfway_price + (quotes_agg.loc[(position.symbol, cross_time), 'spread_twap'] * adjustment_factor)
+        
+        
 @dataclass
 class TradingStrategy:
     touch_detection_areas: TouchDetectionAreas
@@ -262,13 +300,20 @@ class TradingStrategy:
     soft_end_triggered: bool = False
     touch_area_collection: TouchAreaCollection = field(init=False)
 
-    now_bar: TypedBarData = field(init=False)
+    now_bar: TypedBarData = None
+    prev_bar: TypedBarData = None
     daily_bar_objects: List[TypedBarData] = field(default_factory=list)
     prev_close: float = field(init=False)
     switch_count: int = field(init=False)
     
-    prev_accum_pl: float = field(init=False)
-    prev_accum_plpc: float = field(init=False)
+    prev_accum_pl_long: float = field(init=False)
+    prev_accum_plpc_long: float = field(init=False)
+    prev_accum_pl_short: float = field(init=False)
+    prev_accum_plpc_short: float = field(init=False)
+    
+    next_must_be_long: bool = False
+    next_must_be_short: bool = False
+    
     
     volume_profile: VolumeProfile = field(default_factory=VolumeProfile)
             
@@ -396,8 +441,8 @@ class TradingStrategy:
 
     def rebalance(self, is_simulated: bool, cash_change: float, exit_pl: Optional[float] = None, 
                 returned_borrowed: Optional[float] = None, position: Optional[TradePosition] = None):
-        if is_simulated:
-            return
+        # if is_simulated:
+        #     return
         # if not self.is_live_trading:
         old_balance = self.balance
         
@@ -412,7 +457,7 @@ class TradingStrategy:
             self.balance += cash_change
 
         if self.balance < 0:
-            self.log(f"Warning: Balance dropped below zero: {old_balance:.4f} -> {self.balance:.4f} " 
+            self.log(f"{self.now_bar.timestamp} - Warning: Balance dropped below zero: {old_balance:.4f} -> {self.balance:.4f} " 
                     f"(cash_change: {cash_change:.4f}, returned_borrowed: {returned_borrowed if returned_borrowed is not None else 0:.4f}, " 
                     f"exit_pl: {exit_pl if exit_pl is not None else 0:.4f})",
                     level=logging.WARNING)
@@ -477,8 +522,37 @@ class TradingStrategy:
         # Logic for handling position exit (similar to your original function)
         exit_quote_price = self.get_price_at_action(position.is_long, False)
         position.record_snapshot(self.now_bar, exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity)
-        self.prev_accum_pl += position.pl
-        self.prev_accum_plpc += position.plpc
+        if not position.is_simulated:
+            if position.is_long:
+                self.prev_accum_pl_long += position.pl
+                self.prev_accum_plpc_long += position.plpc
+            else:
+                self.prev_accum_pl_short += position.pl
+                self.prev_accum_plpc_short += position.plpc
+        else:
+            assert len(self.open_positions) == 1, len(self.open_positions)
+            self.balance = position.balance_before_simulation
+        
+        # total_accum = self.prev_accum_pl_long + self.prev_accum_pl_short
+        # if position.pl > 0:
+        #     if total_accum != 0:
+        #         frac = position.pl/abs(total_accum)
+        #     else:
+        #         frac = 1
+        #     if frac > 0.5:
+        #         if position.is_long:
+        #             self.next_must_be_short = True
+        #             self.next_must_be_long = False
+        #         elif not position.is_long:
+        #             self.next_must_be_short = False
+        #             self.next_must_be_long = True
+        #     else:
+        #         self.next_must_be_short = False
+        #         self.next_must_be_long = False
+        # else:
+        #     self.next_must_be_short = False
+        #     self.next_must_be_long = False
+            
         self.trades.append(position) # append position
         # self.touch_area_collection.del_open_position_area(position.area)
         self.open_positions.remove(position)
@@ -492,22 +566,42 @@ class TradingStrategy:
             low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
             high = max(position.bar_at_commit.high, self.now_bar.high)
             
-            low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
-            high = max(position.bar_at_commit.high, self.now_bar.high)
-            
             # low = min(position.bar_at_commit.close, self.now_bar.close) # For mid/losing stocks: 4th overall (worst)
             # high = max(position.bar_at_commit.close, self.now_bar.close)
+            
+            # low = position.min_close
+            # high = position.max_close
+            
+            # low = min(position.actual_entry_price, position.exit_price)
+            # high = max(position.actual_entry_price, position.exit_price)
+            
             
             # low = position.min_low # For mid/losing stocks: 2nd w/o switching, 3rd w/ switching
             # high = position.max_high
             
+            # if position.is_long:
+            #     low = position.min_low - position.position_metrics.avg_area_width * 0.25
+            #     high = position.max_high
+            # else:
+            #     low = position.min_low
+            #     high = position.max_high + position.position_metrics.avg_area_width * 0.25
+                
+            # low = position.min_low - position.position_metrics.avg_area_width * 0.1
+            # high = position.max_high + position.position_metrics.avg_area_width * 0.1
+            
+            # print('low, high',low, high)
+            
             # low = position.max_low # For mid/losing stocks: 3rd w/o switching, 2nd w/ switching
             # high = position.min_high
             
+            # if self.params.clear_traded_areas:
+            #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
+            # else:
+            #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
             if self.params.clear_traded_areas:
-                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
+                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area], is_long=position.is_long, filter_side= True)
             else:
-                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
+                position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, is_long=position.is_long, filter_side= True)
         else:
             if self.params.clear_traded_areas:
                 position.cleared_area_ids |= {position.area.id} # default
@@ -525,7 +619,7 @@ class TradingStrategy:
         for position in self.open_positions:
             price_at_action = self.get_price_at_action(position.is_long, False)
             
-            position.update_stop_price(self.now_bar, current_timestamp) # for data recording sake
+            position.update_stop_price(self.now_bar, None, current_timestamp) # for data recording sake
             
             remaining_shares = position.shares
             realized_pl, cash_released, returned_borrowed, fees_expected, qty_intended = position.partial_exit(
@@ -568,7 +662,7 @@ class TradingStrategy:
 
     def calculate_position_details(self, is_initial: bool, is_long: bool, current_price: float, times_buying_power: float, 
                                 avg_volume: float, avg_trade_count: float, volume: float,
-                                trade_count_mult: Optional[float] = 1.0, existing_shares: Optional[int] = 0, 
+                                trade_count_mult: Optional[float] = 1.0, current_cost_basis: Optional[float] = 0.0, current_shares: Optional[int] = 0, 
                                 target_shares: Optional[int] = None):
         # # Logic for calculating position details
         
@@ -586,7 +680,6 @@ class TradingStrategy:
             self.params.use_margin, self.is_marginable, times_buying_power
         )
         
-        current_shares = existing_shares
         max_trade_size_by_volume = self.params.ordersizing.calculate_max_trade_size(avg_volume)  
         
         # max_trade_size, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling = self.params.ordersizing.adjust_max_trade_size(self.current_timestamp, max_trade_size_by_volume, self.now_quotes_raw, self.now_quotes_agg, is_long, 
@@ -594,8 +687,11 @@ class TradingStrategy:
         #                                                                 # self.now_time - self.lookback_before_latest_quote, self.now_time)
         max_trade_size, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling = max_trade_size_by_volume, 1, 1, 1, 1, 1
         
-        # Adjust available balance based on current position
-        available_balance = np.clip(min(self.balance, self.params.max_investment), 0, None) # * actual_margin_multiplier
+        # # Adjust available balance based on current position
+        # available_balance = np.clip(min(self.balance, self.params.max_investment), 0, None) # * actual_margin_multiplier
+        
+        # adjust MAX POSITION SIZE by volume, not just trade size
+        available_balance = np.clip(min(self.balance + current_cost_basis, self.params.max_investment), 0, None)
 
         # Calculate max additional shares based on available balance
         max_additional_shares_by_balance = math.floor(available_balance / current_price)
@@ -656,7 +752,8 @@ class TradingStrategy:
         return total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement
 
 
-    def calculate_exit_details(self, is_long: bool, times_buying_power: float, shares_to_exit: int, volume: float, avg_volume: float, avg_trade_count: float, trade_count_mult: Optional[float] = 1.0):
+    def calculate_exit_details(self, position: TradePosition, current_price: float, times_buying_power: float, shares_to_exit: int, volume: float, 
+                               avg_volume: float, avg_trade_count: float, trade_count_mult: Optional[float] = 1.0, limit_size_by_volume: Optional[bool] = False):
         assert shares_to_exit > 0
 
         # # TODO: make sure now_quotes_raw is filtered to before cutoff
@@ -673,7 +770,20 @@ class TradingStrategy:
         #                                                                 self.latest_quote_time - self.lookback_before_latest_quote, self.now_time)
         #                                                                 # self.now_time - self.lookback_before_latest_quote, self.now_time)
         max_trade_size, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling = max_trade_size_by_volume, 1, 1, 1, 1, 1
-        shares_change = np.clip(shares_to_exit, 0, max_trade_size)
+        if limit_size_by_volume:
+            shares_change = np.clip(shares_to_exit, 0, max_trade_size)
+        else:
+            shares_change = np.clip(shares_to_exit, 0, None)
+            
+            
+        # if shares_to_exit == position.shares and shares_change < shares_to_exit:
+        #     print(position.failed_full_exit_count + 1)
+
+        # # Adjust available balance based on current position
+        # available_balance = self.balance + position.cost_basis
+
+        # # Calculate max additional shares based on available balance
+        # max_additional_shares_by_balance = math.floor(available_balance / current_price)
         
         if max_trade_size != max_trade_size_by_volume:
             self.max_trade_sizes_adjust.append(max_trade_size_by_volume - max_trade_size)
@@ -692,7 +802,7 @@ class TradingStrategy:
         self.max_trade_sizes.append(max_trade_size)
         self.rescale_exit_sizes.append(shares_change)
         
-        return shares_change
+        return shares_change #, max_additional_shares_by_balance # use for scaling
     
     
     def create_new_position(self, area: TouchArea, current_timestamp: datetime, is_retry: bool = False, pending_orders_filtered: List[IntendedOrder] = []) -> List[IntendedOrder]:
@@ -704,6 +814,9 @@ class TradingStrategy:
         
         # assert not area.is_side_switched
         area.update_bounds(current_timestamp)
+        
+        # if self.now_bar.volume < self.now_bar.avg_volume:
+        #     return NO_POSITION_OPENED
 
         # Check if the stop buy would have executed based on high/low.
         if area.is_long:
@@ -818,8 +931,8 @@ class TradingStrategy:
             
             log_level=self.log_level,
             
-            prev_accum_pl=self.prev_accum_pl,
-            prev_accum_plpc=self.prev_accum_plpc,
+            prev_accum_pl=self.prev_accum_pl_long if area.is_long else self.prev_accum_pl_short,
+            prev_accum_plpc=self.prev_accum_plpc_long if area.is_long else self.prev_accum_plpc_short,
             
             
             
@@ -836,11 +949,16 @@ class TradingStrategy:
             # TODO: consider using high prices and low prices determined by macro quotes data, thus affecting initial current_stop_price, max_close, and min_close.
 
         )
-    
-        if (area.is_long and self.params.do_longs) or (not area.is_long and self.params.do_shorts and self.is_etb):  # if conditions not met, simulate position only.
+        
+        if (area.is_long and self.params.do_longs and not self.stop_trading_longs) or \
+            (not area.is_long and self.params.do_shorts and self.is_etb and not self.stop_trading_shorts):  # if conditions not met, simulate position only.
+        # if (area.is_long and self.params.do_longs) or \
+        #     (not area.is_long and self.params.do_shorts and self.is_etb):  # if conditions not met, simulate position only.
             position.is_simulated = False
+            position.balance_before_simulation = None
         else:
             position.is_simulated = True
+            position.balance_before_simulation = self.balance
 
             
         # if self.now_bar.rsi_divergence >= 0 or self.now_bar.mfi_divergence >= 0:
@@ -947,6 +1065,7 @@ class TradingStrategy:
         orders = []
         
         for position in self.open_positions:
+            position.area.update_bounds(current_timestamp)
             price_at_action = None
             
             # OHLC logic for trailing stops
@@ -981,7 +1100,7 @@ class TradingStrategy:
                 
             
                 should_exit_early, should_exit, should_exit_2, should_have_exited_halfway, should_have_exited, should_have_exited_2, prev_halfway_price, prev_stop_price, prev_stop_price_2 = \
-                    position.update_stop_price(self.now_bar, current_timestamp, 
+                    position.update_stop_price(self.now_bar, self.prev_bar, current_timestamp, 
                                                exit_quote_price, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity) # NOTE: continue using bar price here
                 # target_shares = self.calculate_target_shares(position, self.now_bar.close) # NOTE: continue using bar price here
                 target_shares = position.max_target_shares_limit or 0  # works better
@@ -991,7 +1110,10 @@ class TradingStrategy:
                 
                 # should_exit_early = False # original functionality
                 # should_exit = should_exit_early or should_exit # bad
-                should_exit = should_exit_early # can exit early and dont hold. best?
+                # should_exit = should_exit_early # can exit early and dont hold. best?
+                if not position.has_exited:
+                # if position.has_entered and not position.has_exited:
+                    should_exit = should_exit_early # can exit early and dont hold. best?
                     
                 # if should_exit_early:
                 #     should_exit = True # can exit early and dont hold
@@ -1009,11 +1131,20 @@ class TradingStrategy:
                 # should_have_exited = self.wick_reached_avg_entry_price(should_exit_price)
                 
                 
-                if should_have_exited_halfway: 
+                if prev_halfway_price and should_have_exited_halfway: 
+                    
+                    
+                    
                     target_shares = 0
-                    price_at_action = prev_halfway_price
-                
-                
+                    # price_at_action = prev_halfway_price
+                    price_at_action = approximate_stop_execution(position, self.now_quotes_agg, prev_halfway_price)
+                    
+                    if position.has_entered and not position.has_exited:
+                        position.exited_from_stop_order = True
+                    
+                    price_at_action_alt = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
+                    if price_at_action:
+                        self.log(f'Wick crossed STOP ORDER TRIGGER {prev_halfway_price:.4f}, exec {price_at_action:.4f} instead of {price_at_action_alt:.4f}',level=logging.INFO)
                     
                 # # print(target_shares, position.max_shares, should_exit)
                 # elif should_exit:
@@ -1022,10 +1153,14 @@ class TradingStrategy:
                 if not price_at_action and (should_exit_early or should_exit or position.has_exited or target_shares == 0):
                 # if not price_at_action and (should_exit or position.has_exited or target_shares == 0):
 
+                    if position.has_entered and not position.has_exited:
+                        position.exited_from_stop_order = False
                     
                     # assert target_shares == 0, target_shares
                     target_shares = 0
                     price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
+                    if price_at_action:
+                        self.log(f'Close crossed {position.halfway_price:.4f}, exec {price_at_action:.4f}',level=logging.INFO)
                     
                     # if using stop market order safeguard, use this:
                     # price_at_action = position.current_stop_price_2 if should_exit_2 else self.now_bar.close
@@ -1048,10 +1183,10 @@ class TradingStrategy:
             # position.update_market_value(price_at_action)
             
             
-            
-            
-            
-            
+            if position.has_exited:
+                assert target_shares == 0, target_shares
+                assert position.shares == 0, position.shares
+
             # Partial exit and entry logic
             assert target_shares <= position.max_shares, (target_shares, position.max_shares)
 
@@ -1071,16 +1206,30 @@ class TradingStrategy:
             # if target_shares < position.shares and target_shares == 0: # NOTE: if not decreasing until stop price reached
                 shares_to_adjust = position.shares - target_shares
                 if shares_to_adjust > 0:
+                    
+                    if should_have_exited_halfway:
+                        shares_change = self.calculate_exit_details(
+                            position,
+                            price_at_action,  # Previous bar's halfway price 
+                            position.times_buying_power,
+                            shares_to_adjust,  # Full position size (based on stop order modified AFTER previous transaction)
+                            self.prev_bar.volume,
+                            self.prev_bar.avg_volume,  # Previous bar's average volume
+                            self.prev_bar.avg_trade_count
+                        )
+                    else:
+                        shares_change = self.calculate_exit_details( # , max_trade_size
+                            position,
+                            price_at_action,
+                            position.times_buying_power,
+                            shares_to_adjust,
+                            self.now_bar.volume,
+                            self.now_bar.avg_volume,
+                            self.now_bar.avg_trade_count,
+                            # trade_count_mult=(shares_to_adjust / position.max_shares)
+                        )
 
-                    shares_change = self.calculate_exit_details(
-                        position.is_long,
-                        position.times_buying_power,
-                        shares_to_adjust,
-                        self.now_bar.volume,
-                        self.now_bar.avg_volume,
-                        self.now_bar.avg_trade_count,
-                        # trade_count_mult=(shares_to_adjust / position.max_shares)
-                    )
+                    # position.set_max_shares(max_trade_size, self.now_bar, current_timestamp)
                     
                     if shares_change > 0:
                         realized_pl, cash_released, returned_borrowed, fees_expected, qty_intended = position.partial_exit(
@@ -1094,6 +1243,10 @@ class TradingStrategy:
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
                         
+                        
+                        # if target_shares == 0:
+                        #     assert position.shares == 0, (temp, shares_to_adjust, shares_change, position.shares)
+                        
                         orders.append(IntendedOrder(
                             action = 'close' if position.shares == 0 else 'partial_exit',
                             side = OrderSide.SELL if position.is_long else OrderSide.BUY,
@@ -1104,8 +1257,24 @@ class TradingStrategy:
                             fees = fees_expected
                         ))
                         if position.shares == 0:
+                            # if self.current_date.year == 2024 and self.current_date.month == 12 and self.current_date.day == 4:
+                            #     self.log(f'{position.id} {current_timestamp} EXIT',level=logging.WARNING)
                             assert len(position.transactions) > 0, len(position.transactions) # should not exit if committed to area with 0 shares
                             perform_exit(position, price_at_action, should_exit)
+                            
+                            # if position.failed_full_exit_count > 0:
+                            #     print(position.date, position.id, position.holding_time_minutes_at_bar(current_timestamp), position.failed_full_exit_count, target_shares, position.shares, position.bar_at_entry.avg_volume, self.now_bar.avg_volume)
+                            
+                            
+                        elif target_shares == 0 and target_shares != position.shares:
+                            assert not position.has_exited
+                            assert shares_to_adjust != shares_change
+                            
+                            position.failed_full_exit_count += 1
+                            # position.max_target_shares_limit = position.shares
+                            
+                           
+                            
 
                         if shares_change < shares_to_adjust:
 
@@ -1114,16 +1283,21 @@ class TradingStrategy:
                         self.count_exit_skip += 1
                         
             elif target_shares > position.shares:
+                
+                # if position.failed_full_exit_count > 0:
+                #     print(position.date, position.id, position.holding_time_minutes_at_bar(current_timestamp), position.failed_full_exit_count, target_shares, position.shares, position.bar_at_entry.avg_volume, self.now_bar.avg_volume)
+                
             # elif target_shares > position.shares and not position.has_crossed_full_entry: # NOTE: if stop increasing after reaching full entry
                 shares_to_adjust = target_shares - position.shares
                 if shares_to_adjust > 0:
 
-                    existing_shares = position.shares
                     total_shares, actual_margin_multiplier, initial_margin_requirement, estimated_entry_cost, actual_cash_used, shares_change, invest_amount, min_price_movement = self.calculate_position_details(
                         False, position.area.is_long, price_at_action, position.times_buying_power, self.now_bar.avg_volume, self.now_bar.avg_trade_count, self.now_bar.volume,
                         # trade_count_mult=(shares_to_adjust / position.max_shares), 
-                        existing_shares=existing_shares, target_shares=target_shares
+                        current_cost_basis=position.cost_basis, current_shares=position.shares, target_shares=target_shares
                     )
+                    
+                    # position.set_max_shares(total_shares, self.now_bar, current_timestamp)
                     
                     shares_to_buy = min(shares_to_adjust, shares_change)
                     
@@ -1156,16 +1330,16 @@ class TradingStrategy:
                                 fees = fees_expected
                             ))
                             
-                            position.increase_max_shares(position.shares) # Entry possible. Increase max_shares.
+                            position.increase_max_shares(position.shares, self.now_bar, current_timestamp) # Entry possible. Increase max_shares.
                             assert position.shares == total_shares, (position.shares, total_shares)
                             
                         else:
-                            position.increase_max_shares(position.shares + shares_to_buy) # Entry possible but soft end triggered. Increase max_shares regardless.
+                            position.increase_max_shares(position.shares + shares_to_buy, self.now_bar, current_timestamp) # Entry possible but soft end triggered. Increase max_shares regardless.
                             assert position.shares + shares_to_buy == total_shares, (position.shares, shares_to_buy, total_shares)
       
                     else:
                         self.count_entry_skip += 1
-                        position.decrease_max_shares(position.shares) # Entry not possible. Decrease max_shares.
+                        position.decrease_max_shares(position.shares, self.now_bar, current_timestamp) # Entry not possible. Decrease max_shares.
                         
             elif should_exit: # exiting committed area if close price never passed buy price
                 assert target_shares == position.shares == 0, (target_shares, position.shares)
@@ -1218,13 +1392,25 @@ class TradingStrategy:
     def handle_new_trading_day(self, current_timestamp):
         # self.log(f"handle_new_trading_day start", level=logging.INFO)
         self.current_date = current_timestamp.date()
+        self.next_must_be_short = False
+        self.next_must_be_long = False
+        # if self.current_date.year == 2024 and self.current_date.month == 12 and self.current_date.day == 4 and self.touch_detection_areas.symbol == 'MARA':
+        # # if self.current_date.year == 2025 and self.current_date.month == 1 and self.current_date.day == 17 and self.touch_detection_areas.symbol == 'MARA':
+        #     self.log_level = logging.DEBUG
+        #     self.logger = self.setup_logger(self.log_level)
+        # else:
+        #     self.log_level = logging.WARNING
+        #     self.logger = self.setup_logger(self.log_level)
+        
         self.update_daily_parameters(self.current_date)
         self.next_position_id = 0
         self.soft_end_triggered = False
         self.log(f"Starting balance on {self.current_date}: {self.balance}", level=logging.INFO)
         
-        self.prev_accum_pl = 0.0
-        self.prev_accum_plpc = 0.0
+        self.prev_accum_pl_long = 0.0
+        self.prev_accum_pl_short = 0.0
+        self.prev_accum_plpc_long = 0.0
+        self.prev_accum_plpc_short = 0.0
         
         # Process pre-market data for both live and backtest
         start_date = pd.Timestamp(self.current_date, tz=ny_tz)
@@ -1263,6 +1449,8 @@ class TradingStrategy:
             self.daily_quotes_agg, self.daily_quotes_agg_indices = self.get_quote_indices(
                 self.touch_detection_areas.quotes_agg, daily_bars_minutes, seconds_offset = -59
             )
+            
+            self.daily_quotes_agg['midpoint'] = (self.daily_quotes_agg['bid_price_last'] + self.daily_quotes_agg['ask_price_last']) / 2
             assert not self.open_positions, self.open_positions # intraday only. should not have any open positions held overnight from previous day
 
         # Initialize volume profile with pre-market and current intraday data
@@ -1407,6 +1595,7 @@ class TradingStrategy:
             if self.daily_bars.empty or len(self.daily_bars) < 2: 
                 continue
             
+            self.prev_bar = self.now_bar
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
             self.daily_bar_objects.append(self.now_bar)
             self.volume_profile.update_profile(self.now_bar)
@@ -1426,12 +1615,17 @@ class TradingStrategy:
             self.now_quotes_agg = self.get_quotes_agg(current_timestamp)
             self.now_quotes_raw = self.get_quotes_raw(current_timestamp)
             
+            # print(self.now_bar.timestamp)
+            # print(self.now_quotes_agg.index)
+            # print(self.now_quotes_raw.index)
+            # break
+            
             # print(self.now_bid_price, self.now_ask_price, self.now_bar.close)
 
             # print(current_timestamp)
             # print(self.now_bar)
-            if self.now_quotes_raw is not None and not self.now_quotes_raw.empty:
-                self.log(f"{self.now_quotes_raw.index.get_level_values('timestamp')[-1]}")
+            # if self.now_quotes_raw is not None and not self.now_quotes_raw.empty:
+            #     self.log(f"{self.now_quotes_raw.index.get_level_values('timestamp')[-1]}")
             # print(self.now_quotes_agg.index.get_level_values('timestamp'))
             # print()
 
@@ -1448,7 +1642,8 @@ class TradingStrategy:
                 
                 self.touch_area_collection.reset_active_areas(current_timestamp)
                 update_orders, _ = self.update_positions(current_timestamp)
-                
+                # for position in self.open_positions:
+                #     self.log(f"Holding {position.shares}/{position.max_shares} {(position.shares/position.max_shares)*100:.1f}%",level=logging.INFO)
                 new_position_order = []
                 if not self.soft_end_triggered:
                     new_position_order = self.process_active_areas(current_timestamp, update_orders)
@@ -1482,7 +1677,7 @@ class TradingStrategy:
                 self.log(f"    market value ${self.total_market_value:.4f}, margin used ${self.margin_used:.4f}, buying power ${self.buying_power:.4f}", level=logging.INFO)
                 for a in all_orders:
                     peak = a.position.max_close if a.position.is_long else a.position.min_close
-                    self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}", 
+                    self.log(f"       {a.position.id} {a.action} {str(a.side).split('.')[1]} {int(a.qty)} * {a.price}, peak-stop {peak:.4f}-{a.position.current_stop_price:.4f}, {a.position.area}\n", 
                          level=logging.INFO)
                     
             if self.should_close_all_positions(current_timestamp, self.day_end_time, i) and self.day_accrued_fees != 0:
@@ -1536,6 +1731,7 @@ class TradingStrategy:
             
             assert self.daily_bars_index == len(self.daily_bars)-1
             
+            self.prev_bar = self.now_bar
             self.now_bar = TypedBarData.from_row(self.daily_bars.iloc[self.daily_bars_index])
             self.daily_bar_objects.append(self.now_bar)
             self.volume_profile.update_profile(self.now_bar)
@@ -1616,6 +1812,8 @@ class TradingStrategy:
                     if position.area.id in area_ids_to_side_switch:
                         self.touch_area_collection.switch_side(position.area) # TODO: account for area.bar_at_switch
                         # position.area.switch_side() # TODO: test if this does the same thing
+                        
+                
                     
                         
                 all_orders, positions_to_remove2 = self.close_all_positions(current_timestamp, None, self.now_bar.vwap, 
@@ -1681,7 +1879,40 @@ class TradingStrategy:
         
         return day_start_time, day_end_time, day_soft_start_time
 
+    @property
+    def stop_trading_longs(self):
+        # if self.prev_accum_pl_long > 250:
+        #     return True
+        # if self.prev_accum_pl_long < -25:
+        #     return True
+        # if self.prev_accum_pl_long + self.prev_accum_pl_short > 200:
+        #     return True
+        # if min(self.prev_accum_pl_long, self.prev_accum_pl_short) < -100:
+        #     return True
+        return False
+    
+    @property
+    def stop_trading_shorts(self):
+        # if self.prev_accum_pl_short > 250:
+        #     return True
+        # if self.prev_accum_pl_short < -25:
+        #     return True
+        # if self.prev_accum_pl_long + self.prev_accum_pl_short > 200:
+        #     return True
+        # if min(self.prev_accum_pl_long, self.prev_accum_pl_short) < -100:
+        #     return True
+        return False
+    
+    
     def is_trading_time(self, current_timestamp: datetime, day_soft_start_time: datetime, day_end_time: datetime, daily_bars_index, daily_bars, i):
+        # if self.prev_accum_pl_long > 200 and self.prev_accum_pl_short > 200:
+        #     return False
+        # if self.prev_accum_pl_long < -100 and self.prev_accum_pl_short < -100:
+        #     return False
+        
+        # if self.stop_trading_longs and self.stop_trading_shorts:
+        #     return False
+        
         if self.is_live_trading:
             return day_soft_start_time <= current_timestamp < day_end_time
         else:
@@ -1701,6 +1932,9 @@ class TradingStrategy:
         # if pending_orders:
         #     return []
         
+        # stop_trading_longs = self.stop_trading_longs
+        # stop_trading_shorts = self.stop_trading_shorts
+        
         assert len(pending_orders) <= 1, len(pending_orders)
         pending_long_close = any([a.action == 'close' and a.position.is_long and len(a.position.transactions) > 0 for a in pending_orders])
         pending_short_close = any([a.action == 'close' and not a.position.is_long and len(a.position.transactions) > 0 for a in pending_orders])
@@ -1709,10 +1943,19 @@ class TradingStrategy:
             if area.min_touches_time is None or area.min_touches_time > current_timestamp:
                 continue
             
+
             if self.balance <= 0:
                 break
             if self.open_positions:  # ensure only 1 live position at a time
                 break
+            
+            if (not area.is_long and self.next_must_be_long) or (area.is_long and self.next_must_be_short):
+                continue
+            
+            # if (area.is_long and stop_trading_longs) or (not area.is_long and stop_trading_shorts):
+            #     continue 
+            
+            
             if ((area.is_long and (self.params.do_longs or self.params.sim_longs)) or 
                 (not area.is_long and (self.params.do_shorts or self.params.sim_shorts))):
                 
@@ -1897,14 +2140,21 @@ class TradingStrategy:
         # for trade in self.trades:
         #     print(trade.id, [a.bar_latest.close for a in trade.transactions])
         
+        print(f"{buying_power_change:,.2f}%\t"+f"{win_trades / len(trades) * 100:.4f}%" if trades else "N/A")
+        # print(f"prev_accum_pl_long {self.prev_accum_pl_long}, prev_accum_pl_short {self.prev_accum_pl_short}")
+            
+        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+                                     use_plpc=False)
+        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+                                        use_plpc=True)
+        
 
-        # plot_cumulative_pl_and_price(self.trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path)
         plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
                                      use_plpc=False)
-        if not self.export_graph_path:
-            plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
                                         use_plpc=True)
-
+        
+        
         # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \
         #     win_trades / len(self.trades) * 100,  \
         #     total_transaction_costs, avg_transact, self.count_entry_adjust, self.count_entry_skip, self.count_exit_adjust, self.count_exit_skip
@@ -1963,7 +2213,12 @@ class TradingStrategy:
         #     #                     title=f'{field} at Entry vs best_price_diff_body',split_sides=True,
         #     #                     color_field='plpc', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
             
-            
+        plot_trade_correlation(trades, x_field='actual_entry_time', y_field='position_metrics.best_price_diff_body',
+                            figsize=(8,7), x_label='actual_entry_time', y_label='best_price_diff_body %',
+                            binwidth_x=15, binwidth_y=0.2,
+                            title='actual_entry_time vs best_price_diff_body %',split_sides=True,
+                            color_field='pl', is_trinary=False, y_divisor_field='position_metrics.reference_price_norm')
+        
         plot_trade_correlation(trades, x_field='exit_time', y_field='position_metrics.best_price_diff_body',
                             figsize=(8,7), x_label='exit_time', y_label='best_price_diff_body %',
                             binwidth_x=15, binwidth_y=0.2,

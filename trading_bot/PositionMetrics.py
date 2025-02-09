@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union, Tuple
 import numpy as np
 from trading_bot.TypedBarData import TypedBarData
-
+from bisect import bisect_right
 
 @dataclass
 class PositionSnapshot:
@@ -34,6 +34,14 @@ class PositionSnapshot:
     
     has_entered: bool
     has_exited: bool
+    
+    position_vwap_dist: Optional[float] = np.nan
+    position_vwap: Optional[float] = np.nan
+    position_vwap_std: Optional[float] = np.nan
+    
+    vwap_std_close: Optional[float] = np.nan
+    vwap_std_high: Optional[float] = np.nan
+    vwap_std_low: Optional[float] = np.nan
 
     @property
     def is_profitable(self) -> bool:
@@ -54,12 +62,17 @@ class PositionSnapshot:
             return self.bar.high > self.area_buy_price  # Still use area_buy_price here
         return self.bar.low < self.area_buy_price  # Still use area_buy_price here
     
+    def running_plpc_with_accum(self, cost_basis_sold_accum) -> float:
+        if cost_basis_sold_accum <= 0:
+            return 0.0
+        return (self.running_pl / cost_basis_sold_accum) * 100
 
 class PositionMetrics:
     """Manages position metrics over time."""
-    def __init__(self, is_long: bool, prior_relevant_bars: List[TypedBarData] = []):
+    def __init__(self, is_long: bool, norm_strategy: str = 'price', prior_relevant_bars: List[TypedBarData] = []):
         self.snapshots: List[PositionSnapshot] = []
         self.is_long = is_long
+        self.norm_strategy = norm_strategy # 'r','price', or neither for no normalization
         
         self.prior_relevant_bars: List[TypedBarData] = prior_relevant_bars
         
@@ -115,13 +128,20 @@ class PositionMetrics:
         # VWAP tracking from entry
         self.cumulative_volume_since_entry: float = 0.0
         self.cumulative_vwap_volume_since_entry: float = 0.0
-        self.position_vwap: Optional[float] = None
-        self.best_vwap_dist: float = float('-inf')
-        self.worst_vwap_dist: float = float('inf')
-        self.best_vwap_dist_time: Optional[int] = None
-        self.worst_vwap_dist_time: Optional[int] = None
-        self.vwap_dist_list: List[float] = []
-        
+        self.best_vwap_std_close: float = float('-inf')
+        self.worst_vwap_std_close: float = float('inf')
+        self.best_vwap_std_close_time: Optional[int] = None
+        self.worst_vwap_std_close_time: Optional[int] = None
+
+
+    @property
+    def snapshot_at_entry(self) -> PositionSnapshot | None:
+        if self.entry_snapshot_index is not None:
+            return self.snapshots[self.entry_snapshot_index]
+    @property
+    def snapshot_at_exit(self) -> PositionSnapshot | None:
+        if self.exit_snapshot_index is not None:
+            return self.snapshots[self.exit_snapshot_index]
         
 
     def finalize_metrics(self):
@@ -133,14 +153,15 @@ class PositionMetrics:
             if not isinstance(value, (int, float)):
                 continue
             # Check if value is nan or inf
-            if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
-                setattr(self, attr_name, 0.0)
+            if isinstance(value, float) and np.isinf(value):
+                setattr(self, attr_name, np.nan)
             
     @property
     def reference_area_width(self) -> float:
         """Get R unit based on position state."""
         if not self.snapshots:
             return float('inf')
+        # return self.snapshots[0].area_width
         if self.entry_snapshot_index is not None:
             # Use width at entry for entered positions
             return self.snapshots[self.entry_snapshot_index].area_width
@@ -152,26 +173,14 @@ class PositionMetrics:
             # For unentered positions, use first width
             return self.snapshots[0].area_width
         
-        # return self.snapshots[0].area_width
+
             
     @property 
     def reference_price(self) -> float:
         """Get reference price based on position state."""
         if not self.snapshots:
             return float('inf')
-        # if self.entry_snapshot_index is not None:
-        #     # Use area_buy_price at entry for entered positions
-        #     return self.snapshots[self.entry_snapshot_index].area_buy_price
-        # else:
-        #     # # For unentered positions, use area_buy_price at best price
-        #     # best_idx = self._get_best_price_index()
-        #     # return self.snapshots[best_idx].area_buy_price if best_idx is not None else 0.0
-            
-        #     # For unentered positions, use first area_buy_price
-        #     return self.snapshots[0].area_buy_price
-        
         # return self.snapshots[0].area_buy_price
-        
         if self.entry_snapshot_index is not None:
             # Use area_buy_price at entry for entered positions
             return self.snapshots[self.entry_snapshot_index].bar.close
@@ -198,15 +207,23 @@ class PositionMetrics:
             wick_pl: Expected P&L if exited at best price (including prev P&L)
             wick_plpc: Expected P&L% if exited at best price (including prev P&L)
         """
-        self.snapshots.append(snapshot)
-        minute = self.num_snapshots - 1
-            
+        minute = self.num_snapshots # +1
         # Track first entry
         if snapshot.has_entered and self.entry_snapshot_index is None:
-            self.entry_snapshot_index = self.num_snapshots - 1
+            self.entry_snapshot_index = minute
+            assert snapshot.running_pl == 0, snapshot.running_pl
+            assert snapshot.running_plpc == 0, snapshot.running_plpc
             
         if snapshot.has_exited and self.exit_snapshot_index is None:
-            self.exit_snapshot_index = self.num_snapshots - 1
+            self.exit_snapshot_index = minute
+        
+        if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
+            # Calculate high/low std values BEFORE appending current snapshot
+            snapshot.vwap_std_high, snapshot.vwap_std_low = self.calculate_std_value(snapshot.bar.high, snapshot.bar.low)
+            # print(snapshot.bar.timestamp, minute - self.entry_snapshot_index, snapshot.vwap_std_high, snapshot.vwap_std_low)
+        
+        self.snapshots.append(snapshot)
+        assert minute == self.num_snapshots - 1
             
         # Track first pospl minute
         if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
@@ -222,77 +239,100 @@ class PositionMetrics:
                 if self.first_negpl_time is None:
                     self.first_negpl_time = held_time
                 self.last_negpl_time = held_time
-                    
+                
             self.cumulative_volume_since_entry += snapshot.bar.volume
             self.cumulative_vwap_volume_since_entry += snapshot.bar.vwap * snapshot.bar.volume
-            self.position_vwap = (self.cumulative_vwap_volume_since_entry / 
-                                self.cumulative_volume_since_entry if self.cumulative_volume_since_entry > 0 else None)
+            snapshot.position_vwap = (self.cumulative_vwap_volume_since_entry / 
+                                self.cumulative_volume_since_entry if self.cumulative_volume_since_entry > 0 else np.nan)
             
-            if self.position_vwap is not None:
-                # Calculate price differences vs VWAP similar to other metrics
-                if self.is_long:
-                    vwap_dist = snapshot.bar.close - self.position_vwap
-                else:
-                    vwap_dist = self.position_vwap - snapshot.bar.close
-                    
-                self.vwap_dist_list.append(vwap_dist)
-                    
-                if vwap_dist > self.best_vwap_dist:
-                    self.best_vwap_dist = vwap_dist
-                    self.best_vwap_dist_time = minute
-                if vwap_dist < self.worst_vwap_dist:
-                    self.worst_vwap_dist = vwap_dist
-                    self.worst_vwap_dist_time = minute
+            snapshot.position_vwap_std = self.vwap_std
+            
+            # Calculate price differences vs VWAP similar to other metrics
+            assert np.isfinite(snapshot.position_vwap), snapshot.position_vwap
+            
+            # Calculate close std AFTER appending (since we want current bar included)
+            snapshot.vwap_std_close = self.calculate_std_value(snapshot.bar.close)
+            # print('                           ',snapshot.vwap_std_close)
                 
+            if self.is_long:
+                vwap_dist = snapshot.bar.close - snapshot.position_vwap
+            else:
+                vwap_dist = snapshot.position_vwap - snapshot.bar.close
+            snapshot.position_vwap_dist = vwap_dist
+            
+            # Using the std value (already calculated earlier)
+            if snapshot.vwap_std_close > self.best_vwap_std_close:  # rename these fields too
+                self.best_vwap_std_close = snapshot.vwap_std_close
+                self.best_vwap_std_close_time = minute
+            if snapshot.vwap_std_close < self.worst_vwap_std_close:
+                self.worst_vwap_std_close = snapshot.vwap_std_close
+                self.worst_vwap_std_close_time = minute
+                
+            # 2/1 TODO: probably need for wick too?
+            # 2/1 TODO: upload file again to claude with naming changes
+            
+            
                 
         # Update share peaks (do this for all snapshots)
         if snapshot.shares > self.max_shares_reached:
+            assert self.entry_snapshot_index is not None
             self.max_shares_reached = snapshot.shares
             self.max_shares_reached_pct = round(100*snapshot.shares / snapshot.max_shares, 2)
             self.max_shares_reached_time = minute
-
-        
-        # Update area width extremes - do this for all snapshots
-        self.area_width_min = min(self.area_width_min, snapshot.area_width)
-        self.area_width_max = max(self.area_width_max, snapshot.area_width)
-        
-        # Skip remaining calculations for first bar
-        if self.num_snapshots == 1:
-            return
-        
-        # Get reference price for this snapshot's updates
-        ref_price = self.reference_price
             
-        # Calculate price differences based on position direction
-        if self.is_long:
-            price_diff_body = snapshot.bar.close - ref_price
-            price_diff_wick_high = snapshot.bar.high - ref_price
-            price_diff_wick_low = snapshot.bar.low - ref_price
-        else:
-            price_diff_body = ref_price - snapshot.bar.close
-            price_diff_wick_high = ref_price - snapshot.bar.low  # Best for shorts 
-            price_diff_wick_low = ref_price - snapshot.bar.high  # Worst for shorts
-                
-        # Update best/worst price differences with timing
-        if price_diff_body > self.best_price_diff_body:
-            self.best_price_diff_body = price_diff_body
-            self.best_price_diff_body_time = minute
-        if price_diff_body < self.worst_price_diff_body:
-            self.worst_price_diff_body = price_diff_body
-            self.worst_price_diff_body_time = minute
+        # record area width peaks anytime <= exit
+        if self.exit_snapshot_index is None or self.exit_snapshot_index == minute:
+            # Update area width extremes - do this for all snapshots
+            self.area_width_min = min(self.area_width_min, snapshot.area_width)
+            self.area_width_max = max(self.area_width_max, snapshot.area_width)
             
-        if price_diff_wick_high > self.best_price_diff_wick:
-            self.best_price_diff_wick = price_diff_wick_high
-            self.best_price_diff_wick_time = minute
-        if price_diff_wick_low < self.worst_price_diff_wick:
-            self.worst_price_diff_wick = price_diff_wick_low
-            self.worst_price_diff_wick_time = minute
+            
+        # # Skip remaining calculations for first bar
+        # if self.num_snapshots == 1:
+        #     return
         
-        # Update net price diff
-        self.net_price_diff_body = price_diff_body
+        # record price diffs anytime <= exit
+        if self.num_snapshots > 1 and self.exit_snapshot_index is None or self.exit_snapshot_index == minute:
+            # Get reference price for this snapshot's updates
+            ref_price = self.reference_price
+            # Calculate price differences based on position direction
+            if self.is_long:
+                price_diff_body = snapshot.bar.close - ref_price
+                price_diff_wick_high = snapshot.bar.high - ref_price
+                price_diff_wick_low = snapshot.bar.low - ref_price
+            else:
+                price_diff_body = ref_price - snapshot.bar.close
+                price_diff_wick_high = ref_price - snapshot.bar.low  # Best for shorts 
+                price_diff_wick_low = ref_price - snapshot.bar.high  # Worst for shorts
                     
-        # Only update P&L peaks if we had trades
-        if snapshot.avg_entry_price is not None:
+            # Update best/worst price differences with timing
+            if price_diff_body > self.best_price_diff_body:
+                self.best_price_diff_body = price_diff_body
+                self.best_price_diff_body_time = minute
+            if price_diff_body < self.worst_price_diff_body:
+                self.worst_price_diff_body = price_diff_body
+                self.worst_price_diff_body_time = minute
+                
+            if price_diff_wick_high > self.best_price_diff_wick:
+                self.best_price_diff_wick = price_diff_wick_high
+                self.best_price_diff_wick_time = minute
+            if price_diff_wick_low < self.worst_price_diff_wick:
+                self.worst_price_diff_wick = price_diff_wick_low
+                self.worst_price_diff_wick_time = minute
+            
+            # Update net price diff
+            self.net_price_diff_body = price_diff_body
+            
+            
+                    
+        # Only update P&L peaks after entry, not at entry
+        if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
+            assert snapshot.avg_entry_price is not None
+            # self.entry_snapshot_index != minute and 
+            # assert self.num_snapshots > 1, self.num_snapshots
+            
+           
+            
             # Body metrics based on actual closing price
             if snapshot.running_pl > self.max_pl_body:
                 self.max_pl_body = snapshot.running_pl
@@ -305,9 +345,13 @@ class PositionMetrics:
             if snapshot.running_plpc > self.max_plpc_body:
                 self.max_plpc_body = snapshot.running_plpc
                 self.max_plpc_body_time = minute
+                # print(snapshot.timestamp,'> max:', minute, self.max_plpc_body)
+                
+                
             if snapshot.running_plpc < self.min_plpc_body:
                 self.min_plpc_body = snapshot.running_plpc
                 self.min_plpc_body_time = minute
+                # print(snapshot.timestamp,'< min:', minute, self.min_plpc_body)
                 
             # Wick metrics using both best and worst cases
             if best_wick_pl > self.max_pl_wick:
@@ -407,26 +451,232 @@ class PositionMetrics:
         
     @property
     def avg_vwap_dist(self) -> float:
-        if not self.vwap_dist_list:
-            return 0.0
-        return np.mean(self.vwap_dist_list)
+        return np.mean([a.position_vwap_dist for a in self.snapshots if np.isfinite(a.position_vwap_dist)])
+    
+    @property
+    def avg_vwap_std(self) -> float:
+        return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)])
     
     
-    def normalize_by_r(self, value: float) -> float:
-        """Normalize value by R-unit (area_width)."""
-        r_unit = self.reference_area_width
-        return value / r_unit if r_unit else 0.0
+
+    # @property
+    # def entry_vwap_dist(self) -> float:
+    #     """Get VWAP distance at point of entry."""
+    #     if self.entry_snapshot_index is None:
+    #         return np.nan
+    #     entry_snapshot = self.snapshots[self.entry_snapshot_index]
+    #     return entry_snapshot.position_vwap_dist
+
+    # @property
+    # def entry_vwap_std(self) -> float:
+    #     """Get VWAP standard deviation at point of entry."""
+    #     if self.entry_snapshot_index is None:
+    #         return np.nan
+    #     entry_snapshot = self.snapshots[self.entry_snapshot_index]
+    #     return entry_snapshot.position_vwap_std
         
-    def normalize_by_price(self, value: float) -> float:
-        """Normalize value as percentage of reference price."""
+        
+    @property
+    def vwap_std(self) -> float:
+        """Calculate volume-weighted standard deviation of bar VWAPs from position VWAP."""
+        if not self.snapshots or len(self.snapshots) == 1 or self.entry_snapshot_index is None:
+            return np.nan
+
+        snapshots = self.snapshots[self.entry_snapshot_index:]
+        total_volume = sum(s.bar.volume for s in snapshots)
+        if total_volume == 0:
+            return np.nan
+            
+        # Calculate volume-weighted squared deviations
+        squared_devs = sum(
+            s.bar.volume * (s.bar.vwap - s.position_vwap)**2 
+            for s in snapshots
+        )
+        return np.sqrt(squared_devs / total_volume)
+
+    def calculate_std_value(self, *prices: float) -> Union[float, Tuple[float, ...]]:
+        """
+        Calculate how many standard deviations a given price is from current VWAP.
+        
+        Args:
+            *prices: One or more prices to calculate standard deviations for
+            
+        Returns:
+            Single float if one price passed, tuple of floats if multiple.
+            Each value represents number of standard deviations 
+            (positive if above VWAP, negative if below)
+            np.nan: If std_dev is 0 or no snapshots available
+        """
+        if not self.snapshots or len(self.snapshots) == 1 or self.entry_snapshot_index is None:
+            return tuple(np.nan for _ in prices) if len(prices) > 1 else np.nan
+        
+        latest = self.snapshots[-1]
+        std_dev = latest.position_vwap_std  # Using stored std from snapshot
+        
+        if np.isnan(std_dev) or std_dev == 0:
+            return tuple(np.nan for _ in prices) if len(prices) > 1 else np.nan
+            
+        std_values = tuple((price - latest.position_vwap) / std_dev 
+                        for price in prices)
+        return std_values if len(prices) > 1 else std_values[0]
+
+    @property 
+    def vwap_upper_band(self) -> float:
+        """Upper VWAP band at 2 standard deviations."""
+        if not self.snapshots:
+            return np.nan
+        latest = self.snapshots[-1]
+        std_dev = self.vwap_std
+        if np.isnan(std_dev):
+            return np.nan
+        return latest.position_vwap + (2 * std_dev)
+
+    @property 
+    def vwap_lower_band(self) -> float:
+        """Lower VWAP band at 2 standard deviations."""
+        if not self.snapshots:
+            return np.nan
+        latest = self.snapshots[-1]
+        std_dev = self.vwap_std
+        if np.isnan(std_dev):
+            return np.nan
+        return latest.position_vwap - (2 * std_dev)
+    
+    
+        
+    def normalize_by_r(self, *values: float) -> Union[float, Tuple[float, ...]]:
+        """
+        Normalize value(s) by R-unit (area_width).
+        
+        Args:
+            *values: One or more float values to normalize
+            
+        Returns:
+            Single float if one value passed, tuple of floats if multiple
+        """
+        r_unit = self.reference_area_width
+        if r_unit == 0.0:
+            return tuple(0.0 for _ in values) if len(values) > 1 else 0.0
+            
+        normalized = tuple(value / r_unit if not np.isnan(value) else np.nan 
+                        for value in values)
+        return normalized if len(values) > 1 else normalized[0]
+
+    def normalize_by_price(self, *values: float) -> Union[float, Tuple[float, ...]]:
+        """
+        Normalize value(s) as percentage of reference price.
+        
+        Args:
+            *values: One or more float values to normalize
+            
+        Returns:
+            Single float if one value passed, tuple of floats if multiple
+        """
         ref_price = self.reference_price
-        return (value / ref_price * 100) if ref_price else 0.0
+        if ref_price == 0.0:
+            return tuple(0.0 for _ in values) if len(values) > 1 else 0.0
+            
+        normalized = tuple((value / ref_price * 100) if not np.isnan(value) else np.nan 
+                        for value in values)
+        return normalized if len(values) > 1 else normalized[0]
     
-    
+
+    def get_snapshot_metrics_dict(self, current_time: datetime, prefix: str = '') -> dict:
+        """
+        Get snapshot-specific metrics for a given timestamp.
+        
+        Args:
+            current_time: Timestamp to get metrics for
+            
+        Returns:
+            dict: Dictionary of metric names and their values
+        """
+        # Find the relevant snapshot using binary search since timestamps are ordered
+        if not self.snapshots:
+            return {}
+            
+        timestamps = [s.bar.timestamp for s in self.snapshots]
+        idx = bisect_right(timestamps, current_time) - 1
+        
+        # If no snapshot found up to this time, return empty dict
+        if idx < 0:
+            return {}
+        
+        snapshot = self.snapshots[idx]
+        assert snapshot.bar.timestamp <= current_time
+        
+        metrics = {
+            # VWAP metrics
+            # 'position_vwap': snapshot.position_vwap,
+            f'{prefix}position_vwap_dist': snapshot.position_vwap_dist,
+            f'{prefix}position_vwap_std': snapshot.position_vwap_std,
+            f'{prefix}vwap_std_close': snapshot.vwap_std_close,
+            f'{prefix}vwap_std_high': snapshot.vwap_std_high,
+            f'{prefix}vwap_std_low': snapshot.vwap_std_low,
+        }
+        
+        # Apply normalization if configured
+        if self.norm_strategy == 'r':
+            norm_func = self.normalize_by_r
+        elif self.norm_strategy == 'price':
+            norm_func = self.normalize_by_price
+        else:
+            return metrics
+            
+        # Normalize relevant metrics
+        metrics.update({
+            k: norm_func(v) if not np.isnan(v) else np.nan
+            for k, v in metrics.items()
+            # if isinstance(v, (int, float)) and k in {
+            #     'position_vwap_dist', 'position_vwap_std', 'vwap_std_close', 'vwap_std_high', 'vwap_std_low'
+            # }
+        })
+        
+        return metrics
+
+
+
+
+
     def get_metrics_dict(self) -> dict:
         """Return all metrics as a dictionary for easy export."""
-        r_unit = self.reference_area_width
-                
+        
+        if self.norm_strategy == 'r':
+            norm_func = self.normalize_by_r
+        elif self.norm_strategy == 'price':
+            norm_func = self.normalize_by_price
+        else:
+            norm_func = lambda x: x
+        
+    
+        # # Get first/entry snapshot metrics if we have at least 2 snapshots
+        # if len(self.snapshots) >= 2:
+        #     if self.entry_snapshot_index is not None:
+        #         # Use snapshot after entry if available
+        #         if self.entry_snapshot_index + 1 < len(self.snapshots):
+        #             first_snapshot = self.snapshots[self.entry_snapshot_index + 1]
+        #             snapshot_metrics = self.get_snapshot_metrics_dict(
+        #                 first_snapshot.bar.timestamp, prefix='first_'
+        #             )
+        #     else:
+        #         # Use second snapshot for unentered positions
+        #         first_snapshot = self.snapshots[1]
+        #         snapshot_metrics = self.get_snapshot_metrics_dict(
+        #             first_snapshot.bar.timestamp, prefix='first_'
+        #         )
+        # else:
+        #     # Add nan values for all snapshot metrics
+        #     snapshot_metrics = {
+        #         'first_position_vwap': np.nan,
+        #         'first_position_vwap_dist': np.nan,
+        #         'first_position_vwap_std': np.nan,
+        #         'first_vwap_std_close': np.nan,
+        #         'first_vwap_std_high': np.nan,
+        #         'first_vwap_std_low': np.nan
+        #     }
+            
+            
+        
         metrics = {
             # Time-based metrics
             # 'total_time': self.num_snapshots,
@@ -467,20 +717,21 @@ class PositionMetrics:
             'min_pl_body_time': self.min_pl_body_time,
             'max_pl_wick_time': self.max_pl_wick_time,
             'min_pl_wick_time': self.min_pl_wick_time,
-            
+        }
 
-            
-                
+        # metrics.update(snapshot_metrics)
+        metrics.update({
             # # Raw VWAP metrics
-            # 'best_vwap_dist': self.best_vwap_dist,
-            # 'worst_vwap_dist': self.worst_vwap_dist,
+            # 'best_vwap_std_close': self.best_vwap_std_close,
+            # 'worst_vwap_std_close': self.worst_vwap_std_close,
             # Normalized VWAP metrics
-            'avg_vwap_dist_P': self.normalize_by_price(self.avg_vwap_dist),
-            'best_vwap_dist_P': self.normalize_by_price(self.best_vwap_dist),
-            'worst_vwap_dist_P': self.normalize_by_price(self.worst_vwap_dist),
+            'avg_vwap_dist': norm_func(self.avg_vwap_dist),
+            'avg_vwap_std': norm_func(self.avg_vwap_std),
+            'best_vwap_std_close': norm_func(self.best_vwap_std_close),
+            'worst_vwap_std_close': norm_func(self.worst_vwap_std_close),
             
-            'best_vwap_dist_time': self.best_vwap_dist_time,
-            'worst_vwap_dist_time': self.worst_vwap_dist_time,
+            'best_vwap_std_close_time': self.best_vwap_std_close_time,
+            'worst_vwap_std_close_time': self.worst_vwap_std_close_time,
             
 
                 
@@ -496,15 +747,15 @@ class PositionMetrics:
             
             
             # Normalized price differences (R-multiples)
-            'avg_entry_price_diff_P': self.normalize_by_price(self.avg_entry_price_diff),
-            'avg_central_value_dist_P': self.normalize_by_price(self.avg_central_value_dist),
-            'avg_prior_central_value_dist_P': self.normalize_by_price(self.avg_prior_central_value_dist),
+            'avg_entry_price_diff': norm_func(self.avg_entry_price_diff),
+            'avg_central_value_dist': norm_func(self.avg_central_value_dist),
+            'avg_prior_central_value_dist': norm_func(self.avg_prior_central_value_dist),
             
-            'net_price_diff_body_P': self.normalize_by_price(self.net_price_diff_body),
-            'best_price_diff_body_P': self.normalize_by_price(self.best_price_diff_body),
-            'worst_price_diff_body_P': self.normalize_by_price(self.worst_price_diff_body),
-            'best_price_diff_wick_P': self.normalize_by_price(self.best_price_diff_wick),
-            'worst_price_diff_wick_P': self.normalize_by_price(self.worst_price_diff_wick),
+            'net_price_diff_body': norm_func(self.net_price_diff_body),
+            'best_price_diff_body': norm_func(self.best_price_diff_body),
+            'worst_price_diff_body': norm_func(self.worst_price_diff_body),
+            'best_price_diff_wick': norm_func(self.best_price_diff_wick),
+            'worst_price_diff_wick': norm_func(self.worst_price_diff_wick),
             
             # Price movement timing
             'best_price_diff_body_time': self.best_price_diff_body_time,
@@ -519,8 +770,7 @@ class PositionMetrics:
             'ref_area_width': self.reference_area_width,
             'avg_area_width': self.avg_area_width
 
-        }
-        
-        
-        return metrics
+        })
+        return {k: round(v, 10) if isinstance(v, float) else v for k, v in metrics.items()}
+        # return metrics
         

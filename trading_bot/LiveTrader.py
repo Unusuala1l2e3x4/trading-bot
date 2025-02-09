@@ -40,6 +40,8 @@ from dotenv import load_dotenv
 
 import sys, io
 
+ny_tz = ZoneInfo("America/New_York")
+
 STANDARD_DATETIME_STR = '%Y-%m-%d %H:%M:%S'
 ROUNDING_DECIMAL_PLACES = 10  # Choose an appropriate number of decimal places
 
@@ -129,6 +131,19 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[Int
     """
     # Validate input length
     assert len(orders_list) <= 2
+    
+    
+    if len(orders_list) == 2:
+        first_order, second_order = orders_list
+        if first_order.position.is_simulated and not second_order.position.is_simulated:
+            orders_list = [second_order]
+        elif not first_order.position.is_simulated and second_order.position.is_simulated:
+            orders_list = [first_order]
+        elif first_order.position.is_simulated and second_order.position.is_simulated:
+            orders_list = []
+        
+        
+    
     if not orders_list:
         return orders_list
     
@@ -141,7 +156,7 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[Int
         first_order, second_order = orders_list
         
         # Validate basic order properties
-        assert first_order.qty > 0 and second_order.qty > 0, \
+        assert first_order.qty >= 0 and second_order.qty >= 0, \
             f"Order quantities must be positive: {first_order.qty}, {second_order.qty}"
         assert first_order.symbol == second_order.symbol, \
             f"Orders must be for same symbol: {first_order.symbol} != {second_order.symbol}"
@@ -149,7 +164,7 @@ def combine_two_orders_same_symbol(orders_list: List[IntendedOrder]) -> List[Int
         # Validate order sequence
         assert first_order.action == 'close' and second_order.action == 'open', \
             f"When 2 orders are present, the first must be a close and the second must be an open. ({first_order.action}, {second_order.action})"
-
+        
         # Validate order sides match position directions
         assert (first_order.side == OrderSide.SELL) == first_order.position.is_long, \
             f"First order side {first_order.side} doesn't match position direction {first_order.position.is_long}"
@@ -436,7 +451,7 @@ class LiveTrader:
             raise e
         
     async def on_bar(self, bar:Bar, check_time: Optional[datetime] = None):
-        self.timer_start = datetime.now()
+        self.timer_start = datetime.now(tz=ny_tz)
         # debug_print('on_bar') # ,bar
         # log("on_bar")
         try:
@@ -648,8 +663,8 @@ class LiveTrader:
             # if positions_to_remove:
             #     self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | {position.area.id for position in positions_to_remove}
             if positions_to_remove:
-                self.area_ids_to_remove[current_date] = self.area_ids_to_remove[current_date] | set.union(*(position.cleared_area_ids for position in positions_to_remove))
-            self.area_ids_to_side_switch[current_date] = self.area_ids_to_side_switch[current_date] | {a.position.area.id for a in orders_list0 if a.position.area.is_side_switched}
+                self.area_ids_to_remove[current_date] |= set.union(*(position.cleared_area_ids for position in positions_to_remove))
+            self.area_ids_to_side_switch[current_date] |= {a.position.area.id for a in orders_list0 if a.position.area.is_side_switched}
             
             log('trading logic complete',level=logging.DEBUG)
             
