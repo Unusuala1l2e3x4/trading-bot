@@ -103,12 +103,15 @@ def get_latest_value(values: np.ndarray) -> float:
 @dataclass
 class LiveTouchDetectionParameters:
     symbol: str
+    client_type: str # {'stock','crypto'}
     atr_period: int = 15
     level1_period: int = 15
     multiplier: float = 1.725
     min_touches: int = 3
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
+    # start_time: Optional[time] = '09:30'
+    # end_time: Optional[time] = '16:00'
+    start_time: Optional[time] = '00:00'
+    end_time: Optional[time] = '23:59'
     use_median: bool = True # True is better
     touch_area_width_agg: Callable = get_latest_value
     # touch_area_width_agg: Callable = np.median # doesnt work inside jitted functions

@@ -1,8 +1,8 @@
 import os
 import zipfile
 import pandas as pd
-from alpaca.data import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest
+from alpaca.data import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest, CryptoBarsRequest, CryptoQuoteRequest, CryptoLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import Adjustment
 from alpaca.data.models import Bar, Quote
@@ -29,12 +29,12 @@ STANDARD_DATETIME_STR = '%Y-%m-%d %H:%M:%S'
 ROUNDING_DECIMAL_PLACES = 10  # Choose an appropriate number of decimal places
 
 load_dotenv(override=True)
-livepaper = os.getenv('LIVEPAPER')
+# accountname = os.getenv('ACCOUNTNAME')
 config = toml.load('../config.toml')
 
-# Replace with your Alpaca API credentials
-API_KEY = config[livepaper]['key']
-API_SECRET = config[livepaper]['secret']
+# # Replace with your Alpaca API credentials
+# API_KEY = config[accountname]['key']
+# API_SECRET = config[accountname]['secret']
 
 
 # SLEEP_TIME = 0.3 # 60/200 = 0.3 second if we're using free account
@@ -122,11 +122,11 @@ def fill_missing_data(df: pd.DataFrame):
     return result
 
 
-def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDetectionParameters, symbol: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def retrieve_bar_data(client: StockHistoricalDataClient | CryptoHistoricalDataClient, params: BacktestTouchDetectionParameters, symbol: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """_summary_
 
     Args:
-        client (StockHistoricalDataClient): 
+        client (StockHistoricalDataClient | CryptoHistoricalDataClient): 
         params (BacktestTouchDetectionParameters): 
         symbol (str | None): If None, use params.symbol
 
@@ -145,7 +145,7 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
 
     if params.export_bars_path:
         directory = os.path.dirname(params.export_bars_path)
-        bars_zip_path = os.path.join(directory, f'bars_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
+        bars_zip_path = os.path.join(directory, f'bars_{symbol.replace('/','-')}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
         assert directory == os.path.dirname(bars_zip_path)
         os.makedirs(directory, exist_ok=True)
             
@@ -177,16 +177,28 @@ def retrieve_bar_data(client: StockHistoricalDataClient, params: BacktestTouchDe
                         df_unadjusted = None
                     
     def fetch_bars(adjustment: Adjustment, timeframe_amount: int = 1, timeframe_unit: TimeFrameUnit = TimeFrameUnit.Minute):
-        request_params = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame(timeframe_amount, timeframe_unit),
-            start=params.start_date.tz_convert('UTC'),
-            end=params.end_date.tz_convert('UTC'),
-            adjustment=adjustment,
-            feed='sip'
-        )
         try:
-            df = get_data_with_retry(client, client.get_stock_bars, request_params)
+            if params.client_type == 'stock':
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TimeFrame(timeframe_amount, timeframe_unit),
+                    start=params.start_date.tz_convert('UTC'),
+                    end=params.end_date.tz_convert('UTC'),
+                    adjustment=adjustment,
+                    feed='sip'
+                )
+                df = get_data_with_retry(client, client.get_stock_bars, request_params)
+            else:
+                assert params.client_type == 'crypto'
+                request_params = CryptoBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TimeFrame(timeframe_amount, timeframe_unit),
+                    start=params.start_date.tz_convert('UTC'),
+                    end=params.end_date.tz_convert('UTC'),
+                    # adjustment=adjustment,
+                    # feed='sip'
+                )
+                df = get_data_with_retry(client, client.get_crypto_bars, request_params)
         except Exception as e:
             log(f"Error requesting bars for {symbol}: {str(e)}", level=logging.ERROR)
             return pd.DataFrame()
@@ -449,26 +461,39 @@ def get_seed(symbol: str, minute: datetime) -> int:
 
 def get_quotes_zip_path(symbol, params: BacktestTouchDetectionParameters):
    directory = os.path.dirname(params.export_quotes_path)
-   return os.path.join(directory, f'quotes_{symbol}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
+   return os.path.join(directory, f'quotes_{symbol.replace('/','-')}_{params.start_date.strftime("%Y-%m-%d")}_{params.end_date.strftime("%Y-%m-%d")}.zip')
 
 
 from concurrent.futures import ThreadPoolExecutor
 
-def fetch_next_minute_quotes(client: StockHistoricalDataClient, symbols: List[str], minute_start: datetime, minute_end: datetime):
-    request_params = StockQuotesRequest(
-        symbol_or_symbols=symbols,
-        start=minute_start.tz_convert('UTC'),
-        end=minute_end.tz_convert('UTC'),
-        feed='sip' # default for market data subscription?
-        # feed='iex'
-    )
+def fetch_next_minute_quotes(client: StockHistoricalDataClient | CryptoHistoricalDataClient, client_type: str, symbols: List[str], minute_start: datetime, minute_end: datetime):
     try:
-        return get_data_with_retry(client, client.get_stock_quotes, request_params)
+        if client_type == 'stock':
+            request_params = StockQuotesRequest(
+                symbol_or_symbols=symbols,
+                start=minute_start.tz_convert('UTC'),
+                end=minute_end.tz_convert('UTC'),
+                feed='sip' # default for market data subscription?
+                # feed='iex'
+            )
+            df = get_data_with_retry(client, client.get_stock_quotes, request_params)
+        else:
+            assert client_type == 'crypto'
+            request_params = CryptoQuoteRequest(
+                symbol_or_symbols=symbols,
+                start=minute_start.tz_convert('UTC'),
+                end=minute_end.tz_convert('UTC'),
+                feed='sip' # default for market data subscription?
+                # feed='iex'
+            )
+            df = get_data_with_retry(client, client.get_crypto_quotes, request_params)
+        return df
+        # return get_data_with_retry(client, client.get_stock_quotes, request_params)
     except Exception as e:
         log(f"Error retrieving quotes for {symbols} at {minute_start}: {str(e)}", level=logging.ERROR)
         return pd.DataFrame()
 
-def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], minute_intervals_dict: Dict[str, pd.DatetimeIndex], params: BacktestTouchDetectionParameters, 
+def retrieve_quote_data(client: StockHistoricalDataClient | CryptoHistoricalDataClient, symbols: List[str], minute_intervals_dict: Dict[str, pd.DatetimeIndex], params: BacktestTouchDetectionParameters, 
                         first_seconds_sample: int = np.inf, last_seconds_sample: int = np.inf, return_data=True) -> Dict | None:
     quotes_data = {symbol: {'raw': None, 'agg': None} for symbol in symbols}
     
@@ -532,8 +557,8 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
         if params.export_quotes_path:
             directory = os.path.dirname(params.export_quotes_path)
             temp_files[symbol] = {
-                'raw': os.path.join(directory, f'temp_{symbol}_raw_quotes.csv'),
-                'agg': os.path.join(directory, f'temp_{symbol}_aggregated_quotes.csv')
+                'raw': os.path.join(directory, f'temp_{symbol.replace('/','-')}_raw_quotes.csv'),
+                'agg': os.path.join(directory, f'temp_{symbol.replace('/','-')}_aggregated_quotes.csv')
             }
 
     def append_quote_segment(temp_path, df: pd.DataFrame, is_first: bool, index_format=True, max_retries=240, sleep_seconds=0.3):
@@ -587,7 +612,9 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
         
     with ThreadPoolExecutor(max_workers=1) as executor, tqdm(total=len(minutes), desc='Fetching quotes') as pbar:
         # Start first request
-        future = executor.submit(fetch_next_minute_quotes, client, symbols, current_minute_start, current_minute_end)
+        future = executor.submit(fetch_next_minute_quotes, client, params.client_type, symbols, current_minute_start, current_minute_end)
+        
+        # print(current_minute_start)
         
         while True:
             # Get current minute's data
@@ -601,7 +628,7 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                 next_minute = next(minutes_iter)
                 next_minute_start = next_minute
                 next_minute_end = next_minute + timedelta(minutes=1)
-                future = executor.submit(fetch_next_minute_quotes, client, symbols, next_minute_start, next_minute_end)
+                future = executor.submit(fetch_next_minute_quotes, client, params.client_type, symbols, next_minute_start, next_minute_end)
             except StopIteration:
                 future = None
             
@@ -614,7 +641,7 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
                         qdf = qdf0.xs(symbol, level='symbol', drop_level=False)
                     else:
                         qdf = pd.DataFrame()
-                        log(f"No data found for symbol {symbol} at {current_minute}.", level=logging.WARNING)
+                        # log(f"No data found for symbol {symbol} at {current_minute}.", level=logging.WARNING)
                 except Exception as e:
                     qdf = pd.DataFrame()
                     log(f"Error processing data for symbol {symbol} at {current_minute}: {str(e)}", level=logging.ERROR)
@@ -728,13 +755,13 @@ def retrieve_quote_data(client: StockHistoricalDataClient, symbols: List[str], m
 
 def refresh_client(client):
     """
-    Refresh the session of a StockHistoricalDataClient instance.
+    Refresh the session of a StockHistoricalDataClient | CryptoHistoricalDataClient instance.
     
     Args:
-        client: An instance of StockHistoricalDataClient
+        client: An instance of StockHistoricalDataClient | CryptoHistoricalDataClient
     """
-    if not isinstance(client, StockHistoricalDataClient):
-        raise TypeError("Client must be an instance of StockHistoricalDataClient")
+    if not isinstance(client, StockHistoricalDataClient | CryptoHistoricalDataClient):
+        raise TypeError("Client must be an instance of StockHistoricalDataClient | CryptoHistoricalDataClient")
 
     # Refresh the session
     if hasattr(client, '_session'):
@@ -742,7 +769,7 @@ def refresh_client(client):
         client._session = Session()
         log(f"Session refreshed for {client.__class__.__name__}", level=logging.WARNING)
         
-def get_data_with_retry(client: StockHistoricalDataClient, client_func: Callable, request_params: StockBarsRequest, max_retries=10, sleep_seconds=10) -> pd.DataFrame:
+def get_data_with_retry(client: StockHistoricalDataClient | CryptoHistoricalDataClient, client_func: Callable, request_params: StockBarsRequest, max_retries=10, sleep_seconds=10) -> pd.DataFrame:
     attempt = 0
     while True:
         try:
@@ -764,12 +791,12 @@ def get_data_with_retry(client: StockHistoricalDataClient, client_func: Callable
             refresh_client(client)
             t2.sleep(sleep_seconds)
             
-def get_stock_latest_quote_with_retry(client: StockHistoricalDataClient, request_params: StockLatestQuoteRequest, max_retries=10, sleep_seconds=0.01) -> Optional[Quote]:
+def get_stock_latest_quote_with_retry(client: StockHistoricalDataClient | CryptoHistoricalDataClient, request_params: StockLatestQuoteRequest, max_retries=10, sleep_seconds=0.01) -> Optional[Quote]:
     """
     Retrieves the latest quote for a stock with retry logic.
     
     Args:
-        client: StockHistoricalDataClient instance
+        client: StockHistoricalDataClient | CryptoHistoricalDataClient instance
         request_params: StockLatestQuoteRequest parameters
         max_retries: Maximum number of retry attempts (default: 10)
         sleep_seconds: Seconds to wait between retries (default: 0.01)
@@ -780,7 +807,15 @@ def get_stock_latest_quote_with_retry(client: StockHistoricalDataClient, request
     attempt = 0
     while True:
         try:
-            res = client.get_stock_latest_quote(request_params)
+            if not isinstance(client, StockHistoricalDataClient | CryptoHistoricalDataClient):
+                raise TypeError("Client must be an instance of StockHistoricalDataClient | CryptoHistoricalDataClient")
+            
+            if isinstance(client, StockHistoricalDataClient):
+                res = client.get_stock_latest_quote(request_params)
+            elif isinstance(client, CryptoHistoricalDataClient):
+                res = client.get_crypto_latest_quote(request_params)
+            else:
+                raise TypeError("Client must be an instance of StockHistoricalDataClient | CryptoHistoricalDataClient")
             
             # Handle single symbol vs multiple symbols
             if isinstance(res, dict):
@@ -813,7 +848,13 @@ def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols
     if isinstance(params.end_date, str):
         params.end_date = pd.to_datetime(params.end_date).tz_localize(ny_tz)
 
-    client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+    assert params.client_type in {'stock','crypto'}, params.client_type
+    if params.client_type == 'stock':
+        client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+    else:
+        assert params.client_type == 'crypto'
+        client = CryptoHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+
 
     # Retrieve bar data and build minute_intervals_dict
     minute_intervals_dict = {}
@@ -826,7 +867,9 @@ def retrieve_multi_symbol_data(params: BacktestTouchDetectionParameters, symbols
 
         
         minute_intervals = df.index.get_level_values('timestamp')
-        minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
+        # print(minute_intervals)
+        # minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
+        # print(minute_intervals)
         minute_intervals_dict[symbol] = minute_intervals
         
         # elapsed_time = t2.time() - start_time
@@ -866,6 +909,11 @@ if __name__=="__main__":
     
     start_date = "2024-12-01 00:00:00"
     end_date =   "2025-01-01 00:00:00"
+    
+    
+    start_date = "2025-01-01 00:00:00"
+    end_date =   "2025-02-01 00:00:00"
+
 
     # start_date = "2024-09-04 00:00:00"
     # end_date =   "2024-09-05 00:00:00"
@@ -882,17 +930,19 @@ if __name__=="__main__":
     # Usage example (most params are just placeholders for this module):
     params = BacktestTouchDetectionParameters(
         symbol='',
+        client_type='stock',
+        # client_type='crypto',
+        
         start_date=start_date,
         end_date=end_date,
-        # atr_period=15,
-        # level1_period=15,
-        # multiplier=1.4,
-        # min_touches=3,
-        start_time=None,
-        end_time='15:55',
-        # use_median=True,
-        # touch_area_width_agg=None,
         
+        start_time=None,
+        end_time=None,
+        
+        
+        # ema_span=12,
+        # price_ema_span=26,
+
         # ema_span=12,
         # price_ema_span=26,
         
@@ -900,6 +950,9 @@ if __name__=="__main__":
         export_quotes_path=f'quotes/'
     )
 
+    accountname = os.getenv('ACCOUNTNAME')
+    API_KEY = config[accountname]['key']
+    API_SECRET = config[accountname]['secret']
 
     # symbols = ['AAPL', 'GOOGL', 'NVDA']
     # symbols = ['AAPL'] 
@@ -915,12 +968,16 @@ if __name__=="__main__":
     
     # symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META', 'NVDA', 'TSLA']
     # symbols = ['MSTR','MARA','INTC','GOOG']
-    symbols = ['MARA','TSLA','NVDA', 'AMZN', 'AAPL']
-    # symbols = ['AAPL']
+    # symbols = ['MARA','TSLA','NVDA', 'AMZN', 'AAPL']
+    # symbols = ['MARA','TSLA','NVDA', 'AMZN', 'AAPL', 'META']
+    symbols = ['MARA']
+    # symbols = ['SOL/USD', 'ETH/USD', 'LTC/USD', 'BCH/USD']
+    
+    # symbols = ['META']
     # symbols = ['QFIN']
     
-    for symbol in symbols:
-        retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    # for symbol in symbols:
+    #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
         
     # params.start_date = "2024-09-04 00:00:00"
     # params.end_date =   "2024-09-05 00:00:00"
@@ -942,10 +999,15 @@ if __name__=="__main__":
     # for symbol in symbols:
     #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
 
-    # params.start_date = "2024-01-01 00:00:00"
-    # params.end_date =   "2024-02-01 00:00:00"
+    # params.start_date = "2024-12-01 00:00:00"
+    # params.end_date =   "2025-01-01 00:00:00"
     # for symbol in symbols:
     #     retrieve_multi_symbol_data(params, [symbol], return_data=False)
+    
+    params.start_date = "2025-01-01 00:00:00"
+    params.end_date =   "2025-02-01 00:00:00"
+    for symbol in symbols:
+        retrieve_multi_symbol_data(params, [symbol], return_data=False)
     
 
     # for month in range(11, 0, -1):  # Loop through months

@@ -24,3 +24,6 @@ dependencies:
     - seaborn
     - pydeps
     - mplfinance
+    - nbconvert
+    - nbclient
+    - pyautogui

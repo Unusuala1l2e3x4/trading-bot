@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from numba import jit
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
 from alpaca.trading import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
@@ -47,12 +47,12 @@ STANDARD_DATETIME_STR = '%Y-%m-%d %H:%M:%S'
 ROUNDING_DECIMAL_PLACES = 10  # Choose an appropriate number of decimal places
 
 load_dotenv(override=True)
-livepaper = os.getenv('LIVEPAPER')
+accountname = os.getenv('ACCOUNTNAME')
 config = toml.load('../config.toml')
 
 # Replace with your Alpaca API credentials
-API_KEY = config[livepaper]['key']
-API_SECRET = config[livepaper]['secret']
+API_KEY = config[accountname]['key']
+API_SECRET = config[accountname]['secret']
 
 pd.options.mode.copy_on_write = True # https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#why-does-assignment-fail-when-using-chained-indexing
 
@@ -408,6 +408,50 @@ class TouchDetectionState:
     potential_levels: Dict[int, Level] = field(default_factory=lambda: defaultdict(lambda: Level(0, 0, 0, 0, False, [])))
     high_low_diffs: List[float] = field(default_factory=list)
     last_processed_index: int = 0
+
+
+def calculate_vwap_std_metrics(df: pd.DataFrame, vwap_col: str = 'VWAP') -> pd.DataFrame:
+    """
+    Calculate VWAP standard deviation metrics using pandas operations.
+    
+    Args:
+        df: DataFrame with 'volume' and vwap_col columns
+        vwap_col: Name of the VWAP column to calculate std against
+        
+    Returns:
+        DataFrame with added columns:
+        - VWAP_std: Running std dev of price from VWAP
+        - VWAP_std_close: Close price std dev from VWAP
+    """
+    # Group by date for daily calculations
+    grouped = df.groupby(df.index.get_level_values('timestamp').date)
+    
+    # Calculate running squared deviations weighted by volume
+    df['squared_dev'] = df['volume'] * (df['vwap'] - df[vwap_col])**2
+    
+    # Calculate running sum of squared deviations and volumes
+    running_sq_dev = grouped['squared_dev'].cumsum()
+    running_volume = grouped['volume'].cumsum()
+    
+    # Calculate std where volume > 0
+    df['VWAP_std'] = np.sqrt(
+        np.where(running_volume > 0, 
+                running_sq_dev / running_volume,
+                np.nan)
+    )
+    
+    # Calculate standardized close price deviation
+    df['VWAP_std_close'] = np.where(
+        df['VWAP_std'] > 0,
+        (df['close'] - df[vwap_col]) / df['VWAP_std'],
+        np.nan
+    )
+    
+    # Clean up intermediate column
+    df.drop(columns=['squared_dev'], inplace=True)
+    
+    # return df
+
     
     
 def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | LiveTouchDetectionParameters, 
@@ -415,6 +459,19 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                                    market_hours: Optional[Dict[date, Tuple[datetime, datetime]]] = None,
                                    area_ids_to_remove: Optional[set] = {},
                                    previous_state: Optional[TouchDetectionState] = None) -> Union[TouchDetectionAreas, Tuple[TouchDetectionAreas, TouchDetectionState]]:
+    """
+    Calculates touch detection areas for a given stock symbol based on historical price data and volatility.
+    
+    Inspired by https://medium.com/@paullenosky/i-have-created-an-indicator-that-actually-makes-money-unlike-any-other-indicator-i-have-ever-seen-fd7b36aba975
+    
+    This function analyzes historical price data to identify significant price levels (support and resistance)
+    based on the frequency of price touches. It considers market volatility using ATR and allows for 
+    customization of the analysis parameters. The resulting touch areas can be used for trading strategies
+    or further market analysis.
+    """
+    
+    assert params.client_type in {'stock','crypto'}, params.client_type
+    
     def log_live(message, level=logging.INFO):
         if params.__class__.__name__ == 'LiveTouchDetectionParameters':
             logger.log(level, message, exc_info=level >= logging.ERROR)
@@ -422,30 +479,6 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         if params.__class__.__name__ == 'BacktestTouchDetectionParameters':
             logger.log(level, message, exc_info=level >= logging.ERROR)
     
-    """
-    Calculates touch detection areas for a given stock symbol based on historical price data and volatility.
-
-    Parameters:
-    params (TouchDetectionParameters): An instance of TouchDetectionParameters containing all necessary parameters.
-
-    Returns:
-    dict: A dictionary containing:
-        - 'symbol': The analyzed stock symbol
-        - 'long_touch_area': List of TouchArea objects for long positions
-        - 'short_touch_area': List of TouchArea objects for short positions
-        - 'market_hours': Dictionary of market hours for each trading day
-        - 'bars': DataFrame of price data
-        - 'mask': Boolean mask for filtering data
-        - 'min_touches': The minimum number of touches used
-        - 'start_time': The start time used for analysis
-        - 'end_time': The end time used for analysis
-        - 'use_median': Whether median or mean was used for touch area width calculation (True -> use rolling MTR, False -> using rolling+tapered ATR)
-
-    This function analyzes historical price data to identify significant price levels (support and resistance)
-    based on the frequency of price touches. It considers market volatility using ATR and allows for 
-    customization of the analysis parameters. The resulting touch areas can be used for trading strategies
-    or further market analysis.
-    """
     is_live = params.__class__.__name__ == 'LiveTouchDetectionParameters'
 
     if not is_live:
@@ -454,14 +487,19 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         assert params.end_date > params.start_date
 
         # Alpaca API setup
-        client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+        if params.client_type == 'stock':
+            client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+        else:
+            assert params.client_type == 'crypto'
+            client = CryptoHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
 
         # get bars data (2 dataframes)
         df_adjusted, df = retrieve_bar_data(client, params)
         
         # get quotes data (2 dataframes)
         minute_intervals = df.index.get_level_values('timestamp')
-        minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
+        # minute_intervals = minute_intervals[(minute_intervals.time >= time(9, 30)) & (minute_intervals.time < time(16, 0))]
+        # print(minute_intervals)
         minute_intervals_dict = {params.symbol: minute_intervals}
         
         quotes_data = retrieve_quote_data(client, [params.symbol], minute_intervals_dict, params)
@@ -544,6 +582,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             # df['VWAP'] = grouped.apply(lambda x: x['pv'].cumsum() / x['volume'].cumsum()).T.values
             df['VWAP'] = grouped.apply(lambda x: (x['vwap'] * x['volume']).cumsum() / x['volume'].cumsum()).T.values
             
+            calculate_vwap_std_metrics(df)
+            
             df.drop(columns=['typical_price', 'pv'],errors='ignore',inplace=True)
             
             
@@ -618,6 +658,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         
         df['exit_ema_dist'] = (df[exit_ema_var] - df['exit_ema'])
+        
+        df['VWAP_dist'] = df['close'] - df['VWAP']
 
         # Calculate basic ADX components
         df['plus_dm'] = df['high'] - df['high'].shift(1) 
@@ -685,6 +727,8 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                     day_end_time = min(date_obj.replace(hour=end_time.hour, minute=end_time.minute), market_close - timedelta(minutes=3))
                 else:
                     day_end_time = market_close - timedelta(minutes=3)
+            # elif start_time:
+            #     day_start_time, day_end_time = date_obj, date_obj.replace(hour=start_time.hour, minute=start_time.minute)
             else:
                 day_start_time, day_end_time = date_obj, date_obj
             
@@ -763,6 +807,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                 # high, low, close = row['high'], row['low'], row['close']
                 # high, low, close = row['high'], row['low'], row['close']
                 h_l, atr, close = row['H_L'], row['ATR'], row['close']
+                low, high, vwap = row['low'], row['high'], row['vwap'] # TODO: utilize these values
                 timestamp = day_timestamps[i]
                 is_res = row['is_res']
                 
@@ -772,25 +817,60 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
                 # high_close_diffs.append(high - close)
                 # low_close_diffs.append(close - low)
                 
-                w = np.median(high_low_diffs) / 2
+                # w = np.median(high_low_diffs) / 2
+                w = np.median(high_low_diffs) / 3
+                # w = (np.median(high_low_diffs) / 3) * params.multiplier
                 # w = atr
                 # w = np.median(high_low_diffs[-15:]) / 2
-                lmin, lmax = close - w, close + w
+                # lmin, lmax = close - w, close + w
                 
+                
+                if is_res:
+                    lmin, lmax = high - (2*w), high + w
+                else:
+                    lmin, lmax = low - w, low + (2*w)
+
                 # w_high = np.median(high_close_diffs)
                 # w_low = np.median(low_close_diffs)
                 # lmin, lmax = close - w_low, close + w_high
                 
                 # Check if this point falls within any existing levels
                 for level in potential_levels.values():
-                    if level.is_res == is_res and level.lmin <= close <= level.lmax:
-                        level.touches.append(timestamp)
+                    # if level.is_res == is_res and level.lmin <= close <= level.lmax:
+                    #     level.touches.append(timestamp)
+                    if level.is_res == is_res:
+                        if (is_res and level.lmin <= high <= level.lmax) or (not is_res and level.lmin <= low <= level.lmax):
+                            level.touches.append(timestamp)
 
                 if w != 0 and i not in potential_levels:
                 # if (w_high != 0 or w_low != 0) and i not in potential_levels:
                     # Add this point to its own level (match by lmin, lmax in case the same lmin, lmax is already used)
                     # print(w)
-                    potential_levels[i] = Level(i, lmin, lmax, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
+                    # potential_levels[i] = Level(i, lmin, lmax, close, is_res, [timestamp]) # using i as ID since levels have unique INITIAL timestamp
+                    if is_res:
+                        potential_levels[i] = Level(i, lmin, lmax, high, is_res, [timestamp])
+                    else:
+                        potential_levels[i] = Level(i, lmin, lmax, low, is_res, [timestamp])
+
+                # lmin_res, lmax_res = high - (2*w), high + w
+                # lmin_sup, lmax_sup = low - w, low + (2*w)
+
+                # # Check if this point falls within any existing levels
+                # for level in potential_levels.values():
+                #     if level.is_res and level.lmin <= high <= level.lmax:
+                #         level.touches.append(timestamp)
+                #     if not level.is_res and level.lmin <= low <= level.lmax:
+                #         level.touches.append(timestamp)
+                
+                # i_res = i*2
+                # i_sup = i_res+1
+
+                # if w != 0:
+                #     if i_res not in potential_levels:
+                #         potential_levels[i_res] = Level(i_res, lmin_res, lmax_res, high, True, [timestamp])
+                #     if i_sup not in potential_levels:
+                #         potential_levels[i_sup] = Level(i_sup, lmin_sup, lmax_sup, low, False, [timestamp])
+                
             
             # print(pd.Series(high_low_diffs[n:]).describe())
             
@@ -984,7 +1064,7 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
 
     # Main price plot (ax1)
     ax1.plot(df.index.get_level_values('timestamp'), df['central_value'], label='Central Value', color='yellow', linewidth=1)
-    ax1.plot(df.index.get_level_values('timestamp'), df['vwap'], label='VWAP', color='purple', linewidth=1)
+    ax1.plot(df.index.get_level_values('timestamp'), df['VWAP'], label='VWAP', color='purple', linewidth=1)
     if len(grouped) != 1:
         ax1.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue', linewidth=1)
             

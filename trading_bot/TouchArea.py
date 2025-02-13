@@ -268,7 +268,7 @@ class TouchArea:
             f'{prefix}touch_density': round(self.get_touch_density(current_time, touches), 6),
             f'{prefix}touch_regularity': round(self.get_touch_regularity(current_time, touches), 6),
             f'{prefix}atr_trend': round(self.get_atr_trend(current_time, touches), 6),
-            # f'{prefix}num_touches': len(touches), #
+            f'{prefix}num_touches': len(self.current_touches(current_time)), #
             # f'{prefix}area_width': self.get_range, #
         }
         

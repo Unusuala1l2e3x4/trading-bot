@@ -24,12 +24,12 @@ import os, toml
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-livepaper = os.getenv('LIVEPAPER')
+accountname = os.getenv('ACCOUNTNAME')
 config = toml.load('../config.toml')
 
 # Replace with your Alpaca API credentials
-API_KEY = config[livepaper]['key']
-API_SECRET = config[livepaper]['secret']
+API_KEY = config[accountname]['key']
+API_SECRET = config[accountname]['secret']
 
 trading_client = TradingClient(API_KEY, API_SECRET)
 
@@ -55,21 +55,16 @@ logger = setup_logger(logging.INFO)
 def log(message, level=logging.INFO):
     logger.log(level, message, exc_info=level >= logging.ERROR)
 
-
+"""
 # symbol,group,slippage_factor,atr_sensitivity,notes
 # NVDA,High Volume Meme,0.02,15.0,Highest volume + tight spread despite being meme stock
 # TSLA,High Volume Meme,0.03,12.0,High volume but wider spreads + high volatility means higher base slippage
 # AAPL,Blue Chip,0.02,10.0,Very liquid with tight spreads despite lower volume than memes
 # AMZN,Blue Chip,0.025,10.0,Similar to AAPL but slightly wider spreads historically
 # MARA,Low Price High Vol,0.01,20.0,Lower $ slippage due to price but very sensitive to volatility
-
+"""
 @dataclass
 class SlippageEstimationParameters:
-    # slippage_factor: Optional[float] = 0.001
-    # slippage_factor: Optional[float] = 0.02 # Dollar cost per share, which you can calibrate based on historical data.
-    # beta:  Optional[float] = 0.95 # An exponent typically less than 1 (commonly between 0.5 and 0.8), representing the non-linearity of the impact.]
-    
-    
     # Average/Representative
     slippage_factor: Optional[float] = 0.005
     atr_sensitivity: Optional[float] = 12
@@ -150,7 +145,7 @@ class OrderSizingParameters:
         min_trade_count = max(1, np.round(self.min_trade_count * multiplier).astype(int)) # >= 1
         if avg_trade_count < min_trade_count or avg_volume < min_trade_count:
             return False
-        
+        '''
         # # NOTE: no quotes data used for live trading to prioritize speed
         # # Thus: removing the functionality below
         # quote_count = normalize_quote_count( 
@@ -162,13 +157,14 @@ class OrderSizingParameters:
         #     return False
         
         # TODO: there needs to be at least one quote
-            
+        '''
         return True
     
     # @jit(nopython=True)
     def calculate_max_trade_size(self, avg_volume: float) -> int:
         return np.round(avg_volume * self.max_volume_percentage / 100).astype(int)
     
+    ''' # outdated
     # @jit(nopython=True)
     def calculate_spread_scaling(
         self,
@@ -389,7 +385,7 @@ class OrderSizingParameters:
         # log(f"{self.current_timestamp}: scaling calc {pressure_scaling} * {spread_scaling} = {final_scaling} ({base_size} -> {ret})", level=logging.INFO)
         
         return ret, spread_ratio, spread_scaling, stability_scaling, persistence_scaling, final_scaling
-
+'''
 
 @dataclass
 class StrategyParameters:
@@ -403,15 +399,10 @@ class StrategyParameters:
     assume_marginable_and_etb: bool = False
     times_buying_power: float = 1
     min_stop_dist_relative_change_for_partial: Optional[float] = 0
-    soft_start_time: Optional[time] = None
-    soft_end_time: Optional[time] = None
+    soft_start_time: Optional[time] = '00:00'
+    soft_end_time: Optional[time] = '23:59'
     
     gradual_entry_range_multiplier: Optional[float] = 1.0
-    
-    # gradual_entry_range_multiplier: Optional[float] = 0.75 # better for meme stocks but not others
-    # gradual_entry_range_multiplier: Optional[float] = 0.5 # bad
-    # gradual_entry_range_multiplier: Optional[float] = 1.25 # bad except for MARA
-    # gradual_entry_range_multiplier: Optional[float] = 0.9 # better for NVDA and TSLA but not others
 
     # lunch_stop_entry_time: Optional[time] = time(11, 45)
     # lunch_resume_entry_time: Optional[time] = time(12, 15)

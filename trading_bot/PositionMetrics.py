@@ -1,9 +1,22 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Dict
 import numpy as np
-from trading_bot.TypedBarData import TypedBarData
+from trading_bot.TypedBarData import TypedBarData, AnchoredVWAPMetrics
 from bisect import bisect_right
+
+
+
+
+
+@dataclass
+class BreakoutCharacteristics:
+    type: str  # 'Aggressive', 'Passive', 'Indecisive', 'Lethargic'
+    confidence: float  # 0.0-1.0
+    vwap_metrics: Dict[str, float]  # Key metrics that led to classification
+    volume_metrics: Dict[str, float]  # Volume analysis metrics
+
+
 
 @dataclass
 class PositionSnapshot:
@@ -456,25 +469,7 @@ class PositionMetrics:
     @property
     def avg_vwap_std(self) -> float:
         return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)])
-    
-    
 
-    # @property
-    # def entry_vwap_dist(self) -> float:
-    #     """Get VWAP distance at point of entry."""
-    #     if self.entry_snapshot_index is None:
-    #         return np.nan
-    #     entry_snapshot = self.snapshots[self.entry_snapshot_index]
-    #     return entry_snapshot.position_vwap_dist
-
-    # @property
-    # def entry_vwap_std(self) -> float:
-    #     """Get VWAP standard deviation at point of entry."""
-    #     if self.entry_snapshot_index is None:
-    #         return np.nan
-    #     entry_snapshot = self.snapshots[self.entry_snapshot_index]
-    #     return entry_snapshot.position_vwap_std
-        
         
     @property
     def vwap_std(self) -> float:
@@ -543,7 +538,154 @@ class PositionMetrics:
         return latest.position_vwap - (2 * std_dev)
     
     
+            
+    def get_breakout_bars(self) -> Tuple[List[TypedBarData], List[TypedBarData]]:
+        """
+        Get bars for breakout analysis.
         
+        Returns:
+            Tuple of (prior_bars, position_bars) where:
+            - prior_bars: Exactly 5 bars ending at entry bar (includes the entry bar)
+            - position_bars: Up to 5 bars strictly after entry
+        """
+        
+        if not self.snapshots:
+            return [], []
+            
+        # Get all bars in chronological order
+        # self.prior_relevant_bars and [s.bar for s in self.snapshots] are consecutive and mutually exclusive
+        all_bars = (
+            self.prior_relevant_bars + 
+            [s.bar for s in self.snapshots]
+        )
+        
+        if self.entry_snapshot_index is None:
+            # Not entered yet - calculate indices relative to current state
+            # entry_idx points to latest snapshot since we haven't entered
+            entry_idx = len(self.prior_relevant_bars) + len(self.snapshots) - 1
+            prior_end = entry_idx + 1  # Include the latest bar
+            prior_start = max(0, prior_end - 5)
+            return all_bars[prior_start:prior_end], []
+        
+        # Calculate full index of entry bar in all_bars
+        # entry_snapshot_index references the bar received before entry
+        # Since prior_relevant_bars and snapshots are consecutive:
+        # - If entry_snapshot_index is 0, entry bar is first snapshot
+        # - If entry_snapshot_index > 0, entry bar is that many bars into snapshots
+        entry_idx = len(self.prior_relevant_bars) + self.entry_snapshot_index
+        
+        # Get exactly 5 bars ending at entry (includes entry bar)
+        prior_end = entry_idx + 1  # Add 1 to include entry bar
+        prior_start = max(0, prior_end - 5)
+        prior_bars = all_bars[prior_start:prior_end]
+        
+        # Get exactly 5 bars after entry (or all available if < 5)
+        # entry_idx + 1 starts at first bar after entry
+        position_bars = all_bars[entry_idx + 1:entry_idx + 6]
+        
+        return prior_bars, position_bars
+            
+        
+    def calculate_breakout_metrics(self) -> Tuple[Optional[AnchoredVWAPMetrics], Optional[AnchoredVWAPMetrics]]:
+        prior_bars, position_bars = self.get_breakout_bars()
+        return TypedBarData.calculate_breakout_metrics(
+            position_bars=position_bars,
+            prior_bars=prior_bars,
+            is_long=self.is_long
+        )
+        
+        
+    def analyze_volume_trend(self, bars: List[TypedBarData]) -> Dict[str, float]:
+        """Analyze volume characteristics in bar sequence."""
+        if not bars:
+            return {
+                'volume_trend': 0.0,
+                'volume_consistency': 0.0,
+                'cumulative_progress': 0.0
+            }
+            
+        # Calculate volume ratios (vs average)
+        volume_ratios = [bar.volume / bar.avg_volume for bar in bars]
+        
+        # Calculate trend (are later bars stronger?)
+        volume_trend = np.polyfit(range(len(volume_ratios)), volume_ratios, 1)[0]
+        
+        # Measure consistency (std dev of ratios)
+        volume_consistency = 1.0 - min(1.0, np.std(volume_ratios))
+        
+        # Calculate how volume progresses
+        cumulative_volumes = np.cumsum(volume_ratios)
+        expected_progress = np.linspace(0, sum(volume_ratios), len(bars))
+        cumulative_progress = np.mean(cumulative_volumes >= expected_progress)
+        
+        return {
+            'volume_trend': volume_trend,
+            'volume_consistency': volume_consistency,
+            'cumulative_progress': cumulative_progress
+        }
+
+
+        
+    def characterize_breakout(self) -> Optional[BreakoutCharacteristics]:
+        """Analyze breakout characteristics using VWAP and volume metrics.
+        
+        Inspired by https://www.youtube.com/watch?v=FdMcPKGtFgA&ab_channel=SMBCapital
+        
+        """
+        prior_bars, position_bars = self.get_breakout_bars()
+        if not position_bars:
+            return None
+            
+        # Get VWAP metrics
+        pre_metrics, post_metrics = self.calculate_breakout_metrics()
+        if not post_metrics:
+            return None
+            
+        # Analyze volume trends
+        vol_metrics = self.analyze_volume_trend(position_bars)
+        
+        # Combine key indicators
+        price_strength = post_metrics.vwap_std_close  # How far we've moved
+        price_conviction = post_metrics.vwap_std  # How direct the move is
+        volume_strength = vol_metrics['volume_trend']
+        volume_consistency = vol_metrics['volume_consistency']
+        
+        # Classification logic
+        if (price_strength > 2.0 and  # Strong move
+            volume_strength > 0.1 and  # Increasing volume
+            volume_consistency > 0.7):  # Consistent buying/selling
+            type = 'Aggressive'
+            confidence = min(1.0, (price_strength/3 + volume_consistency)/2)
+            
+        elif (1.0 <= price_strength <= 2.0 and  # Moderate move
+              volume_consistency > 0.8 and      # Very consistent
+              abs(volume_strength) < 0.1):      # Steady volume
+            type = 'Passive'
+            confidence = volume_consistency
+            
+        elif (abs(price_strength) < 0.5 or     # Weak move
+              volume_consistency < 0.3):        # Inconsistent
+            type = 'Lethargic'
+            confidence = 1.0 - max(abs(price_strength)/2, volume_consistency)
+            
+        else:
+            type = 'Indecisive'
+            confidence = 0.6  # Medium confidence default for mixed signals
+            
+        return BreakoutCharacteristics(
+            type=type,
+            confidence=confidence,
+            vwap_metrics={
+                'price_strength': price_strength,
+                'price_conviction': price_conviction,
+                'vwap_dist': post_metrics.vwap_dist
+            },
+            volume_metrics=vol_metrics
+        )
+
+
+
+    
     def normalize_by_r(self, *values: float) -> Union[float, Tuple[float, ...]]:
         """
         Normalize value(s) by R-unit (area_width).
@@ -579,63 +721,6 @@ class PositionMetrics:
         normalized = tuple((value / ref_price * 100) if not np.isnan(value) else np.nan 
                         for value in values)
         return normalized if len(values) > 1 else normalized[0]
-    
-
-    def get_snapshot_metrics_dict(self, current_time: datetime, prefix: str = '') -> dict:
-        """
-        Get snapshot-specific metrics for a given timestamp.
-        
-        Args:
-            current_time: Timestamp to get metrics for
-            
-        Returns:
-            dict: Dictionary of metric names and their values
-        """
-        # Find the relevant snapshot using binary search since timestamps are ordered
-        if not self.snapshots:
-            return {}
-            
-        timestamps = [s.bar.timestamp for s in self.snapshots]
-        idx = bisect_right(timestamps, current_time) - 1
-        
-        # If no snapshot found up to this time, return empty dict
-        if idx < 0:
-            return {}
-        
-        snapshot = self.snapshots[idx]
-        assert snapshot.bar.timestamp <= current_time
-        
-        metrics = {
-            # VWAP metrics
-            # 'position_vwap': snapshot.position_vwap,
-            f'{prefix}position_vwap_dist': snapshot.position_vwap_dist,
-            f'{prefix}position_vwap_std': snapshot.position_vwap_std,
-            f'{prefix}vwap_std_close': snapshot.vwap_std_close,
-            f'{prefix}vwap_std_high': snapshot.vwap_std_high,
-            f'{prefix}vwap_std_low': snapshot.vwap_std_low,
-        }
-        
-        # Apply normalization if configured
-        if self.norm_strategy == 'r':
-            norm_func = self.normalize_by_r
-        elif self.norm_strategy == 'price':
-            norm_func = self.normalize_by_price
-        else:
-            return metrics
-            
-        # Normalize relevant metrics
-        metrics.update({
-            k: norm_func(v) if not np.isnan(v) else np.nan
-            for k, v in metrics.items()
-            # if isinstance(v, (int, float)) and k in {
-            #     'position_vwap_dist', 'position_vwap_std', 'vwap_std_close', 'vwap_std_high', 'vwap_std_low'
-            # }
-        })
-        
-        return metrics
-
-
-
 
 
     def get_metrics_dict(self) -> dict:
@@ -647,35 +732,8 @@ class PositionMetrics:
             norm_func = self.normalize_by_price
         else:
             norm_func = lambda x: x
-        
-    
-        # # Get first/entry snapshot metrics if we have at least 2 snapshots
-        # if len(self.snapshots) >= 2:
-        #     if self.entry_snapshot_index is not None:
-        #         # Use snapshot after entry if available
-        #         if self.entry_snapshot_index + 1 < len(self.snapshots):
-        #             first_snapshot = self.snapshots[self.entry_snapshot_index + 1]
-        #             snapshot_metrics = self.get_snapshot_metrics_dict(
-        #                 first_snapshot.bar.timestamp, prefix='first_'
-        #             )
-        #     else:
-        #         # Use second snapshot for unentered positions
-        #         first_snapshot = self.snapshots[1]
-        #         snapshot_metrics = self.get_snapshot_metrics_dict(
-        #             first_snapshot.bar.timestamp, prefix='first_'
-        #         )
-        # else:
-        #     # Add nan values for all snapshot metrics
-        #     snapshot_metrics = {
-        #         'first_position_vwap': np.nan,
-        #         'first_position_vwap_dist': np.nan,
-        #         'first_position_vwap_std': np.nan,
-        #         'first_vwap_std_close': np.nan,
-        #         'first_vwap_std_high': np.nan,
-        #         'first_vwap_std_low': np.nan
-        #     }
             
-            
+        pre_metrics, post_metrics = self.calculate_breakout_metrics()
         
         metrics = {
             # Time-based metrics
@@ -717,19 +775,28 @@ class PositionMetrics:
             'min_pl_body_time': self.min_pl_body_time,
             'max_pl_wick_time': self.max_pl_wick_time,
             'min_pl_wick_time': self.min_pl_wick_time,
-        }
 
-        # metrics.update(snapshot_metrics)
-        metrics.update({
+
+
+            # Add breakout metrics
+            'breakout_pre_vwap_dist': norm_func(pre_metrics.vwap_dist),
+            'breakout_pre_vwap_std': norm_func(pre_metrics.vwap_std),
+            'breakout_pre_vwap_std_close': pre_metrics.vwap_std_close,
+            
+            'breakout_post_vwap_dist': norm_func(post_metrics.vwap_dist),
+            'breakout_post_vwap_std': norm_func(post_metrics.vwap_std),
+            'breakout_post_vwap_std_close': post_metrics.vwap_std_close,
+
+
             # # Raw VWAP metrics
             # 'best_vwap_std_close': self.best_vwap_std_close,
             # 'worst_vwap_std_close': self.worst_vwap_std_close,
             # Normalized VWAP metrics
             'avg_vwap_dist': norm_func(self.avg_vwap_dist),
             'avg_vwap_std': norm_func(self.avg_vwap_std),
-            'best_vwap_std_close': norm_func(self.best_vwap_std_close),
-            'worst_vwap_std_close': norm_func(self.worst_vwap_std_close),
-            
+            'best_vwap_std_close': self.best_vwap_std_close,
+            'worst_vwap_std_close': self.worst_vwap_std_close,
+                
             'best_vwap_std_close_time': self.best_vwap_std_close_time,
             'worst_vwap_std_close_time': self.worst_vwap_std_close_time,
             
@@ -770,7 +837,7 @@ class PositionMetrics:
             'ref_area_width': self.reference_area_width,
             'avg_area_width': self.avg_area_width
 
-        })
+        }
         return {k: round(v, 10) if isinstance(v, float) else v for k, v in metrics.items()}
         # return metrics
         

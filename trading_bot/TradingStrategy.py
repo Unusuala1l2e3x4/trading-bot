@@ -9,7 +9,7 @@ import math
 from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
 from trading_bot.TradePosition import TradePosition, export_trades_to_csv
-from trading_bot.TradePositionPlotting import plot_cumulative_pl_and_price, plot_cumulative_pl_and_price_from_snapshots, plot_trade_correlation
+from trading_bot.TradePositionPlotting import TimeRange, plot_cumulative_pl_and_price, plot_cumulative_pl_and_price_from_snapshots, plot_trade_correlation
 from trading_bot.TypedBarData import TypedBarData, PreMarketBar
 from trading_bot.VolumeProfile import VolumeProfile
 
@@ -40,12 +40,12 @@ import os, toml
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-livepaper = os.getenv('LIVEPAPER')
+accountname = os.getenv('ACCOUNTNAME')
 config = toml.load('../config.toml')
 
 # Replace with your Alpaca API credentials
-API_KEY = config[livepaper]['key']
-API_SECRET = config[livepaper]['secret']
+API_KEY = config[accountname]['key']
+API_SECRET = config[accountname]['secret']
 
 trading_client = TradingClient(API_KEY, API_SECRET)
 
@@ -209,7 +209,7 @@ def calculate_margin_values(use_margin: bool, is_marginable: bool, times_buying_
 
 def approximate_stop_execution(position: TradePosition, quotes_agg: pd.DataFrame, prev_halfway_price: float, adjustment_factor: float = 0.6666666666666666):
     # midpoints = (quotes_agg['bid_price_last'] + quotes_agg['ask_price_last']) / 2
-    if position.shares == 0:
+    if position.shares == 0 or quotes_agg is None or quotes_agg.empty:
         return None
     
     
@@ -563,8 +563,8 @@ class TradingStrategy:
         if not position.has_entered:
             return
         if self.params.clear_passed_areas:
-            low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
-            high = max(position.bar_at_commit.high, self.now_bar.high)
+            # low = min(position.bar_at_commit.low, self.now_bar.low) # For mid/losing stocks: 1st overall (best but w/o switching is better)
+            # high = max(position.bar_at_commit.high, self.now_bar.high)
             
             # low = min(position.bar_at_commit.close, self.now_bar.close) # For mid/losing stocks: 4th overall (worst)
             # high = max(position.bar_at_commit.close, self.now_bar.close)
@@ -576,8 +576,8 @@ class TradingStrategy:
             # high = max(position.actual_entry_price, position.exit_price)
             
             
-            # low = position.min_low # For mid/losing stocks: 2nd w/o switching, 3rd w/ switching
-            # high = position.max_high
+            low = position.min_low # For mid/losing stocks: 2nd w/o switching, 3rd w/ switching
+            high = position.max_high
             
             # if position.is_long:
             #     low = position.min_low - position.position_metrics.avg_area_width * 0.25
@@ -594,14 +594,27 @@ class TradingStrategy:
             # low = position.max_low # For mid/losing stocks: 3rd w/o switching, 2nd w/ switching
             # high = position.min_high
             
+            
             # if self.params.clear_traded_areas:
             #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area])
             # else:
             #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp)
+            
             if self.params.clear_traded_areas:
                 position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area], is_long=position.is_long, filter_side= True)
             else:
                 position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, is_long=position.is_long, filter_side= True)
+            
+            
+            # filter_side = position.pl > 0
+            # filter_side = position.pl <= 0
+            # filter_side = position.position_metrics.net_price_diff_body > 0
+            # filter_side = position.position_metrics.net_price_diff_body <= 0
+            
+            # if self.params.clear_traded_areas:
+            #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, [position.area], is_long=position.is_long, filter_side=filter_side)
+            # else:
+            #     position.cleared_area_ids |= self.touch_area_collection.remove_areas_in_range(low, high, current_timestamp, is_long=position.is_long, filter_side=filter_side)
         else:
             if self.params.clear_traded_areas:
                 position.cleared_area_ids |= {position.area.id} # default
@@ -921,7 +934,10 @@ class TradingStrategy:
             target_max_shares=target_max_shares,  # This becomes max_shares
             entry_price=price_at_action,
             bar_at_commit=self.now_bar,
-            prior_relevant_bars=[a for a in self.daily_bar_objects if a.timestamp >= area.touches[0] and a.timestamp < current_timestamp],
+            prior_relevant_bars=[a for a in self.daily_bar_objects if 
+                                    (a.timestamp >= area.touches[0] and a.timestamp < current_timestamp) or 
+                                    (a.timestamp >= current_timestamp - timedelta(minutes=4)) # include AT LEAST 5 prior bars (includes current bar)
+                                 ], 
             
             use_margin=self.params.use_margin,
             is_marginable=self.is_marginable, # NOTE: when live, need to call is_security_marginable
@@ -1131,7 +1147,7 @@ class TradingStrategy:
                 # should_have_exited = self.wick_reached_avg_entry_price(should_exit_price)
                 
                 
-                if prev_halfway_price and should_have_exited_halfway: 
+                if prev_halfway_price and should_have_exited_halfway and not self.now_quotes_agg.empty: 
                     
                     
                     
@@ -1514,7 +1530,9 @@ class TradingStrategy:
                 ret = self.daily_quotes_raw
                 assert self.daily_quotes_raw is not None and not self.daily_quotes_raw.empty, self.daily_quotes_raw
 
-            assert not ret.empty, ret
+            # assert not ret.empty, ret
+            if ret is None or ret.empty:
+                return ret
             dqr_timestamps = ret.index.get_level_values('timestamp')
 
             
@@ -1551,7 +1569,10 @@ class TradingStrategy:
             if self.daily_bars_index >= len(self.daily_quotes_agg_indices)-1:
                 return None
             ret = self.daily_quotes_agg.iloc[self.daily_quotes_agg_indices[self.daily_bars_index] : self.daily_quotes_agg_indices[self.daily_bars_index + 1]]
-            
+        
+        if ret is None or ret.empty:
+            return ret
+        
         ret_latest = ret.index.get_level_values('timestamp')[-1]
         bars_latest = self.daily_bars.iloc[self.daily_bars_index].name[1]
         assert ret_latest <= bars_latest, (ret_latest, bars_latest)
@@ -1872,7 +1893,8 @@ class TradingStrategy:
                            market_close - pd.Timedelta(minutes=3)) if self.touch_detection_areas.end_time else market_close - pd.Timedelta(minutes=3)
         
         if self.params.soft_start_time:
-            day_soft_start_time = max(market_open, day_start_time, 
+            # day_soft_start_time = max(market_open, day_start_time, 
+            day_soft_start_time = max(day_start_time, 
                                       date_obj.replace(hour=self.params.soft_start_time.hour, minute=self.params.soft_start_time.minute))
         else:
             day_soft_start_time = max(market_open, day_start_time)
@@ -2142,16 +2164,21 @@ class TradingStrategy:
         
         print(f"{buying_power_change:,.2f}%\t"+f"{win_trades / len(trades) * 100:.4f}%" if trades else "N/A")
         # print(f"prev_accum_pl_long {self.prev_accum_pl_long}, prev_accum_pl_short {self.prev_accum_pl_short}")
+        
+        time_range = TimeRange(time(9, 30), time(16, 0))
+        # time_range = TimeRange(time(4, 0), time(20, 0))
+        # time_range = TimeRange(time(20, 0), time(4, 0))
+        
             
-        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                      use_plpc=False)
-        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                         use_plpc=True)
         
 
-        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                      use_plpc=False)
-        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                         use_plpc=True)
         
         

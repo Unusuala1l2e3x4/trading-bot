@@ -1235,10 +1235,11 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         
         #
         'trend_strength',
-        'central_value_dist'
-        
-        # 
-        'entry_position_vwap_dist',
+        'central_value_dist',
+        'exit_ema_dist',
+        'VWAP_dist',
+        'VWAP_std_close',
+
         
     }
     # Flip values for shorts

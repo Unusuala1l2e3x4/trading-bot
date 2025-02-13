@@ -4,7 +4,8 @@ import numpy as np
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from alpaca.data.live.stock import StockDataStream
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest
+from alpaca.data.live.crypto import CryptoDataStream
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockLatestQuoteRequest, CryptoBarsRequest, CryptoQuoteRequest, CryptoLatestQuoteRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.stream import TradingStream
@@ -12,7 +13,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest, LimitOrderRequest, StopLimitOrderRequest, TrailingStopOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce, OrderType, TradeEvent
 from alpaca.trading.models import Order, TradeUpdate
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.enums import Adjustment
 from types import SimpleNamespace
 from dataclasses import dataclass, field
@@ -46,12 +47,12 @@ STANDARD_DATETIME_STR = '%Y-%m-%d %H:%M:%S'
 ROUNDING_DECIMAL_PLACES = 10  # Choose an appropriate number of decimal places
 
 load_dotenv(override=True)
-livepaper = os.getenv('LIVEPAPER')
+accountname = os.getenv('ACCOUNTNAME')
 config = toml.load('../config.toml')
 
 # Replace with your Alpaca API credentials
-API_KEY = config[livepaper]['key']
-API_SECRET = config[livepaper]['secret']
+API_KEY = config[accountname]['key']
+API_SECRET = config[accountname]['secret']
 
 
 debug = True
@@ -222,9 +223,9 @@ class LiveTrader:
     slippage_data_list: List[SlippageData] = field(default_factory=list)
     
     trading_client: TradingClient = field(init=False)
-    data_stream: StockDataStream = field(init=False)
+    data_stream: StockDataStream | CryptoDataStream = field(init=False)
     trading_stream: TradingStream = field(init=False)
-    historical_client: StockHistoricalDataClient = field(init=False)
+    historical_client: StockHistoricalDataClient | CryptoHistoricalDataClient = field(init=False)
     trading_strategy: Optional[TradingStrategy] = None
     bars: pd.DataFrame = field(default_factory=pd.DataFrame)
     bars_adjusted: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -249,12 +250,21 @@ class LiveTrader:
     reconciliation_lock: asyncio.Lock = None
 
     def __post_init__(self):
-        self.trading_client = TradingClient(self.api_key, self.secret_key, paper= livepaper == 'paper')
-        self.data_stream = StockDataStream(self.api_key, self.secret_key, feed=DataFeed.IEX, 
-                                           websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
-        self.trading_stream = TradingStream(self.api_key, self.secret_key, paper= livepaper == 'paper',
-                                           websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
-        self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+        assert self.touch_detection_params.client_type in {'stock','crypto'}, self.touch_detection_params.client_type
+        
+        self.trading_client = TradingClient(self.api_key, self.secret_key, ) # paper= accountname == 'paper'
+        self.trading_stream = TradingStream(self.api_key, self.secret_key, 
+                                           websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024}) # paper= accountname == 'paper',
+        
+        if self.touch_detection_params.client_type == 'stock':
+            self.data_stream = StockDataStream(self.api_key, self.secret_key, feed=DataFeed.IEX, 
+                                            websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
+            self.historical_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+        else:
+            assert self.touch_detection_params.client_type == 'crypto'
+            self.data_stream = CryptoDataStream(self.api_key, self.secret_key, feed=DataFeed.IEX, 
+                                            websocket_params={"ping_interval": 2, "ping_timeout": 180, "max_queue": 1024})
+            self.historical_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
         
         self.order_tracker = OrderTracker()
         self.reconciliation_lock = asyncio.Lock()  # Prevent concurrent reconciliation
@@ -1049,11 +1059,14 @@ async def main():
     # symbol = "ETH"
     # symbol = "TSLA"
     symbol = "NVDA"
-    
+
     simulation_mode = True  # Set this to True for simulation, False for live trading
 
     touch_detection_params = LiveTouchDetectionParameters(
         symbol=symbol,
+        client_type='stock',
+        # client_type='crypto',
+        
         # atr_period=15,
         # level1_period=15,
         # multiplier=1.4,

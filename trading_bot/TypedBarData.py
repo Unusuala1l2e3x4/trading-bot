@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -35,7 +35,16 @@ class PreMarketBar:
             vwap=row['vwap'],
             ATR=row['ATR'],
         )
-        
+
+
+@dataclass
+class AnchoredVWAPMetrics:
+    """Container for VWAP metrics calculated from a sequence of bars"""
+    vwap: float = np.nan  # Anchored VWAP value
+    vwap_dist: float = np.nan  # Distance from close to VWAP
+    vwap_std: float = np.nan  # Standard deviation of prices from VWAP
+    vwap_std_close: float = np.nan  # Close price in standard deviations from VWAP
+    
     
 @dataclass
 class TypedBarData:
@@ -51,8 +60,12 @@ class TypedBarData:
     close: float
     volume: float
     trade_count: float
+    
     vwap: float
     VWAP: float
+    VWAP_std: float
+    VWAP_std_close: float
+    
     MACD: float
     MACD_signal: float
     MACD_hist: float
@@ -633,3 +646,85 @@ class TypedBarData:
     # def shows_reversal_potential(area_is_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
     #                         mfi_overbought: float = 75, mfi_oversold: float = 25, 
     #                         pre_position: bool = False) -> bool:
+    
+    
+    
+    @staticmethod
+    def calculate_anchored_vwap_metrics(bars: List['TypedBarData'], 
+                                      is_long: bool) -> Optional[AnchoredVWAPMetrics]:
+        """
+        Calculate VWAP metrics anchored at first bar through last bar.
+        Always calculates metrics regardless of bar count.
+        
+        Args:
+            bars: List of TypedBarData objects
+            is_long: Whether this is a long position 
+            
+        Returns:
+            AnchoredVWAPMetrics object containing the calculated metrics
+        """
+        if not bars:
+            return AnchoredVWAPMetrics()
+            
+        # Calculate cumulative values
+        cumulative_volume = sum(bar.volume for bar in bars)
+        if cumulative_volume == 0:
+            return AnchoredVWAPMetrics()
+            
+        # Calculate VWAP using bar VWAPs (more accurate than typical price)
+        cumulative_vwap_volume = sum(bar.vwap * bar.volume for bar in bars)
+        vwap = cumulative_vwap_volume / cumulative_volume
+        
+        # Get last bar's close for distance calculation
+        last_close = bars[-1].close
+        
+        # Calculate VWAP distance based on position direction
+        if is_long:
+            vwap_dist = last_close - vwap
+        else:
+            vwap_dist = vwap - last_close
+            
+        # Calculate volume-weighted standard deviation
+        squared_devs = sum(
+            bar.volume * (bar.vwap - vwap)**2 
+            for bar in bars
+        )
+        vwap_std = np.sqrt(squared_devs / cumulative_volume)
+        
+        # Calculate close price in standard deviations from VWAP
+        vwap_std_close = ((last_close - vwap) / vwap_std 
+                         if vwap_std > 0 else 0.0)
+        
+        return AnchoredVWAPMetrics(
+            vwap=vwap,
+            vwap_dist=vwap_dist,
+            vwap_std=vwap_std,
+            vwap_std_close=vwap_std_close
+        )
+
+    @staticmethod
+    def calculate_breakout_metrics(position_bars: List['TypedBarData'],
+                                 prior_bars: List['TypedBarData'],
+                                 is_long: bool) -> Tuple[Optional[AnchoredVWAPMetrics], Optional[AnchoredVWAPMetrics]]:
+        """
+        Calculate VWAP metrics for both pre-entry and post-entry periods.
+        
+        Args:
+            position_bars: List of bars since entry (up to 5)
+            prior_bars: List of exactly 5 bars ending at entry
+            is_long: Whether this is a long position
+            
+        Returns:
+            Tuple of (pre_entry_metrics, post_entry_metrics)
+            Either may be None if no volume
+        """
+        # Calculate metrics for both periods
+        pre_entry_metrics = TypedBarData.calculate_anchored_vwap_metrics(
+            prior_bars, is_long
+        )
+        
+        post_entry_metrics = TypedBarData.calculate_anchored_vwap_metrics(
+            position_bars, is_long
+        )
+                
+        return pre_entry_metrics, post_entry_metrics

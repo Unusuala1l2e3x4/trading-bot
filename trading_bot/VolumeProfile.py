@@ -400,11 +400,22 @@ class VolumeProfile:
         # print(np.sum(norm_profile), np.sum(self.smoothed_profile))
         
         # Calculate local threshold using rolling mean
-        window = min_width * 2 + 1  # Odd window centered on potential peak
+        window = min(len(smoothed), min_width * 2 + 1)
+        if window % 2 == 0:  # Make sure window is odd
+            window -= 1
+        if window < 3:  # Minimum window size
+            return np.array([]), np.array([]), np.array([])
         rolling_mean = np.convolve(smoothed, np.ones(window)/window, mode='same')
+        
+        assert smoothed.size == rolling_mean.size, (smoothed.size, rolling_mean.size, window, profile.size, norm_profile.size)
+        #                                           (5, 7, 7, 5, 5)
         
         # Each point must be X% higher than its local neighborhood average
         min_prominence = rolling_mean * self.min_peak_prominence_pct
+        
+        # print(smoothed)
+        # print(min_prominence)
+        assert smoothed.size == min_prominence.size, (smoothed.size, min_prominence.size)
         
         # Detect peaks with more relaxed width constraint
         peaks, properties = find_peaks(
@@ -415,7 +426,7 @@ class VolumeProfile:
         )
         
         if len(peaks) == 0:
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([])
         
         # Return peaks and their prominences 
         # (prominences still relative to local baseline)

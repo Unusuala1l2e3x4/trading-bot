@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from numba import jit
 import logging
-
+from dataclasses import dataclass
 
 from trading_bot.TradePosition import TradePosition
 
@@ -20,12 +20,54 @@ from zoneinfo import ZoneInfo
 ny_tz = ZoneInfo("America/New_York")
 
 
+@dataclass
+class TimeRange:
+    """Defines a daily trading time range."""
+    start_time: time  # e.g. time(9, 30) for 9:30 AM
+    end_time: time    # e.g. time(16, 0) for 4:00 PM
+    volume_bar_minutes: int = 30  # Width of volume bars in minutes
+    
+    def __post_init__(self):
+        # Calculate trading minutes in a day
+        start_minutes = self.start_time.hour * 60 + self.start_time.minute
+        end_minutes = self.end_time.hour * 60 + self.end_time.minute
+        if end_minutes <= start_minutes:
+            end_minutes += 24 * 60  # Handle overnight sessions
+        self.minutes_per_day = end_minutes - start_minutes
+        
+        # Store start time components for offset calculations
+        self.start_hour = self.start_time.hour
+        self.start_minute = self.start_time.minute
+        
+    def get_minute_offset(self, t: time) -> int:
+        """Convert time to minutes from session start."""
+        minutes = t.hour * 60 + t.minute - (self.start_hour * 60 + self.start_minute)
+        if minutes < 0:  # Handle overnight sessions
+            minutes += 24 * 60
+        return minutes
+    
+    def is_within_range(self, t: time) -> bool:
+        """Check if time falls within trading hours."""
+        if self.end_time > self.start_time:  # Normal session
+            return self.start_time <= t <= self.end_time
+        else:  # Overnight session
+            return t >= self.start_time or t <= self.end_time
+    
+    def get_volume_bar_width(self, is_short_period: bool) -> int:
+        """Get appropriate bar width in minutes."""
+        if is_short_period:
+            return self.volume_bar_minutes
+        return self.minutes_per_day
+    
+    
+    
+
 import matplotlib.patches as mpatches
 
 def is_trading_day(date: date):
     return date.weekday() < 5
 
-def prepare_plotting_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[datetime.date], bool]:
+def prepare_plotting_data(df: pd.DataFrame, time_range: TimeRange) -> Tuple[pd.DataFrame, pd.DataFrame, List[datetime.date], bool]:
     """Common data preparation for plotting."""
     timestamps = df.index.get_level_values('timestamp')
     df['time'] = timestamps.time
@@ -35,11 +77,10 @@ def prepare_plotting_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame,
     trading_days = df.groupby('date').apply(lambda x: x['close'].nunique() > 1).reset_index()
     trading_days = set(trading_days[trading_days[0]]['date'])
 
-    # Filter df to include only intraday data and trading days
+    # Filter df by time range
     df_intraday = df[
-        (df['time'] >= time(9, 30)) & 
-        (df['time'] <= time(16, 0)) &
-        (df['date'].isin(trading_days))
+        df['time'].apply(time_range.is_within_range) &
+        df['date'].isin(trading_days)
     ].copy()
 
     # Calculate volume data
@@ -47,26 +88,31 @@ def prepare_plotting_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame,
     is_short_period = date_range <= 7
     
     if is_short_period:
-        df_intraday['half_hour'] = df_intraday['time'].apply(
-            lambda t: t.replace(minute=0 if t.minute < 30 else 30, second=0))
-        volume_data = df_intraday.groupby(['date', 'half_hour'])['volume'].sum().reset_index()
+        # Group by custom intervals based on volume_bar_minutes
+        df_intraday['interval'] = df_intraday['time'].apply(
+            lambda t: t.replace(
+                minute=(t.minute // time_range.volume_bar_minutes) * time_range.volume_bar_minutes,
+                second=0
+            )
+        )
+        volume_data = df_intraday.groupby(['date', 'interval'])['volume'].sum().reset_index()
         volume_data['datetime'] = volume_data.apply(
-            lambda row: pd.Timestamp.combine(row['date'], row['half_hour']), axis=1)
+            lambda row: pd.Timestamp.combine(row['date'], row['interval']), axis=1)
         volume_data = volume_data.set_index('datetime').sort_index()
-        volume_data = volume_data[volume_data.index.time != time(16, 0)]
     else:
         volume_data = df_intraday.groupby('date')['volume'].sum()
 
-    # Create continuous index
+
+    # Create continuous index based on minutes from session start
     unique_dates = sorted(df_intraday['date'].unique())
     continuous_index = []
     cumulative_minutes = 0
     
     for date in unique_dates:
         day_data = df_intraday[df_intraday['date'] == date]
-        day_minutes = day_data['time'].apply(lambda t: (t.hour - 9) * 60 + t.minute - 30)
+        day_minutes = day_data['time'].apply(time_range.get_minute_offset)
         continuous_index.extend(cumulative_minutes + day_minutes)
-        cumulative_minutes += 390
+        cumulative_minutes += time_range.minutes_per_day
 
     df_intraday['continuous_index'] = continuous_index
     
@@ -227,39 +273,46 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
     }
 
 def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dates: List[datetime.date], 
-                is_short_period: bool, point_data: Dict[str, list], use_plpc: bool = False,
-                show_position_markers: bool = True, when_above_max_investment: Optional[List[pd.Timestamp]] = None,
+                is_short_period: bool, point_data: Dict[str, list], continuous_points: List[int],
+                time_range: TimeRange, use_plpc: bool = False, show_position_markers: bool = True,
+                when_above_max_investment: Optional[List[pd.Timestamp]] = None,
                 trading_days: set = None) -> Tuple[plt.Figure, List[plt.Axes]]:
     """Create the plot using prepared data."""
     symbol = df_intraday.index.get_level_values('symbol')[0]
-    continuous_points = []
+    # continuous_points = []
     
-    # Convert timestamps to continuous index
-    for timestamp in point_data['times']:
-        exit_date = timestamp.date()
-        if exit_date in unique_dates:
-            exit_minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
-            days_passed = unique_dates.index(exit_date)
-            continuous_points.append(days_passed * 390 + exit_minute)
+    # # Convert timestamps to continuous index
+    # for timestamp in point_data['times']:
+    #     exit_date = timestamp.date()
+    #     if exit_date in unique_dates:
+    #         exit_minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
+    #         days_passed = unique_dates.index(exit_date)
+    #         continuous_points.append(days_passed * 390 + exit_minute)
 
     # Create figure and axes
     fig, ax1 = plt.subplots(figsize=(18, 10))
     
     # Plot close price
     ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='gray', label='Close Price')
+    ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP'], color='purple', label='VWAP')
     
-    # Add points for when above max investment
+    # print(list(df_intraday.columns))
+    # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'MACD', 'MACD_signal', 'MACD_hist', 'MACD_hist_roc', 'RSI', 'RSI_roc', 'MFI', 'MFI_roc', 'VWAP', 
+    # 'central_value', 'exit_ema', 'is_res', 'H_L', 'ATR', 'MTR', 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'rolling_range_min_4', 'rolling_range_min_7', 
+    # 'rolling_ATR', 'central_value_dist', 'exit_ema_dist', 'ADX', 'trend_strength', 'time', 'date', 'half_hour', 'continuous_index']
+    
+    # Add points for when above max investment if provided
     if when_above_max_investment and len(when_above_max_investment) > 0:
         above_max_continuous_index = []
         for timestamp in when_above_max_investment:
             if timestamp.date() in trading_days:
-                date = timestamp.date()
-                minute = (timestamp.time().hour - 9) * 60 + (timestamp.time().minute - 30)
-                days_passed = unique_dates.index(date)
-                above_max_continuous_index.append(days_passed * 390 + minute)
-        min_close = df_intraday['close'].min()
-        ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
-                color='red', marker='o', linestyle='None', label='Above Max Investment')
+                idx = convert_timestamp_to_continuous_index(timestamp, unique_dates, time_range)
+                if idx is not None:
+                    above_max_continuous_index.append(idx)
+        if above_max_continuous_index:
+            min_close = df_intraday['close'].min()
+            ax1.plot(above_max_continuous_index, [min_close] * len(above_max_continuous_index), 
+                    color='red', marker='o', linestyle='None', label='Above Max Investment')
 
     # Create P/L axis
     ax2 = ax1.twinx()
@@ -302,21 +355,17 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
     ax3 = ax1.twinx()
     ax3.spines['right'].set_position(('axes', 1.1))
     
-    # Plot volume
+    # Plot volume with bar width from TimeRange
+    bar_width = time_range.get_volume_bar_width(is_short_period)
     if is_short_period:
-        bar_width = 30
         for timestamp, row in volume_data.iterrows():
-            date = timestamp.date()
-            time = timestamp.time()
-            days_passed = unique_dates.index(date)
-            minutes = (time.hour - 9) * 60 + time.minute - 30
-            x_position = days_passed * 390 + minutes
-            ax3.bar(x_position, row['volume'], width=bar_width, alpha=0.3, color='purple', align='edge')
-        volume_label = 'Half-hourly Mean Volume'
+            x_position = convert_timestamp_to_continuous_index(timestamp, unique_dates, time_range)
+            if x_position is not None:
+                ax3.bar(x_position, row['volume'], width=bar_width, alpha=0.3, color='purple', align='edge')
+        volume_label = f'{bar_width}-min Mean Volume'
     else:
-        bar_width = 390
         for i, (date, mean_volume) in enumerate(volume_data.items()):
-            ax3.bar(i * 390, mean_volume, width=bar_width, alpha=0.3, color='purple', align='edge')
+            ax3.bar(i * time_range.minutes_per_day, mean_volume, width=bar_width, alpha=0.3, color='purple', align='edge')
         volume_label = 'Daily Mean Volume'
 
     # Set labels and format axes
@@ -341,16 +390,13 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
     ax3_patch = mpatches.Patch(color='purple', alpha=0.3, label=volume_label)
     ax1.legend(lines1 + lines2 + [ax3_patch], labels1 + labels2 + [volume_label], loc='upper left')
 
-    # Set up x-axis ticks and labels
+    # Set up x-axis with dates
     all_days = [date.strftime('%Y-%m-%d') for date in unique_dates]
-    week_starts = []
+    week_starts = [i for i, date in enumerate(unique_dates) 
+                  if i == 0 or date.weekday() < unique_dates[i-1].weekday()]
     
-    for i, date in enumerate(unique_dates):
-        if i == 0 or date.weekday() < unique_dates[i-1].weekday():
-            week_starts.append(i)
-
-    major_ticks = [i * 390 for i in week_starts]
-    all_ticks = list(range(0, len(unique_dates) * 390, 390))
+    major_ticks = [i * time_range.minutes_per_day for i in week_starts]
+    all_ticks = [i * time_range.minutes_per_day for i in range(len(unique_dates))]
 
     ax1.set_xticks(major_ticks)
     ax1.set_xticks(all_ticks, minor=True)
@@ -368,10 +414,26 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
     ax1.grid(which='major', axis='x', linestyle='--', alpha=0.75)
     ax1.grid(which='minor', axis='x', linestyle='--', alpha=0.35)
     
+    # Set up legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax3_patch = mpatches.Patch(color='purple', alpha=0.3, label=volume_label)
+    ax1.legend(lines1 + lines2 + [ax3_patch], labels1 + labels2 + [volume_label], loc='upper left')
+    
     plt.tight_layout()
     return fig, [ax1, ax2, ax3]
 
-def plot_cumulative_pl_and_price(trades: List['TradePosition'], df: pd.DataFrame, initial_investment: float, 
+
+def convert_timestamp_to_continuous_index(timestamp: datetime, unique_dates: List[date], time_range: TimeRange) -> Optional[int]:
+    """Convert timestamp to continuous index value."""
+    if timestamp.date() in unique_dates:
+        days_passed = unique_dates.index(timestamp.date())
+        minute_offset = time_range.get_minute_offset(timestamp.time())
+        return days_passed * time_range.minutes_per_day + minute_offset
+    return None
+
+
+def plot_cumulative_pl_and_price(trades: List['TradePosition'], df: pd.DataFrame, initial_investment: float, time_range: Optional[TimeRange] = None,
                                when_above_max_investment: Optional[List[pd.Timestamp]]=None, 
                                filename: Optional[str]=None,
                                use_plpc: bool=False,
@@ -379,17 +441,28 @@ def plot_cumulative_pl_and_price(trades: List['TradePosition'], df: pd.DataFrame
                                show_position_markers: bool=True):
     """Plot cumulative P/L based on trade transactions."""
     
+    # Use default market hours if no time range provided
+    if time_range is None:
+        time_range = TimeRange(time(9, 30), time(16, 0))
+    
     # Prepare data
-    df_intraday, volume_data, unique_dates, is_short_period = prepare_plotting_data(df)
+    df_intraday, volume_data, unique_dates, is_short_period = prepare_plotting_data(df, time_range)
     trading_days = set(unique_dates)
     
     # Collect point data from transactions
     point_data = collect_transaction_points(trades, trading_days, use_plpc, use_transactions)
     
-    # Create plot
-    fig, axes = create_plot(df_intraday, volume_data, unique_dates, is_short_period, 
-                          point_data, use_plpc, show_position_markers, 
-                          when_above_max_investment, trading_days)
+    # Convert timestamps to continuous indices
+    continuous_points = []
+    for timestamp in point_data['times']:
+        idx = convert_timestamp_to_continuous_index(timestamp, unique_dates, time_range)
+        if idx is not None:
+            continuous_points.append(idx)
+    
+    # Create plot using updated continuous indices
+    fig, axes = create_plot(df_intraday, volume_data, unique_dates, is_short_period,
+                          point_data, continuous_points, time_range, use_plpc,
+                          show_position_markers, when_above_max_investment, trading_days)
     if use_transactions:
         plt.title('Transactions level')
     else:
@@ -409,23 +482,36 @@ def plot_cumulative_pl_and_price(trades: List['TradePosition'], df: pd.DataFrame
 
 def plot_cumulative_pl_and_price_from_snapshots(trades: List['TradePosition'], df: pd.DataFrame, 
                                              initial_investment: float, 
+                                             time_range: Optional[TimeRange] = None,
                                              when_above_max_investment: Optional[List[pd.Timestamp]]=None, 
                                              filename: Optional[str]=None,
                                              use_plpc: bool=False,
                                              show_position_markers: bool=True):
     """Plot cumulative P/L based on position metrics snapshots."""
     
+    # Use default market hours if no time range provided
+    if time_range is None:
+        # time_range = TimeRange(time(9, 30), time(16, 0))
+        time_range = TimeRange(time(0, 0), time(23, 59))
+    
     # Prepare data
-    df_intraday, volume_data, unique_dates, is_short_period = prepare_plotting_data(df)
+    df_intraday, volume_data, unique_dates, is_short_period = prepare_plotting_data(df, time_range)
     trading_days = set(unique_dates)
     
     # Collect point data from snapshots
     point_data = collect_snapshot_points(trades, trading_days, use_plpc)
     
-    # Create plot
-    fig, axes = create_plot(df_intraday, volume_data, unique_dates, is_short_period, 
-                          point_data, use_plpc, show_position_markers,
-                          when_above_max_investment, trading_days)
+    # Convert timestamps to continuous indices
+    continuous_points = []
+    for timestamp in point_data['times']:
+        idx = convert_timestamp_to_continuous_index(timestamp, unique_dates, time_range)
+        if idx is not None:
+            continuous_points.append(idx)
+    
+    # Create plot using updated continuous indices
+    fig, axes = create_plot(df_intraday, volume_data, unique_dates, is_short_period,
+                          point_data, continuous_points, time_range, use_plpc,
+                          show_position_markers, when_above_max_investment, trading_days)
     plt.title('Snapshots level')
     plt.tight_layout()
     # Save or display
