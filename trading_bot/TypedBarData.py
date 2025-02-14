@@ -62,9 +62,6 @@ class TypedBarData:
     trade_count: float
     
     vwap: float
-    VWAP: float
-    VWAP_std: float
-    VWAP_std_close: float
     
     MACD: float
     MACD_signal: float
@@ -74,29 +71,40 @@ class TypedBarData:
     RSI_roc: float
     MFI: float
     MFI_roc: float
+        
+    VWAP: float
+    VWAP_dist: float
+    VWAP_std: float
+    VWAP_std_close: float
+    
     central_value: float
+    central_value_dist: float
+
     exit_ema: float
+    exit_ema_dist: float
+
     is_res: bool
-    # shares_per_trade: float
-    avg_volume: float # (EMA)
-    avg_trade_count: float # (EMA)
-    log_return: float
-    volatility: float # (rolling)
     
     # New bar data fields
     H_L: float  # High-Low range
     # H_PC: float  # High-Previous Close
     # L_PC: float  # Low-Previous Close
     # TR: float  # True Range
+    
     ATR: float  # Average True Range (EMA)
-    MTR: float  # Median True Range
+    MTR: float  # Median True Range    
+    
+    # shares_per_trade: float
+    avg_volume: float # (EMA)
+    avg_trade_count: float # (EMA)
+    log_return: float
+    volatility: float # (rolling)
+
     rolling_range_min_4: float  # 4-bar minimum range
     rolling_range_min_7: float  # 7-bar minimum range
     rolling_ATR: float  # rolling ATR average
 
     # New trend metrics
-    central_value_dist: float       # Normalized distance to central value
-    exit_ema_dist: float
     ADX: float                      # Overall trend strength (0-100)
     trend_strength: float           # Directional trend strength (-100 to +100)
 
