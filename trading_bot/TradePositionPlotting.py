@@ -200,6 +200,9 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
     cumulative_pl = []
     cumulative_pl_longs = []
     cumulative_pl_shorts = []
+    avwap = []
+    vwap_std_plus = []
+    vwap_std_minus = []
     running_pl = 0
     running_pl_longs = 0
     running_pl_shorts = 0
@@ -218,6 +221,9 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
             cumulative_pl.append(running_pl)
             cumulative_pl_longs.append(running_pl_longs)
             cumulative_pl_shorts.append(running_pl_shorts)
+            avwap.append(np.nan)
+            vwap_std_plus.append(np.nan)
+            vwap_std_minus.append(np.nan)
 
         # Add points for each snapshot 
         for snapshot in trade.position_metrics.snapshots:
@@ -243,6 +249,9 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
                 cumulative_pl.append(snapshot_pl)
                 cumulative_pl_longs.append(snapshot_pl_longs)
                 cumulative_pl_shorts.append(snapshot_pl_shorts)
+                avwap.append(snapshot.position_vwap)
+                vwap_std_plus.append(snapshot.position_vwap + snapshot.position_vwap_std)
+                vwap_std_minus.append(snapshot.position_vwap - snapshot.position_vwap_std)
 
             # Update final cumulative values from last snapshot
             if trade.exit_time and snapshot.timestamp == trade.exit_time:
@@ -262,6 +271,9 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
                 cumulative_pl.append(running_pl)
                 cumulative_pl_longs.append(running_pl_longs)
                 cumulative_pl_shorts.append(running_pl_shorts)
+                avwap.append(snapshot.position_vwap)
+                vwap_std_plus.append(snapshot.position_vwap + snapshot.position_vwap_std)
+                vwap_std_minus.append(snapshot.position_vwap - snapshot.position_vwap_std)
 
     return {
         'times': point_times,
@@ -269,7 +281,10 @@ def collect_snapshot_points(trades: List['TradePosition'], trading_days: set, us
         'trades': point_trades,
         'pl': cumulative_pl,
         'pl_longs': cumulative_pl_longs,
-        'pl_shorts': cumulative_pl_shorts
+        'pl_shorts': cumulative_pl_shorts,
+        'avwap': avwap,
+        'vwap_std_plus': vwap_std_plus,
+        'vwap_std_minus': vwap_std_minus
     }
 
 def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dates: List[datetime.date], 
@@ -293,8 +308,10 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
     fig, ax1 = plt.subplots(figsize=(18, 10))
     
     # Plot close price
-    ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='gray', label='Close Price')
-    ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP'], color='purple', label='VWAP')
+    ax1.plot(df_intraday['continuous_index'], df_intraday['close'], color='black', label='Close Price',alpha=0.4, zorder=0)
+    ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP'], color='purple', label='VWAP', zorder=0)
+    ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP']+df_intraday['VWAP_std'], color='purple', label='VWAP std +',alpha=0.3, zorder=0)
+    ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP']-df_intraday['VWAP_std'], color='purple', label='VWAP std -',alpha=0.3, zorder=0)
     
     # print(list(df_intraday.columns))
     # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'MACD', 'MACD_signal', 'MACD_hist', 'MACD_hist_roc', 'RSI', 'RSI_roc', 'MFI', 'MFI_roc', 'VWAP', 
@@ -322,6 +339,11 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
         ax2.plot(continuous_points, point_data['pl'], color='green', label='All P/L', zorder=1)
         ax2.plot(continuous_points, point_data['pl_longs'], color='blue', label='Longs P/L', zorder=1)
         ax2.plot(continuous_points, point_data['pl_shorts'], color='yellow', label='Shorts P/L', zorder=1)
+        if 'avwap' in point_data:
+            assert 'vwap_std_plus' in point_data and 'vwap_std_minus' in point_data
+            ax1.plot(continuous_points, point_data['avwap'], color='cyan', label='AVWAP', zorder=0)
+            ax1.plot(continuous_points, point_data['vwap_std_plus'], color='cyan', label='AVWAP std +', zorder=0, alpha=0.35)
+            ax1.plot(continuous_points, point_data['vwap_std_minus'], color='cyan', label='AVWAP std -', zorder=0, alpha=0.35)
         
         if show_position_markers:
             # Separate indices by position side
@@ -361,11 +383,11 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
         for timestamp, row in volume_data.iterrows():
             x_position = convert_timestamp_to_continuous_index(timestamp, unique_dates, time_range)
             if x_position is not None:
-                ax3.bar(x_position, row['volume'], width=bar_width, alpha=0.3, color='purple', align='edge')
+                ax3.bar(x_position, row['volume'], width=bar_width, alpha=0.15, color='purple', align='edge')
         volume_label = f'{bar_width}-min Mean Volume'
     else:
         for i, (date, mean_volume) in enumerate(volume_data.items()):
-            ax3.bar(i * time_range.minutes_per_day, mean_volume, width=bar_width, alpha=0.3, color='purple', align='edge')
+            ax3.bar(i * time_range.minutes_per_day, mean_volume, width=bar_width, alpha=0.15, color='purple', align='edge')
         volume_label = 'Daily Mean Volume'
 
     # Set labels and format axes
@@ -516,16 +538,96 @@ def plot_cumulative_pl_and_price_from_snapshots(trades: List['TradePosition'], d
     plt.tight_layout()
     # Save or display
     if filename:
-        if use_plpc and 'pl' in filename and 'plpc' not in filename:
-            filename = filename.replace('pl','plpc')
+        if use_plpc:
+            fn = 'plpc_'+os.path.basename(filename)
+        else:
+            fn = 'pl_'+os.path.basename(filename)
         os.makedirs(os.path.dirname(filename), exist_ok=True)
-        plt.savefig(filename, dpi=300)
+        # plt.savefig(filename, dpi=300)
+        plt.savefig(os.path.join(os.path.dirname(filename), fn), dpi=300)
         print(f"Graph has been saved as {filename}")
     else:
         plt.show()
         
     plt.close()
+
+
+
+def plot_cumulative_pl_and_price_from_snapshots_by_day(
+    trades: List['TradePosition'], 
+    df: pd.DataFrame, 
+    initial_investment: float,
+    time_range: Optional[TimeRange] = None,
+    when_above_max_investment: Optional[List[pd.Timestamp]] = None,
+    filename: Optional[str] = None,
+    use_plpc: bool = False,
+    show_position_markers: bool = True
+):
+    """
+    Create separate plots for each trading day.
     
+    Args:
+        trades: List of TradePosition objects
+        df: DataFrame containing price and volume data
+        initial_investment: Initial investment amount
+        time_range: Optional TimeRange object for custom trading hours
+        when_above_max_investment: Optional list of timestamps when above max investment
+        filename: Optional base filename (if .csv extension present, it will be removed)
+        use_plpc: Whether to use percentage change instead of absolute P/L
+        show_position_markers: Whether to show position entry/exit markers
+    """
+    # Get unique dates from trades
+    unique_dates = sorted(set(trade.date for trade in trades))
+    
+    # Create output directory if filename provided
+    output_dir = None
+    if filename:
+        base_name = filename.rsplit('.', 1)[0] if filename.endswith('.png') else filename
+        output_dir = base_name
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Plot each day
+    for date in unique_dates:
+        # Filter trades for this day
+        day_trades = [trade for trade in trades if trade.date == date]
+        if not day_trades:
+            continue
+            
+        # Filter DataFrame for this day
+        day_df = df[df.index.get_level_values('timestamp').date == date].copy()
+        if day_df.empty:
+            continue
+            
+        # Filter when_above_max_investment for this day
+        day_above_max = None
+        if when_above_max_investment:
+            day_above_max = [t for t in when_above_max_investment 
+                           if t.date() == date]
+            
+        # Create day's plot
+        day_filename = None
+        if output_dir:
+            # Create filename with date suffix
+            day_filename = os.path.join(
+                output_dir, 
+                f"{date.strftime('%Y-%m-%d')}.png"
+                # f"{os.path.basename(base_name)}_{date.strftime('%Y-%m-%d')}.png"
+            )
+            
+        plot_cumulative_pl_and_price_from_snapshots(
+            trades=day_trades,
+            df=day_df,
+            initial_investment=initial_investment,
+            time_range=time_range,
+            when_above_max_investment=day_above_max,
+            filename=day_filename,
+            use_plpc=use_plpc,
+            show_position_markers=show_position_markers
+        )
+
+    return len(unique_dates)  # Return number of plots created
+
+
     
     
 from mpl_toolkits.axes_grid1 import make_axes_locatable

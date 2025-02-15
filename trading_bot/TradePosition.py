@@ -70,7 +70,13 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
     return price * (1 + slippage_ratio), slippage_price_change
 
     
-    
+@dataclass
+class TakeProfitLevel:
+    std_distance: float  # Distance in standard deviations
+    size_fraction: float # Fraction of position to exit
+    executed: bool = False
+
+
 @dataclass
 class Transaction:
     timestamp: datetime
@@ -134,6 +140,7 @@ class TradePosition:
     prior_relevant_bars: List[TypedBarData]
     
     bar_at_entry: TypedBarData = None
+    bar_at_switch: TypedBarData = None
     market_value: float = 0.0
     shares: int = 0 # no fractional trading
     partial_entry_count: int = 0
@@ -182,6 +189,7 @@ class TradePosition:
     current_stop_price_2: Optional[float] = None
     
     position_metrics: PositionMetrics = None
+    take_profit_levels: List[TakeProfitLevel] = field(default_factory=list)
     
     max_close: Optional[float] = None
     min_close: Optional[float] = None
@@ -275,13 +283,37 @@ class TradePosition:
             
         self.update_stop_price(self.bar_at_commit, None, self.entry_time)
         self.position_metrics = PositionMetrics(self.is_long, prior_relevant_bars=self.prior_relevant_bars)
-    
+        self.bar_at_switch = self.area.bar_at_switch
+        
+        self.take_profit_levels = [
+            TakeProfitLevel(1.5, 0.5),  # Exit 50% at 1.5 std
+            TakeProfitLevel(2.5, 0.6),  # Exit 60% of remainder at 2.5 std
+        ]
+
+    @property
+    def get_area_width(self):
+        # v1
+        # if self.position_metrics is None or self.position_metrics.num_snapshots == 0:
+        #     return self.area.get_range
+        # else:
+        #     return self.position_metrics.reference_area_width
+        
+        # # v2
+        # if self.position_metrics is None or self.position_metrics.entry_snapshot_index is None:
+        #     return self.area.get_range
+        # else:
+        #     return self.position_metrics.reference_area_width
+        
+        # orig
+        return self.area.get_range
+        
+        
     
     def set_full_entry_price(self):
         if self.is_long:
-            self.full_entry_price = self.area.get_buy_price + (self.area.get_range * self.gradual_entry_range_multiplier) # area bounds already updated in TradingStrategy.create_new_position
+            self.full_entry_price = self.area.get_buy_price + (self.get_area_width * self.gradual_entry_range_multiplier) # area bounds already updated in TradingStrategy.create_new_position
         else:
-            self.full_entry_price = self.area.get_buy_price - (self.area.get_range * self.gradual_entry_range_multiplier)
+            self.full_entry_price = self.area.get_buy_price - (self.get_area_width * self.gradual_entry_range_multiplier)
         
         
     def calculate_target_shares_from_price(self, current_price: float) -> int:
@@ -394,7 +426,7 @@ class TradePosition:
 
         transaction = Transaction(timestamp, shares, price_unadjusted, price, is_entry, self.is_long, transaction_cost, finra_taf, sec_fee, stock_borrow_cost, commission, 
                                   value, bar, 
-                                  self.area.get_range,
+                                  self.get_area_width,
                                   self.shares,
                                   self.max_shares,
                                   slippage_price_change=slippage_price_change,
@@ -630,15 +662,15 @@ class TradePosition:
         self.min_low = min(self.min_low or self.bar_at_commit.low, bar.low)
 
         if self.is_long:
-            self.current_stop_price = self.max_close - self.area.get_range
-            # self.current_stop_price = max(self.max_close - self.area.get_range, self.area.get_buy_price)
-            # self.current_stop_price = max(self.max_close - self.area.get_range, self.set_halfway_price())
-            self.current_stop_price_2 = self.max_close - self.area.get_range * 3
+            self.current_stop_price = self.max_close - self.get_area_width
+            # self.current_stop_price = max(self.max_close - self.get_area_width, self.area.get_buy_price)
+            # self.current_stop_price = max(self.max_close - self.get_area_width, self.set_halfway_price())
+            self.current_stop_price_2 = self.max_close - self.get_area_width * 3
         else:
-            self.current_stop_price = self.min_close + self.area.get_range
-            # self.current_stop_price = min(self.min_close + self.area.get_range, self.area.get_buy_price)
-            # self.current_stop_price = min(self.min_close + self.area.get_range, self.set_halfway_price())
-            self.current_stop_price_2 = self.min_close + self.area.get_range * 3
+            self.current_stop_price = self.min_close + self.get_area_width
+            # self.current_stop_price = min(self.min_close + self.get_area_width, self.area.get_buy_price)
+            # self.current_stop_price = min(self.min_close + self.get_area_width, self.set_halfway_price())
+            self.current_stop_price_2 = self.min_close + self.get_area_width * 3
         
         self.set_halfway_price(bar.close)
         # self.set_halfway_price(exit_quote_price)
@@ -651,7 +683,7 @@ class TradePosition:
         # should_exit_halfway = self.max_shares_ratio_threshold(0.25) and is_profitable
         
         # self.update_market_value(exit_quote_price) # NOTE: update_market_value should use quotes data, but not necessary here. quote price isnt determined yet anyways.
-        self.log(f"area {self.area.id}: get_range {self.area.get_range:.4f}",level=logging.DEBUG)
+        self.log(f"area {self.area.id}: get_range {self.get_area_width:.4f}",level=logging.DEBUG)
         
         # if not self.has_crossed_full_entry:
         self.set_max_target_shares_limit(bar, current_timestamp)
@@ -1092,7 +1124,7 @@ class TradePosition:
             prev_shares=shares_to_exit,
             max_shares=self.max_shares,
             max_target_shares_limit=self.max_target_shares_limit or 0,
-            area_width=self.area.get_range,
+            area_width=self.get_area_width,
             area_buy_price=self.area.get_buy_price,
             avg_entry_price=self.avg_entry_price,
             
@@ -1203,7 +1235,9 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
         
     df = pd.DataFrame(data)
     bardf = TypedBarData.to_dataframe([trade.bar_at_entry for trade in trades])
+    # print(bardf.columns)
     float_cols = bardf.select_dtypes(include=['float']).columns
+    # print(float_cols)
     bardf[float_cols] = bardf[float_cols].round(10)
     # assert bardf['timestamp'].dt.strftime('%H:%M:%S').equals(df['Entry Time']), f"{bardf['timestamp'].dt.strftime('%H:%M:%S')}\n{df['Entry Time']}"
     df = pd.concat([df,bardf.drop(columns=['timestamp','symbol','time','date'],errors='ignore')],axis=1)

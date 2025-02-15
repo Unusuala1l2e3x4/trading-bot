@@ -166,7 +166,7 @@ class PositionMetrics:
             if not isinstance(value, (int, float)):
                 continue
             # Check if value is nan or inf
-            if isinstance(value, float) and np.isinf(value):
+            if isinstance(value, float) and not np.isfinite(value):
                 setattr(self, attr_name, np.nan)
             
     @property
@@ -208,6 +208,53 @@ class PositionMetrics:
     @property 
     def reference_price_norm(self) -> float:
         return self.reference_price/100
+    
+    
+        
+    @property
+    def avg_reference_area_width(self) -> float:
+        """Get average area width between entry and exit."""
+        if not self.snapshots:
+            return float('inf')
+            
+        if self.entry_snapshot_index is None:
+            # Not entered - use all snapshots
+            snapshots = self.snapshots
+        else:
+            # Get snapshots from entry to exit (inclusive)
+            end_idx = self.exit_snapshot_index + 1 if self.exit_snapshot_index is not None else None
+            snapshots = self.snapshots[self.entry_snapshot_index:end_idx]
+            
+        return np.mean([s.area_width for s in snapshots])
+
+    @property 
+    def avg_reference_price(self) -> float:
+        """Get average close price between entry and exit."""
+        if not self.snapshots:
+            return float('inf')
+            
+        if self.entry_snapshot_index is None:
+            # Not entered - use all snapshots
+            snapshots = self.snapshots
+        else:
+            # Get snapshots from entry to exit (inclusive)
+            end_idx = self.exit_snapshot_index + 1 if self.exit_snapshot_index is not None else None
+            snapshots = self.snapshots[self.entry_snapshot_index:end_idx]
+            
+        return np.mean([s.bar.close for s in snapshots])
+
+    def normalize_relative_metrics(self, value: float) -> float:
+        """
+        Normalize metrics that depend on bar-by-bar values.
+        Used for central_value_dist and vwap_dist.
+        """
+        if self.norm_strategy == 'r':
+            return value / self.avg_reference_area_width if np.isfinite(value) else np.nan
+        elif self.norm_strategy == 'price':
+            return (value / self.avg_reference_price * 100) if np.isfinite(value) else np.nan
+        return value
+        
+    
 
         
     def add_snapshot(self, snapshot: PositionSnapshot, best_wick_pl: float, worst_wick_pl: float, best_wick_plpc: float, worst_wick_plpc: float):
@@ -464,13 +511,16 @@ class PositionMetrics:
         
     @property
     def avg_vwap_dist(self) -> float:
-        return np.mean([a.position_vwap_dist for a in self.snapshots if np.isfinite(a.position_vwap_dist)])
+        return np.mean([a.position_vwap_dist for a in self.snapshots if np.isfinite(a.position_vwap_dist)]) # TODO: filter to when holding
     
     @property
     def avg_vwap_std(self) -> float:
-        return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)])
+        return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)]) # TODO: filter to when holding
 
-        
+    @property
+    def avg_vwap_std_close(self) -> float:
+        return np.mean([a.vwap_std_close for a in self.snapshots if np.isfinite(a.vwap_std_close)]) # TODO: filter to when holding
+    
     @property
     def vwap_std(self) -> float:
         """Calculate volume-weighted standard deviation of bar VWAPs from position VWAP."""
@@ -500,7 +550,7 @@ class PositionMetrics:
             Single float if one price passed, tuple of floats if multiple.
             Each value represents number of standard deviations 
             (positive if above VWAP, negative if below)
-            np.nan: If std_dev is 0 or no snapshots available
+            np.nan: If std_dev is too small, no snapshots available, or result exceeds threshold
         """
         if not self.snapshots or len(self.snapshots) == 1 or self.entry_snapshot_index is None:
             return tuple(np.nan for _ in prices) if len(prices) > 1 else np.nan
@@ -508,12 +558,22 @@ class PositionMetrics:
         latest = self.snapshots[-1]
         std_dev = latest.position_vwap_std  # Using stored std from snapshot
         
-        if np.isnan(std_dev) or std_dev == 0:
+        MIN_STD_DEV = 1e-8  # Minimum meaningful standard deviation - Values beyond 10 standard deviations are extremely rare in normal distributions
+        MAX_STD_VALUE = 10.0  # Cap at 10 standard deviations
+        
+        if not np.isfinite(std_dev) or std_dev < MIN_STD_DEV:
             return tuple(np.nan for _ in prices) if len(prices) > 1 else np.nan
             
-        std_values = tuple((price - latest.position_vwap) / std_dev 
-                        for price in prices)
-        return std_values if len(prices) > 1 else std_values[0]
+        std_values = []
+        for price in prices:
+            std_value = (price - latest.position_vwap) / std_dev
+            # Return np.nan if value is too extreme
+            if abs(std_value) > MAX_STD_VALUE:
+                std_values.append(np.nan)
+            else:
+                std_values.append(std_value)
+        
+        return tuple(std_values) if len(prices) > 1 else std_values[0]
 
     @property 
     def vwap_upper_band(self) -> float:
@@ -522,7 +582,7 @@ class PositionMetrics:
             return np.nan
         latest = self.snapshots[-1]
         std_dev = self.vwap_std
-        if np.isnan(std_dev):
+        if not np.isfinite(std_dev):
             return np.nan
         return latest.position_vwap + (2 * std_dev)
 
@@ -533,7 +593,7 @@ class PositionMetrics:
             return np.nan
         latest = self.snapshots[-1]
         std_dev = self.vwap_std
-        if np.isnan(std_dev):
+        if not np.isfinite(std_dev):
             return np.nan
         return latest.position_vwap - (2 * std_dev)
     
@@ -626,62 +686,62 @@ class PositionMetrics:
 
 
         
-    def characterize_breakout(self) -> Optional[BreakoutCharacteristics]:
-        """Analyze breakout characteristics using VWAP and volume metrics.
+    # def characterize_breakout(self) -> Optional[BreakoutCharacteristics]:
+    #     """Analyze breakout characteristics using VWAP and volume metrics.
         
-        Inspired by https://www.youtube.com/watch?v=FdMcPKGtFgA&ab_channel=SMBCapital
+    #     Inspired by https://www.youtube.com/watch?v=FdMcPKGtFgA&ab_channel=SMBCapital
         
-        """
-        prior_bars, position_bars = self.get_breakout_bars()
-        if not position_bars:
-            return None
+    #     """
+    #     prior_bars, position_bars = self.get_breakout_bars()
+    #     if not position_bars:
+    #         return None
             
-        # Get VWAP metrics
-        pre_metrics, post_metrics = self.calculate_breakout_metrics()
-        if not post_metrics:
-            return None
+    #     # Get VWAP metrics
+    #     pre_metrics, post_metrics = self.calculate_breakout_metrics()
+    #     if not post_metrics:
+    #         return None
             
-        # Analyze volume trends
-        vol_metrics = self.analyze_volume_trend(position_bars)
+    #     # Analyze volume trends
+    #     vol_metrics = self.analyze_volume_trend(position_bars)
         
-        # Combine key indicators
-        price_strength = post_metrics.vwap_std_close  # How far we've moved
-        price_conviction = post_metrics.vwap_std  # How direct the move is
-        volume_strength = vol_metrics['volume_trend']
-        volume_consistency = vol_metrics['volume_consistency']
+    #     # Combine key indicators
+    #     price_strength = post_metrics.vwap_std_close  # How far we've moved
+    #     price_conviction = post_metrics.vwap_std  # How direct the move is
+    #     volume_strength = vol_metrics['volume_trend']
+    #     volume_consistency = vol_metrics['volume_consistency']
         
-        # Classification logic
-        if (price_strength > 2.0 and  # Strong move
-            volume_strength > 0.1 and  # Increasing volume
-            volume_consistency > 0.7):  # Consistent buying/selling
-            type = 'Aggressive'
-            confidence = min(1.0, (price_strength/3 + volume_consistency)/2)
+    #     # Classification logic
+    #     if (price_strength > 2.0 and  # Strong move
+    #         volume_strength > 0.1 and  # Increasing volume
+    #         volume_consistency > 0.7):  # Consistent buying/selling
+    #         type = 'Aggressive'
+    #         confidence = min(1.0, (price_strength/3 + volume_consistency)/2)
             
-        elif (1.0 <= price_strength <= 2.0 and  # Moderate move
-              volume_consistency > 0.8 and      # Very consistent
-              abs(volume_strength) < 0.1):      # Steady volume
-            type = 'Passive'
-            confidence = volume_consistency
+    #     elif (1.0 <= price_strength <= 2.0 and  # Moderate move
+    #           volume_consistency > 0.8 and      # Very consistent
+    #           abs(volume_strength) < 0.1):      # Steady volume
+    #         type = 'Passive'
+    #         confidence = volume_consistency
             
-        elif (abs(price_strength) < 0.5 or     # Weak move
-              volume_consistency < 0.3):        # Inconsistent
-            type = 'Lethargic'
-            confidence = 1.0 - max(abs(price_strength)/2, volume_consistency)
+    #     elif (abs(price_strength) < 0.5 or     # Weak move
+    #           volume_consistency < 0.3):        # Inconsistent
+    #         type = 'Lethargic'
+    #         confidence = 1.0 - max(abs(price_strength)/2, volume_consistency)
             
-        else:
-            type = 'Indecisive'
-            confidence = 0.6  # Medium confidence default for mixed signals
+    #     else:
+    #         type = 'Indecisive'
+    #         confidence = 0.6  # Medium confidence default for mixed signals
             
-        return BreakoutCharacteristics(
-            type=type,
-            confidence=confidence,
-            vwap_metrics={
-                'price_strength': price_strength,
-                'price_conviction': price_conviction,
-                'vwap_dist': post_metrics.vwap_dist
-            },
-            volume_metrics=vol_metrics
-        )
+    #     return BreakoutCharacteristics(
+    #         type=type,
+    #         confidence=confidence,
+    #         vwap_metrics={
+    #             'price_strength': price_strength,
+    #             'price_conviction': price_conviction,
+    #             'vwap_dist': post_metrics.vwap_dist
+    #         },
+    #         volume_metrics=vol_metrics
+    #     )
 
 
 
@@ -700,7 +760,7 @@ class PositionMetrics:
         if r_unit == 0.0:
             return tuple(0.0 for _ in values) if len(values) > 1 else 0.0
             
-        normalized = tuple(value / r_unit if not np.isnan(value) else np.nan 
+        normalized = tuple(value / r_unit if np.isfinite(value) else np.nan 
                         for value in values)
         return normalized if len(values) > 1 else normalized[0]
 
@@ -718,7 +778,7 @@ class PositionMetrics:
         if ref_price == 0.0:
             return tuple(0.0 for _ in values) if len(values) > 1 else 0.0
             
-        normalized = tuple((value / ref_price * 100) if not np.isnan(value) else np.nan 
+        normalized = tuple((value / ref_price * 100) if np.isfinite else np.nan 
                         for value in values)
         return normalized if len(values) > 1 else normalized[0]
 
@@ -728,10 +788,16 @@ class PositionMetrics:
         
         if self.norm_strategy == 'r':
             norm_func = self.normalize_by_r
+            norm_relative = self.normalize_relative_metrics
         elif self.norm_strategy == 'price':
             norm_func = self.normalize_by_price
+            norm_relative = self.normalize_relative_metrics
         else:
             norm_func = lambda x: x
+            norm_relative = lambda x: x
+                
+        
+        
             
         pre_metrics, post_metrics = self.calculate_breakout_metrics()
         
@@ -779,12 +845,11 @@ class PositionMetrics:
 
 
             # Add breakout metrics
-            'breakout_pre_vwap_dist': norm_func(pre_metrics.vwap_dist),
+            'breakout_pre_vwap_dist': norm_func(pre_metrics.vwap_dist), # NOTE: okay to use norm_func since it is only 5 bars
+            'breakout_post_vwap_dist': norm_func(post_metrics.vwap_dist), # NOTE: okay to use norm_func since it is only 5 bars
             'breakout_pre_vwap_std': norm_func(pre_metrics.vwap_std),
-            'breakout_pre_vwap_std_close': pre_metrics.vwap_std_close,
-            
-            'breakout_post_vwap_dist': norm_func(post_metrics.vwap_dist),
             'breakout_post_vwap_std': norm_func(post_metrics.vwap_std),
+            'breakout_pre_vwap_std_close': pre_metrics.vwap_std_close,
             'breakout_post_vwap_std_close': post_metrics.vwap_std_close,
 
 
@@ -792,8 +857,9 @@ class PositionMetrics:
             # 'best_vwap_std_close': self.best_vwap_std_close,
             # 'worst_vwap_std_close': self.worst_vwap_std_close,
             # Normalized VWAP metrics
-            'avg_vwap_dist': norm_func(self.avg_vwap_dist),
+            'avg_vwap_dist': norm_relative(self.avg_vwap_dist), # NOTE: normalized by average
             'avg_vwap_std': norm_func(self.avg_vwap_std),
+            'avg_vwap_std_close': self.avg_vwap_std_close,
             'best_vwap_std_close': self.best_vwap_std_close,
             'worst_vwap_std_close': self.worst_vwap_std_close,
                 
@@ -815,8 +881,8 @@ class PositionMetrics:
             
             # Normalized price differences (R-multiples)
             'avg_entry_price_diff': norm_func(self.avg_entry_price_diff),
-            'avg_central_value_dist': norm_func(self.avg_central_value_dist),
-            'avg_prior_central_value_dist': norm_func(self.avg_prior_central_value_dist),
+            'avg_central_value_dist': norm_relative(self.avg_central_value_dist), # NOTE: normalized by average
+            'avg_prior_central_value_dist': norm_relative(self.avg_prior_central_value_dist), # NOTE: normalized by average
             
             'net_price_diff_body': norm_func(self.net_price_diff_body),
             'best_price_diff_body': norm_func(self.best_price_diff_body),

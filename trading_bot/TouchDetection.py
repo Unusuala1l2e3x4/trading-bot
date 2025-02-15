@@ -581,14 +581,18 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
             # Calculate running sums within each day
             # df['VWAP'] = grouped.apply(lambda x: x['pv'].cumsum() / x['volume'].cumsum()).T.values
             df['VWAP'] = grouped.apply(lambda x: (x['vwap'] * x['volume']).cumsum() / x['volume'].cumsum()).T.values
+
+            df['VWAP_dist'] = df['close'] - df['VWAP']
+            # df['VWAP_dist'] = (df['close'] - df['VWAP'])/df['VWAP']
             
             calculate_vwap_std_metrics(df)
-            
+
             df.drop(columns=['typical_price', 'pv'],errors='ignore',inplace=True)
             
             
         calculate_vwap(df)
         calculate_vwap(df_adjusted)
+
         
         # vwap is bar vwap
         # VWAP is day vwap
@@ -602,6 +606,10 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         # df['central_value'] = df['vwap']
 
         df_adjusted['central_value'] = calculate_ema_with_cutoff(df_adjusted, central_value_var, span=params.price_ema_span)
+
+        # Calculate distance to central value/EMA - positive when price above
+        df['central_value_dist'] = df['close'] - df['central_value']
+        # df['central_value_dist'] = (df['close'] - df['central_value'])/df['central_value']
         
         
         exit_ema_var = 'close'
@@ -609,6 +617,11 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         df['exit_ema'] = calculate_ema_with_cutoff(df, exit_ema_var, span=params.exit_ema_span)
         df_adjusted['exit_ema'] = calculate_ema_with_cutoff(df_adjusted, exit_ema_var, span=params.exit_ema_span)
+        
+
+        df['exit_ema_dist'] = df[exit_ema_var] - df['exit_ema']
+        # df['exit_ema_dist'] = (df[exit_ema_var] - df['exit_ema'])/df['exit_ema']
+        
         
         
         df['is_res'] = df['close'] >= df['central_value'] # if is_res, trade long
@@ -649,17 +662,7 @@ def calculate_touch_detection_area(params: BacktestTouchDetectionParameters | Li
         
         # Add ATR-based calculations
         df['rolling_ATR'] = df['ATR'].rolling(window=15, min_periods=1).mean()
-        
-                
-        # Calculate distance to central value/EMA - positive when price above
-        # df['central_value_dist'] = (df[central_value_var] - df['central_value']) / df[central_value_var] # Normalize by price level
-        df['central_value_dist'] = (df['close'] - df['central_value']) # / df['MTR' if params.use_median else 'ATR']# Normalize by price level
-        # df['central_value_dist'] = (df[central_value_var] - df['central_value'])
-        
-        
-        df['exit_ema_dist'] = (df[exit_ema_var] - df['exit_ema'])
-        
-        df['VWAP_dist'] = df['close'] - df['VWAP']
+
 
         # Calculate basic ADX components
         df['plus_dm'] = df['high'] - df['high'].shift(1) 
@@ -965,8 +968,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     long_touch_area = touch_detection_areas.long_touch_area
     short_touch_area = touch_detection_areas.short_touch_area
     market_hours = touch_detection_areas.market_hours
-    # df = touch_detection_areas.bars
-    df = touch_detection_areas.bars_adjusted
+    df = touch_detection_areas.bars
+    # df = touch_detection_areas.bars_adjusted
     # df_adjusted = touch_detection_areas.bars_adjusted
     mask = touch_detection_areas.mask
     # min_touches = touch_detection_areas.min_touches
@@ -981,7 +984,7 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     
     # plt.figure(figsize=(14, 7))
     # Create figure with 3 subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 15), height_ratios=[4, 1, 1], sharex=True)
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(15, 15), height_ratios=[4, 1, 1, 1], sharex=True)
     plt.subplots_adjust(hspace=0.05)
     
 
@@ -1065,6 +1068,8 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     # Main price plot (ax1)
     ax1.plot(df.index.get_level_values('timestamp'), df['central_value'], label='Central Value', color='yellow', linewidth=1)
     ax1.plot(df.index.get_level_values('timestamp'), df['VWAP'], label='VWAP', color='purple', linewidth=1)
+    ax1.plot(df.index.get_level_values('timestamp'), df['VWAP']+df['VWAP_std'], color='purple', label='VWAP std +',alpha=0.3)
+    ax1.plot(df.index.get_level_values('timestamp'), df['VWAP']-df['VWAP_std'], color='purple', label='VWAP std -',alpha=0.3)
     if len(grouped) != 1:
         ax1.plot(df.index.get_level_values('timestamp'), df['close'], label='Close Price', color='blue', linewidth=1)
             
@@ -1142,6 +1147,27 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
     
     # Keep grid only on the main axis
     ax3.grid(True)
+    
+    
+    # ADX and trend_strength
+    ax4_twin = ax4.twinx()
+    
+    # Plot ADX on left axis
+    ax4.plot(df.index.get_level_values('timestamp'), df['ADX'], label='ADX', color='purple', linewidth=1)
+    ax4.axhline(y=50, color='black', linestyle=':', alpha=0.3)
+    ax4.set_ylim(0, 100)
+    ax4.set_ylabel('ADX', color='purple')
+    ax4.tick_params(axis='y', labelcolor='purple')
+    
+    # Plot trend_strength on right axis
+    ax4_twin.plot(df.index.get_level_values('timestamp'), df['trend_strength'], label='trend_strength', color='orange', linewidth=1)
+    ax4.axhline(y=0, color='black', linestyle=':', alpha=0.3)
+    ax4_twin.set_ylim(-100, 100)
+    ax4_twin.set_ylabel('Trend Strength', color='orange')
+    ax4_twin.tick_params(axis='y', labelcolor='orange')
+    
+    ax4.legend().remove()
+    ax4.grid(True)
     
     # Helper function to plot trade markers
     def plot_trade_markers(ax, ax_twin, y_value, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=False, custom_marker=None):
@@ -1237,10 +1263,12 @@ def plot_touch_detection_areas(touch_detection_areas: TouchDetectionAreas, zoom_
                        zorder=5, alpha=1)
         
         # Plot on MACD chart (ax2)
-        plot_trade_markers(ax2, ax2_twin, 0, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True) # , custom_marker='.'
+        plot_trade_markers(ax2, None, 0, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True) # , custom_marker='.'
         
         # Plot on RSI chart (ax3)
-        plot_trade_markers(ax3, ax3_twin, 50, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True)
+        plot_trade_markers(ax3, None, 50, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True)
+        
+        plot_trade_markers(ax4_twin, None, 50, long_entries, long_exits, long_iswin, short_entries, short_exits, short_iswin, plot_ids=True)
         
         
     df = df[mask]

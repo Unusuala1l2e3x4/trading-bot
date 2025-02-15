@@ -421,129 +421,151 @@ class TypedBarData:
         divergence = mfi_change - price_change
         return np.tanh(divergence)
         
-    
-    
-    # TODO: needs to be adjusted based on data-driven analysis
-    def shows_reversal_potential(self, area_is_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
-                            mfi_overbought: float = 75, mfi_oversold: float = 25, 
-                            pre_position: bool = False) -> bool:
+        
+        
+    def shows_reversal_potential(self, area_is_long, std_threshold = 1, pre_position: bool = False) -> bool:
         """
-        Check if conditions suggest trend reversal.
+        Check if we should switch sides based on VWAP extension and price action.
+        
+        For long areas (looking to short):
+        - Price significantly above daily VWAP (>1.5-2 std)
+        - Signs of upward momentum exhaustion
+        
+        For short areas (looking to long):
+        - Price significantly below daily VWAP (<-1.5-2 std)
+        - Signs of downward momentum exhaustion
         """
-        # if self.rsi_divergence >= 0 and self.mfi_divergence >= 0:
-        if area_is_long and (self.rsi_divergence >= 0 or self.mfi_divergence >= 0):
-            return True
-        if not area_is_long and (self.rsi_divergence <= 0 or self.mfi_divergence <= 0):
-            return True
-        return False
+        # Negative trend_strength means bearish trend
+        trend_strength_favors_reversal = (
+            (area_is_long and self.trend_strength < 0) or  # Bearish trend for long area
+            (not area_is_long and self.trend_strength > 0)  # Bullish trend for short area
+        )
+        
+        # Check for price extension from VWAP
+        vwap_extension = abs(self.VWAP_std_close) >= std_threshold
+        
+        # Check if extended in right direction for area
+        properly_extended = (
+            (area_is_long and self.VWAP_std_close > 0) or  # Above VWAP for long area
+            (not area_is_long and self.VWAP_std_close < 0)  # Below VWAP for short area
+        )
+        
+        # Check for momentum exhaustion using MACD
+        momentum_waning = (
+            (area_is_long and self.MACD_hist_roc < 0) or  # Declining momentum in long area
+            (not area_is_long and self.MACD_hist_roc > 0)  # Rising momentum in short area
+        )
+        
+        # Volume characteristics
+        volume_confirms = self.volume_ratio > 1.0  # Above average volume
+        
+        # Core conditions
+        basic_conditions = (
+            vwap_extension and
+            properly_extended and 
+            momentum_waning
+        )
+        
+        # Additional confirmation
+        supporting_conditions = (
+            trend_strength_favors_reversal and
+            volume_confirms
+        )
+        
+        return basic_conditions and supporting_conditions
+
+    def describe_reversal_potential(self, area_was_long, std_threshold = 1) -> str:
+        """Enhanced description separating core and supporting conditions."""
+        basic_conditions_list = []
+        supporting_conditions_list = []
+        
+        # Basic Conditions
+        # 1. VWAP extension
+        vwap_extension = abs(self.VWAP_std_close) >= std_threshold
+        if vwap_extension:
+            basic_conditions_list.append(
+                f"Extended {abs(self.VWAP_std_close):.2f} std {'above' if self.VWAP_std_close > 0 else 'below'} VWAP"
+            )
+        
+        # 2. Extended in right direction
+        properly_extended = (
+            (area_was_long and self.VWAP_std_close < 0) or  # Below VWAP to reverse long
+            (not area_was_long and self.VWAP_std_close > 0)  # Above VWAP to reverse short
+        )
+        if properly_extended:
+            basic_conditions_list.append(
+                f"Extension direction matches potential reversal"
+            )
+        
+        # 3. Momentum
+        momentum_waning = (
+            (area_was_long and self.MACD_hist_roc < 0) or 
+            (not area_was_long and self.MACD_hist_roc > 0)
+        )
+        if momentum_waning:
+            supporting_conditions_list.append(
+                f"{'Bullish' if not area_was_long else 'Bearish'} momentum waning (MACD hist ROC={self.MACD_hist_roc:.3f})"
+            )
+
+        # Supporting Conditions
+        # 1. Trend strength
+        trend_strength_favors_reversal = (
+            (area_was_long and self.trend_strength < 0) or 
+            (not area_was_long and self.trend_strength > 0)
+        )
+        if trend_strength_favors_reversal:
+            supporting_conditions_list.append(
+                f"Trend strength favors reversal ({self.trend_strength:.1f})"
+            )
+
+        # 2. Volume
+        volume_confirms = self.volume_ratio > 1.0 
+        if volume_confirms:
+            supporting_conditions_list.append(
+                f"Higher than average volume ({self.volume_ratio:.1f}x)"
+            )
+
+        # Summarize conditions
+        if not basic_conditions_list and not supporting_conditions_list:
+            return "No reversal conditions detected"
+
+
+        # Core conditions
+        basic_conditions = (
+            vwap_extension and
+            properly_extended
+        )
+        
+        # Additional confirmation
+        supporting_conditions = (
+            momentum_waning and
+            trend_strength_favors_reversal and
+            volume_confirms
+        )
+
+
+        # has_potential = len(basic_conditions_list) >= 3  # All basic conditions met
+        # has_support = len(supporting_conditions_list) > 0  # At least one supporting condition
+        
+        
+        has_potential = basic_conditions
+        has_support = supporting_conditions
+        
     
-        # probably better to just not trade instead of reverse
-        # unclear effect for positions that remain unentered if didnt switch
+
+        summary = []
+        summary.append(f"Basic Conditions ({len(basic_conditions_list)}/2 met):")
+        summary.extend(f"  - {cond}" for cond in basic_conditions_list)
+        
+        summary.append(f"\nSupporting Conditions ({len(supporting_conditions_list)}/3 met):")
+        summary.extend(f"  - {cond}" for cond in supporting_conditions_list)
+
+        status = "POTENTIAL REVERSAL" if has_potential and has_support else "Partial conditions"
+        
+        return f"{status} detected:\n" + "\n".join(summary)
+            
+            
     
-        
-        # # Base momentum conditions - only need one indicator
-        # oversold_reversal = (
-        #     not area_is_long and (
-        #         # MFI oversold and improving
-        #         (self.MFI <= mfi_oversold and self.MFI_roc > 0) or
-        #         # RSI oversold and improving  
-        #         (self.RSI <= rsi_oversold and self.RSI_roc > 0)
-        #     )
-        # )
-        
-        # overbought_reversal = (
-        #     area_is_long and (
-        #         # MFI overbought and deteriorating
-        #         (self.MFI >= mfi_overbought and self.MFI_roc < 0) or
-        #         # RSI overbought and deteriorating
-        #         (self.RSI >= rsi_overbought and self.RSI_roc < 0)
-        #     )
-        # )
-        
-        # if not (oversold_reversal or overbought_reversal):
-        #     return False
-            
-        # # Get common metrics
-        # indecision_count = sum(signal[1] for signal in self.get_indecision_signals())
-        # close_to_high = (self.close - self.low) / (self.high - self.low) if self.high != self.low else 0.5
-        # close_to_low = (self.high - self.close) / (self.high - self.low) if self.high != self.low else 0.5
-        # volume_strength = self.volume_ratio > 1.0
-        
-        # if pre_position:
-        #     # For side switching, need ANY TWO of:
-        #     # 1. Indecision signals (market struggling to continue trend)
-        #     # 2. Volume confirmation
-        #     # 3. Price moving in new direction
-            
-        #     confirmation_count = sum([
-        #         indecision_count >= 1,  # Relaxed from 2 to 1
-        #         volume_strength,
-        #         oversold_reversal and close_to_high > 0.6,  # Relaxed from 0.7
-        #         overbought_reversal and close_to_low > 0.6   # Relaxed from 0.7
-        #     ])
-            
-        #     return confirmation_count >= 2  # Need any 2 confirmations
-                
-        # else:
-        #     # For position scaling warnings (keep as before)
-        #     warning_count = sum([
-        #         indecision_count >= 2,
-        #         volume_strength,
-        #         oversold_reversal and close_to_low > 0.7,  # Staying near low when oversold
-        #         overbought_reversal and close_to_high > 0.7  # Staying near high when overbought
-        #     ])
-            
-        #     return warning_count >= 2
-        
-    def describe_reversal_potential(self, area_was_long, rsi_overbought: float = 65, rsi_oversold: float = 35,
-                            mfi_overbought: float = 75, mfi_oversold: float = 25, ) -> str:
-        """Get a readable description of reversal potential conditions."""
-        conditions = []
-        
-        # # Check oversold conditions
-        if self.MFI <= mfi_oversold:
-            # assert not area_was_long
-            conditions.append(f"MFI oversold ({self.MFI:.1f} <= {mfi_oversold})")
-        if not area_was_long and self.RSI <= rsi_oversold:
-            # assert not area_was_long
-            conditions.append(f"RSI oversold ({self.RSI:.1f} <= {rsi_oversold})")
-        
-        # # Check overbought conditions
-        if self.MFI >= mfi_overbought:
-            # assert area_was_long
-            conditions.append(f"MFI overbought ({self.MFI:.1f} >= {mfi_overbought})")
-        if area_was_long and self.RSI >= rsi_overbought:
-            # assert area_was_long
-            conditions.append(f"RSI overbought ({self.RSI:.1f} >= {rsi_overbought})")
-        
-        # # Check price action
-        # if self.close >= self.open:
-        #     conditions.append(f"Bullish price action (O:{self.open:.2f} -> C:{self.close:.2f})")
-        # elif self.close <= self.open:
-        #     conditions.append(f"Bearish price action (O:{self.open:.2f} -> C:{self.close:.2f})")
-        
-        # Check divergence
-        if self.has_divergence:
-            conditions.append(f"Divergence detected (Price: {'up' if self.close > self.open else 'down'}, " 
-                            f"RSI: {'down' if self.RSI_roc < 0 else 'up'}, "
-                            f"MFI: {'down' if self.MFI_roc < 0 else 'up'})"
-                            )
-        
-        # Check indecision
-        if self.shows_indecision:
-            # conditions.append(f"Shows indecision ({self.indecision_count} signals)")
-            conditions.append(f"Shows indecision - {self.describe_indecision}")
-        
-        if not conditions:
-            return "describe_reversal_potential - No reversal conditions detected"
-        
-        # Determine overall reversal potential
-        has_potential = self.shows_reversal_potential(area_was_long, rsi_overbought, rsi_oversold, 
-                                                    mfi_overbought, mfi_oversold,
-                                                    pre_position=True)
-        
-        return (f"describe_reversal_potential - {'POTENTIAL REVERSAL' if has_potential else 'Partial conditions'} detected:\n" + 
-                "\n".join(f"- {cond}" for cond in conditions))
         
     
     def update_thresholds(self,

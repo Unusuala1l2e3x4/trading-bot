@@ -112,7 +112,7 @@ class LiveTouchDetectionParameters:
     # end_time: Optional[time] = '16:00'
     start_time: Optional[time] = '00:00'
     end_time: Optional[time] = '23:59'
-    use_median: bool = True # True is better
+    use_median: bool = True # True seems slightly better
     touch_area_width_agg: Callable = get_latest_value
     # touch_area_width_agg: Callable = np.median # doesnt work inside jitted functions
     # touch_area_width_agg: Callable = np_median

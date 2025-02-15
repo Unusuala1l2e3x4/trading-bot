@@ -9,7 +9,7 @@ import math
 from trading_bot.TouchDetection import TouchDetectionAreas, plot_touch_detection_areas
 from trading_bot.TouchArea import TouchArea, TouchAreaCollection
 from trading_bot.TradePosition import TradePosition, export_trades_to_csv
-from trading_bot.TradePositionPlotting import TimeRange, plot_cumulative_pl_and_price, plot_cumulative_pl_and_price_from_snapshots, plot_trade_correlation
+from trading_bot.TradePositionPlotting import TimeRange, plot_cumulative_pl_and_price, plot_cumulative_pl_and_price_from_snapshots, plot_cumulative_pl_and_price_from_snapshots_by_day, plot_trade_correlation
 from trading_bot.TypedBarData import TypedBarData, PreMarketBar
 from trading_bot.VolumeProfile import VolumeProfile
 
@@ -860,7 +860,7 @@ class TradingStrategy:
             self.now_bar.shows_reversal_potential(area.is_long, pre_position=True)
             # self.now_bar.shows_reversal_potential(area.is_long, self.params.rsi_overbought, self.params.rsi_oversold, self.params.mfi_overbought, self.params.mfi_oversold)
         # NOTE: switch must be set at this point
-        self.log(self.now_bar.describe_reversal_potential(not area.is_long), level=logging.INFO)
+        self.log(f'TouchArea {area.id}: {self.now_bar.describe_reversal_potential(not area.is_long)}', level=logging.INFO)
         
         if is_retry or (not is_retry and switch):
             self.log('area side switched', level=logging.INFO)
@@ -877,7 +877,7 @@ class TradingStrategy:
             # *** if not switching immediately, try current area before moving on
             try_create = self.create_new_position(area, current_timestamp, True) # try area again with new side. If doesn't work, it may work in future minute.
             if try_create:
-                self.log('immediate current area switched',level=logging.INFO)
+                self.log(f'TouchArea {area.id}: immediate current area switched',level=logging.INFO)
                 # return try_create
             return try_create # better
         
@@ -953,12 +953,12 @@ class TradingStrategy:
             
             
             # # Use price_at_action for initial peak-stop
-            # current_stop_price=price_at_action - area.get_range if area.is_long else price_at_action + area.get_range,
+            # current_stop_price=price_at_action - get_area_width if area.is_long else price_at_action + get_area_width,
             # max_close=price_at_action if area.is_long else None,
             # min_close=price_at_action if not area.is_long else None
             
             # Use H-L prices for initial peak-stop (seems to have better results - certain trades exit earlier)
-            # current_stop_price=self.now_bar.high - area.get_range if area.is_long else self.now_bar.low + area.get_range,
+            # current_stop_price=self.now_bar.high - get_area_width if area.is_long else self.now_bar.low + get_area_width,
             # max_close=self.now_bar.high if area.is_long else None,
             # min_close=self.now_bar.low if not area.is_long else None,
             
@@ -1037,7 +1037,7 @@ class TradingStrategy:
             price_movement = current_price - position.current_stop_price
         else:
             price_movement = position.current_stop_price - current_price
-        target_pct = np.clip(price_movement / position.area.get_range, 0, 1.0)
+        target_pct = np.clip(price_movement / position.get_area_width, 0, 1.0)
         
         # Calculate base target shares
         base_target_shares = math.floor(target_pct * position.max_shares)
@@ -2175,11 +2175,16 @@ class TradingStrategy:
         plot_cumulative_pl_and_price_from_snapshots(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                         use_plpc=True)
         
-
-        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
-                                     use_plpc=False)
-        plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
+        plot_cumulative_pl_and_price_from_snapshots_by_day(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
+                                        use_plpc=False)
+        plot_cumulative_pl_and_price_from_snapshots_by_day(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
                                         use_plpc=True)
+        
+
+        # plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
+        #                              use_plpc=False)
+        # plot_cumulative_pl_and_price(trades, self.touch_detection_areas.bars, self.params.initial_investment, time_range, filename=self.export_graph_path,
+        #                                 use_plpc=True)
         
         
         # return self.balance, sum(1 for trade in trades if trade.is_long), sum(1 for trade in trades if not trade.is_long), balance_change, mean_plpc, win_mean_plpc, lose_mean_plpc, \

@@ -300,7 +300,8 @@ class TouchAreaCollection:
     # Lastly by id, just in case
     def area_sort_key(self, area: TouchArea):
         # return (area.min_touches_time, area.id)
-        return (area.min_touches_time, area.initial_touches[0], area.id)
+        # return (area.min_touches_time, area.initial_touches[0], area.id)
+        return (not area.is_side_switched, area.min_touches_time, area.initial_touches[0], area.id)
 
     def get_area(self, area: TouchArea):
         index = bisect_left(self.active_date_areas, self.area_sort_key(area),
