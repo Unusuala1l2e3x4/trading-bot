@@ -59,7 +59,7 @@ class PositionSnapshot:
     @property
     def is_profitable(self) -> bool:
         """Check if position is pospl at this snapshot."""
-        return self.running_pl > 0 and self.prev_shares > 0
+        return self.running_pl > 0 # and self.prev_shares > 0
 
     @property
     def body_above_buy_price(self) -> bool:
@@ -470,7 +470,7 @@ class PositionMetrics:
     @property
     def profitable_time(self) -> int:
         """Count minutes position had positive P&L."""
-        return sum(1 for s in self.snapshots if s.is_profitable)
+        return sum(1 for s in self.snapshots if s.is_profitable and s.shares > 0)
     
     @property
     def profitable_time_pct(self) -> int:
@@ -511,15 +511,15 @@ class PositionMetrics:
         
     @property
     def avg_vwap_dist(self) -> float:
-        return np.mean([a.position_vwap_dist for a in self.snapshots if np.isfinite(a.position_vwap_dist)]) # TODO: filter to when holding
+        return np.mean([a.position_vwap_dist for a in self.snapshots if np.isfinite(a.position_vwap_dist)])
     
     @property
     def avg_vwap_std(self) -> float:
-        return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)]) # TODO: filter to when holding
+        return np.mean([a.position_vwap_std for a in self.snapshots if np.isfinite(a.position_vwap_std)])
 
     @property
     def avg_vwap_std_close(self) -> float:
-        return np.mean([a.vwap_std_close for a in self.snapshots if np.isfinite(a.vwap_std_close)]) # TODO: filter to when holding
+        return np.mean([a.vwap_std_close for a in self.snapshots if np.isfinite(a.vwap_std_close)])
     
     @property
     def vwap_std(self) -> float:
