@@ -47,6 +47,8 @@ class PositionSnapshot:
     
     has_entered: bool
     has_exited: bool
+    is_entry_snapshot: bool = False
+    is_exit_snapshot: bool = False
     
     position_vwap_dist: Optional[float] = np.nan
     position_vwap: Optional[float] = np.nan
@@ -56,10 +58,15 @@ class PositionSnapshot:
     vwap_std_high: Optional[float] = np.nan
     vwap_std_low: Optional[float] = np.nan
 
+
+    @property
+    def is_before_or_at_exit(self) -> bool:
+        return not self.has_exited or self.is_exit_snapshot
+
     @property
     def is_profitable(self) -> bool:
         """Check if position is pospl at this snapshot."""
-        return self.running_pl > 0 # and self.prev_shares > 0
+        return self.running_pl > 0 and self.is_before_or_at_exit
 
     @property
     def body_above_buy_price(self) -> bool:
@@ -271,23 +278,25 @@ class PositionMetrics:
         # Track first entry
         if snapshot.has_entered and self.entry_snapshot_index is None:
             self.entry_snapshot_index = minute
+            snapshot.is_entry_snapshot = True
             assert snapshot.running_pl == 0, snapshot.running_pl
             assert snapshot.running_plpc == 0, snapshot.running_plpc
             
         if snapshot.has_exited and self.exit_snapshot_index is None:
             self.exit_snapshot_index = minute
+            snapshot.is_exit_snapshot = True
         
-        if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
+        # NOTE: flags should all be set above    
+        if snapshot.has_entered and snapshot.is_before_or_at_exit:
             # Calculate high/low std values BEFORE appending current snapshot
             snapshot.vwap_std_high, snapshot.vwap_std_low = self.calculate_std_value(snapshot.bar.high, snapshot.bar.low)
-            # print(snapshot.bar.timestamp, minute - self.entry_snapshot_index, snapshot.vwap_std_high, snapshot.vwap_std_low)
         
         self.snapshots.append(snapshot)
         assert minute == self.num_snapshots - 1
             
         # Track first pospl minute
-        if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
-            if self.exit_snapshot_index == minute:
+        if snapshot.has_entered and snapshot.is_before_or_at_exit:
+            if snapshot.is_exit_snapshot:
                 assert snapshot.prev_shares > 0
             held_time = minute - self.entry_snapshot_index
             if snapshot.is_profitable:
@@ -312,8 +321,7 @@ class PositionMetrics:
             
             # Calculate close std AFTER appending (since we want current bar included)
             snapshot.vwap_std_close = self.calculate_std_value(snapshot.bar.close)
-            # print('                           ',snapshot.vwap_std_close)
-                
+
             if self.is_long:
                 vwap_dist = snapshot.bar.close - snapshot.position_vwap
             else:
@@ -328,31 +336,20 @@ class PositionMetrics:
                 self.worst_vwap_std_close = snapshot.vwap_std_close
                 self.worst_vwap_std_close_time = minute
                 
-            # 2/1 TODO: probably need for wick too?
-            # 2/1 TODO: upload file again to claude with naming changes
-            
-            
-                
+
         # Update share peaks (do this for all snapshots)
         if snapshot.shares > self.max_shares_reached:
-            assert self.entry_snapshot_index is not None
+            assert snapshot.has_entered
             self.max_shares_reached = snapshot.shares
             self.max_shares_reached_pct = round(100*snapshot.shares / snapshot.max_shares, 2)
             self.max_shares_reached_time = minute
             
         # record area width peaks anytime <= exit
-        if self.exit_snapshot_index is None or self.exit_snapshot_index == minute:
+        if snapshot.is_before_or_at_exit:
             # Update area width extremes - do this for all snapshots
             self.area_width_min = min(self.area_width_min, snapshot.area_width)
             self.area_width_max = max(self.area_width_max, snapshot.area_width)
             
-            
-        # # Skip remaining calculations for first bar
-        # if self.num_snapshots == 1:
-        #     return
-        
-        # record price diffs anytime <= exit
-        if self.num_snapshots > 1 and self.exit_snapshot_index is None or self.exit_snapshot_index == minute:
             # Get reference price for this snapshot's updates
             ref_price = self.reference_price
             # Calculate price differences based on position direction
@@ -386,12 +383,8 @@ class PositionMetrics:
             
                     
         # Only update P&L peaks after entry, not at entry
-        if self.entry_snapshot_index is not None and (self.exit_snapshot_index is None or self.exit_snapshot_index == minute):
+        if snapshot.has_entered and snapshot.is_before_or_at_exit:
             assert snapshot.avg_entry_price is not None
-            # self.entry_snapshot_index != minute and 
-            # assert self.num_snapshots > 1, self.num_snapshots
-            
-           
             
             # Body metrics based on actual closing price
             if snapshot.running_pl > self.max_pl_body:
@@ -438,76 +431,81 @@ class PositionMetrics:
             #     f"{self.min_plpc_wick} <= {self.min_plpc_body} <= {self.max_plpc_body} <= {self.max_plpc_wick}"
             # NOTE: dont assert; treat wick metrics as approximations
                     
-    # @property
-    # def has_entered_time(self) -> datetime:
-    #     return next((a.timestamp for a in self.snapshots if a.has_entered), datetime.min)
-    
-    @property
-    def body_above_buy_price_time(self) -> int:
-        """Count minutes price was above entry level."""
-        return sum(1 for s in self.snapshots if s.body_above_buy_price)
-    
-    @property
-    def wick_above_buy_price_time(self) -> int:
-        """Count minutes price was above entry level."""
-        return sum(1 for s in self.snapshots if s.wick_above_buy_price)
-    
-    @property
-    def body_above_buy_price_time_pct(self) -> int:
-        """Count minutes price was above entry level."""
-        return (self.body_above_buy_price_time / self.num_snapshots * 100) if self.holding_time > 0 else 0
-    
-    @property
-    def wick_above_buy_price_time_pct(self) -> int:
-        """Count minutes price was above entry level."""
-        return (self.wick_above_buy_price_time / self.num_snapshots * 100) if self.holding_time > 0 else 0
-    
-    @property
-    def wick_above_buy_price_time_pct(self) -> int:
-        """Count minutes price was above entry level."""
-        return (self.wick_above_buy_price_time / self.num_snapshots * 100) if self.holding_time > 0 else 0
-    
-    @property
-    def profitable_time(self) -> int:
-        """Count minutes position had positive P&L."""
-        return sum(1 for s in self.snapshots if s.is_profitable and s.shares > 0)
-    
-    @property
-    def profitable_time_pct(self) -> int:
-        """Count minutes position had positive P&L."""
-        return (self.profitable_time / self.holding_time * 100) if self.holding_time > 0 else 0
 
-    @property
-    def holding_time(self) -> int:
-        """Total number of minutes position was held."""
-        return sum(1 for a in self.snapshots if a.shares > 0)
-    
     @property
     def num_snapshots(self) -> int:
         """Total number of minutes position was held."""
         return len(self.snapshots)
     
     @property
+    def snapshots_before_or_at_exit(self) -> List[PositionSnapshot]:
+        return [a for a in self.snapshots if a.is_before_or_at_exit]
+    
+    @property
+    def num_snapshots_before_or_at_exit(self) -> int:
+        """Total number of minutes position was held."""
+        return len(self.snapshots_before_or_at_exit)
+
+    @property
+    def profitable_time(self) -> int:
+        """Count minutes position had positive P&L."""
+        return sum(1 for s in self.snapshots if s.is_profitable)
+    
+    @property
+    def holding_time(self) -> int:
+        """Total number of minutes position was held."""
+        return sum(1 for a in self.snapshots if a.shares > 0)
+    
+    @property
+    def profitable_time_pct(self) -> int:
+        """Count minutes position had positive P&L."""
+        assert self.profitable_time <= self.holding_time, f'{self.profitable_time} <= {self.holding_time}'
+        return (self.profitable_time / self.holding_time * 100) if self.holding_time > 0 else 0
+    
+    @property
+    def body_above_buy_price_time(self) -> int:
+        """Count minutes price was above entry level."""
+        return sum(1 for s in self.snapshots_before_or_at_exit if s.body_above_buy_price)
+    
+    @property
+    def wick_above_buy_price_time(self) -> int:
+        """Count minutes price was above entry level."""
+        return sum(1 for s in self.snapshots_before_or_at_exit if s.wick_above_buy_price)
+    
+    @property
+    def body_above_buy_price_time_pct(self) -> int:
+        """Count minutes price was above entry level."""
+        return (self.body_above_buy_price_time / self.num_snapshots_before_or_at_exit * 100) if self.num_snapshots_before_or_at_exit > 0 else 0
+    
+    @property
+    def wick_above_buy_price_time_pct(self) -> int:
+        """Count minutes price was above entry level."""
+        return (self.wick_above_buy_price_time / self.num_snapshots_before_or_at_exit * 100) if self.num_snapshots_before_or_at_exit > 0 else 0
+    
+    @property
     def avg_entry_price_diff(self) -> float:
-        avg_entry_price_first = next((a.avg_entry_price for a in self.snapshots if a.avg_entry_price is not None), None)
+        avg_entry_price_first = next((a.avg_entry_price for a in self.snapshots_before_or_at_exit if a.avg_entry_price is not None), None)
         if avg_entry_price_first:
-            avg_entry_price_last = next((a.avg_entry_price for a in reversed(self.snapshots) if a.avg_entry_price is not None), None)
+            avg_entry_price_last = next((a.avg_entry_price for a in reversed(self.snapshots_before_or_at_exit) if a.avg_entry_price is not None), None)
             return avg_entry_price_last - avg_entry_price_first if self.is_long else avg_entry_price_first - avg_entry_price_last
         return 0.0
     
     @property
     def avg_area_width(self) -> float:
-        return np.mean([a.area_width for a in self.snapshots])
+        return np.mean([a.area_width for a in self.snapshots_before_or_at_exit])
     
     @property
     def avg_central_value_dist(self) -> float:
-        ret = np.mean([a.bar.central_value_dist for a in self.snapshots])
+        ret = np.mean([a.bar.central_value_dist for a in self.snapshots_before_or_at_exit])
         return ret if self.is_long else -ret
         
     @property
     def avg_prior_central_value_dist(self) -> float:
         ret = np.mean([a.central_value_dist for a in self.prior_relevant_bars])
         return ret if self.is_long else -ret
+    
+    
+    # avwap-based metrics and functions:
         
     @property
     def avg_vwap_dist(self) -> float:
