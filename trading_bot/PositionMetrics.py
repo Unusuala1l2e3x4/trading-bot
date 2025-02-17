@@ -250,19 +250,6 @@ class PositionMetrics:
             
         return np.mean([s.bar.close for s in snapshots])
 
-    def normalize_relative_metrics(self, value: float) -> float:
-        """
-        Normalize metrics that depend on bar-by-bar values.
-        Used for central_value_dist and vwap_dist.
-        """
-        if self.norm_strategy == 'r':
-            return value / self.avg_reference_area_width if np.isfinite(value) else np.nan
-        elif self.norm_strategy == 'price':
-            return (value / self.avg_reference_price * 100) if np.isfinite(value) else np.nan
-        return value
-        
-    
-
         
     def add_snapshot(self, snapshot: PositionSnapshot, best_wick_pl: float, worst_wick_pl: float, best_wick_plpc: float, worst_wick_plpc: float):
         """Add a new snapshot and update running metrics.
@@ -318,9 +305,6 @@ class PositionMetrics:
             
             # Calculate price differences vs VWAP similar to other metrics
             assert np.isfinite(snapshot.position_vwap), snapshot.position_vwap
-            
-            # Calculate close std AFTER appending (since we want current bar included)
-            snapshot.vwap_std_close = self.calculate_std_value(snapshot.bar.close)
 
             if self.is_long:
                 vwap_dist = snapshot.bar.close - snapshot.position_vwap
@@ -328,13 +312,17 @@ class PositionMetrics:
                 vwap_dist = snapshot.position_vwap - snapshot.bar.close
             snapshot.position_vwap_dist = vwap_dist
             
+            # Calculate close std AFTER appending (since we want current bar included)
+            snapshot.vwap_std_close = self.calculate_std_value(snapshot.bar.close)
+
             # Using the std value (already calculated earlier)
-            if snapshot.vwap_std_close > self.best_vwap_std_close:  # rename these fields too
-                self.best_vwap_std_close = snapshot.vwap_std_close
-                self.best_vwap_std_close_time = minute
-            if snapshot.vwap_std_close < self.worst_vwap_std_close:
-                self.worst_vwap_std_close = snapshot.vwap_std_close
-                self.worst_vwap_std_close_time = minute
+            if np.isfinite(snapshot.vwap_std_close):
+                if snapshot.vwap_std_close > self.best_vwap_std_close:  # rename these fields too
+                    self.best_vwap_std_close = snapshot.vwap_std_close
+                    self.best_vwap_std_close_time = minute
+                if snapshot.vwap_std_close < self.worst_vwap_std_close:
+                    self.worst_vwap_std_close = snapshot.vwap_std_close
+                    self.worst_vwap_std_close_time = minute
                 
 
         # Update share peaks (do this for all snapshots)
@@ -556,17 +544,18 @@ class PositionMetrics:
         latest = self.snapshots[-1]
         std_dev = latest.position_vwap_std  # Using stored std from snapshot
         
-        MIN_STD_DEV = 1e-8  # Minimum meaningful standard deviation - Values beyond 10 standard deviations are extremely rare in normal distributions
-        MAX_STD_VALUE = 10.0  # Cap at 10 standard deviations
+        MIN_STD_DEV = 1e-8  # Minimum meaningful standard deviation
+        MAX_STD_VALUE = 10.0  # Cap at 10 standard deviations - Values beyond 10 standard deviations are extremely rare in normal distributions
         
         if not np.isfinite(std_dev) or std_dev < MIN_STD_DEV:
             return tuple(np.nan for _ in prices) if len(prices) > 1 else np.nan
             
         std_values = []
         for price in prices:
-            std_value = (price - latest.position_vwap) / std_dev
+            dist = price - latest.position_vwap if self.is_long else latest.position_vwap - price
+            std_value = dist / std_dev
             # Return np.nan if value is too extreme
-            if abs(std_value) > MAX_STD_VALUE:
+            if not np.isfinite(std_value) or abs(std_value) > MAX_STD_VALUE:
                 std_values.append(np.nan)
             else:
                 std_values.append(std_value)
@@ -780,6 +769,16 @@ class PositionMetrics:
                         for value in values)
         return normalized if len(values) > 1 else normalized[0]
 
+    def normalize_relative_metrics(self, value: float) -> float:
+        """
+        Normalize metrics that depend on bar-by-bar values.
+        Used for central_value_dist and vwap_dist.
+        """
+        if self.norm_strategy == 'r':
+            return value / self.avg_reference_area_width if np.isfinite(value) else np.nan
+        elif self.norm_strategy == 'price':
+            return (value / self.avg_reference_price * 100) if np.isfinite(value) else np.nan
+        return value
 
     def get_metrics_dict(self) -> dict:
         """Return all metrics as a dictionary for easy export."""

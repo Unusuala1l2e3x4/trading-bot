@@ -69,13 +69,6 @@ def calculate_slippage(is_long: bool, is_entry: bool, price: float, trade_size: 
 
     return price * (1 + slippage_ratio), slippage_price_change
 
-    
-@dataclass
-class TakeProfitLevel:
-    std_distance: float  # Distance in standard deviations
-    size_fraction: float # Fraction of position to exit
-    executed: bool = False
-
 
 @dataclass
 class Transaction:
@@ -120,6 +113,24 @@ class Transaction:
         if cost_basis_sold_accum <= 0:
             return 0.0
         return (self.pl / cost_basis_sold_accum) * 100
+
+
+@dataclass
+class TakeProfitConfig:
+    """Configuration for take-profit exits based on VWAP std and price movement"""
+    # VWAP-based first stage settings
+    std_threshold: float = 1  # Start taking profit when beyond this std
+    std_threshold_early_exit: float = -1
+    dampening_factor: float = 1  # Adjust exit size (lower means slower exits)
+    require_profitable: bool = True  # Only take profit when position is profitable
+    
+    # Area width-based final stage
+    area_width_multiple: float = 2  # Multiple of area width for final exit stage
+    
+    # Position size thresholds
+    min_exit_size: int = 1  # Minimum shares to exit
+    min_remaining: float = 0.2  # Minimum position size to maintain (as fraction)
+    
 
 @dataclass
 class TradePosition:
@@ -189,7 +200,6 @@ class TradePosition:
     current_stop_price_2: Optional[float] = None
     
     position_metrics: PositionMetrics = None
-    take_profit_levels: List[TakeProfitLevel] = field(default_factory=list)
     
     max_close: Optional[float] = None
     min_close: Optional[float] = None
@@ -199,6 +209,14 @@ class TradePosition:
     min_low: Optional[float] = None
     
     exited_from_stop_order: bool = False
+    
+    # New fields for take-profit tracking
+    take_profit_config: TakeProfitConfig = field(default_factory=TakeProfitConfig)
+    in_final_exit_stage: bool = False
+    total_tp_exits: int = 0
+    last_tp_exit_time: Optional[datetime] = None
+    
+    prev_exit_ratio: float = float('-inf')
     
     unrealized_pl: float = field(default=0.0)
     realized_pl: float = 0.0
@@ -284,11 +302,6 @@ class TradePosition:
         self.update_stop_price(self.bar_at_commit, None, self.entry_time)
         self.position_metrics = PositionMetrics(self.is_long, prior_relevant_bars=self.prior_relevant_bars)
         self.bar_at_switch = self.area.bar_at_switch
-        
-        self.take_profit_levels = [
-            TakeProfitLevel(1.5, 0.5),  # Exit 50% at 1.5 std
-            TakeProfitLevel(2.5, 0.6),  # Exit 60% of remainder at 2.5 std
-        ]
 
     @property
     def get_area_width(self):
@@ -550,7 +563,6 @@ class TradePosition:
         #     # self.max_target_shares_limit = (self.shares + self.max_shares) / 2
         
         # self.log(f"Holding {self.shares}/{self.max_shares} {(self.shares/self.max_shares)*100:.1f}%",level=logging.INFO)
-    
         return exit_pl, cash_released, returned_borrowed, fees, shares_to_sell
 
     def calculate_exit_values(self, exit_time: datetime, exit_price: float, shares_to_sell: int, 
@@ -583,6 +595,104 @@ class TradePosition:
         fees_expected = finra_taf + sec_fee + stock_borrow_cost + commission
         
         return exit_pl, fees_expected
+    
+    def check_final_exit_stage(self, current_price: float, bar: TypedBarData) -> bool:
+        """
+        Check if position should enter final exit stage based on area width.
+        Returns True if entered final stage.
+        """
+        if self.in_final_exit_stage:
+            return False
+            
+        # Calculate price movement normalized by reference
+        price_movement = current_price - self.position_metrics.reference_price
+        if self.is_long:
+            width_threshold = self.position_metrics.avg_area_width * self.take_profit_config.area_width_multiple
+            if price_movement >= width_threshold:
+                self.in_final_exit_stage = True
+                self.log(f"Entering final exit stage: Movement {price_movement:.4f} >= {width_threshold:.4f}")
+                return True
+        else:
+            width_threshold = -self.position_metrics.avg_area_width * self.take_profit_config.area_width_multiple
+            if price_movement <= width_threshold:
+                self.in_final_exit_stage = True
+                self.log(f"Entering final exit stage: Movement {price_movement:.4f} <= {width_threshold:.4f}")
+                return True
+                
+        return False
+    
+    def calculate_take_profit_exit(self, current_price: float, bar: TypedBarData, slippage_factor: float, atr_sensitivity: float) -> Tuple[Optional[int], str]:
+        """
+        Calculate shares to exit based on take-profit conditions.
+        
+        Returns:
+            Tuple of (shares_to_exit, reason) where:
+            - shares_to_exit is None if no exit needed
+            - reason describes the exit trigger
+        """        
+        if not self.has_entered or self.shares == 0 or self.in_final_exit_stage:
+            return None, ""
+        
+        # Skip TP if position is still building initial size
+        min_size_for_tp = self.max_target_shares_limit * 0.25  # Example threshold 
+        if self.shares < min_size_for_tp:
+            return None, ""
+         
+        
+        is_profitable, _, _ = self.is_profitable(bar, current_price, slippage_factor, atr_sensitivity)
+        
+        # Skip if profitable check fails
+        if self.take_profit_config.require_profitable and not is_profitable:
+            return None, ""
+        
+        # Check if should enter final stage
+        if self.check_final_exit_stage(current_price, bar):
+            return None, "final_stage_start"  # Let regular exit logic handle it
+            
+        # Calculate VWAP std distance
+        std_distance = self.position_metrics.calculate_std_value(current_price)
+        if np.isnan(std_distance):
+            return None, ""
+        
+        
+            
+        # Check if beyond threshold
+        if std_distance > self.take_profit_config.std_threshold:
+            # Calculate exit size proportional to std distance beyond threshold
+            exit_ratio = (std_distance - self.take_profit_config.std_threshold)
+            # exit_ratio = max(exit_ratio, 0.2) # set minimum ratio per exit
+            
+            # Apply dampening if configured
+            if self.take_profit_config.dampening_factor != 1.0:
+                exit_ratio *= self.take_profit_config.dampening_factor
+                
+            temp = exit_ratio
+            if exit_ratio < self.prev_exit_ratio:
+                exit_ratio = 0 # don't take profit if std has decreased. also allows for more position building
+                self.prev_exit_ratio = float('-inf')
+            else:
+                self.prev_exit_ratio = temp
+                
+            # Calculate shares while respecting minimums
+            max_exit = self.shares - math.ceil(self.max_shares * self.take_profit_config.min_remaining)
+            if max_exit <= 0:
+                return None, ""
+                
+            shares_to_exit = min(
+                max_exit,
+                math.floor(self.shares * exit_ratio)
+            )
+            
+            # Ensure minimum exit size
+            if shares_to_exit < self.take_profit_config.min_exit_size:
+                return None, ""
+             
+            return shares_to_exit, f"vwap_std_{std_distance:.2f}"
+        
+        else:
+            self.prev_exit_ratio = float('-inf')
+            
+        return None, ""
     
     def max_shares_ratio_threshold(self, ratio: float = 0.75):
         assert 0 <= ratio <= 1
@@ -704,66 +814,72 @@ class TradePosition:
 
 
     def set_max_target_shares_limit(self, bar: TypedBarData, current_timestamp: datetime):
+        
+        
+        if self.in_final_exit_stage:
+            # Once in final stage, prevent new entries
+            return
+        
         # Check if price has crossed full entry threshold
-        # if not self.has_crossed_full_entry:
-        if (self.is_long and bar.close >= self.full_entry_price) or \
-        (not self.is_long and bar.close <= self.full_entry_price):
-            # Full entry condition met - go to maximum size
-            self.has_crossed_full_entry = True
-            self.full_entry_time = current_timestamp
-            self.max_target_shares_limit = self.max_shares
-            if self.initial_shares is None:
-                self.initial_shares = self.max_target_shares_limit
-                # TODO: consider using half of self.max_shares (if initial shares is at max shares)
-                
-            # self.log(f"100% of target shares ({self.max_shares}) reached at entry",level=logging.INFO)
-            self.log(f"100% of target shares ({self.max_shares}) reached {(current_timestamp - self.entry_time).total_seconds()/60 :.2f} min after entry",level=logging.INFO)
-        else:
-            # Check for close price crossing buy price
-            current_limit = self.max_target_shares_limit or 0 # default 0 for comparisons of limits
-            
-            # NOTE: if doing gradual entry
-            new_limit = self.calculate_target_shares_from_price(bar.close)
-            
-            
-            # or, need to call calculate_target_shares_from_price BEFORE max_shares was reduced due to volume changes
-            
-            
-            # # NOTE: if doing immediate entry after close price meets buy price
-            # new_limit = self.max_shares
-            # self.has_crossed_full_entry = True
-            # self.full_entry_time = current_timestamp
-            
-            # Scale up based on close price (when full entry not reached but close has crossed entry price)
-            # NOTE: commenting this out seems to improve performance
-            if (self.is_long and bar.close >= self.area.get_buy_price) or \
-            (not self.is_long and bar.close <= self.area.get_buy_price):
-                # Close has crossed buy price - calculate size based on movement
-                if new_limit > current_limit:
-                    self.max_target_shares_limit = new_limit
-                    if self.initial_shares is None:
-                        self.initial_shares = self.max_target_shares_limit
-                    self.log(f"Close price crossed {(current_timestamp - self.entry_time).total_seconds()/60 :.0f} min after entry: {new_limit} shares ({(new_limit/self.max_shares)*100:.1f}%)",level=logging.INFO)
-                # elif new_limit < current_limit and self.max_shares_ratio_threshold():
-                #     self.max_target_shares_limit = new_limit
+        if not self.has_crossed_full_entry:
+            if (self.is_long and bar.close >= self.full_entry_price) or \
+            (not self.is_long and bar.close <= self.full_entry_price):
+                # Full entry condition met - go to maximum size
+                self.has_crossed_full_entry = True
+                self.full_entry_time = current_timestamp
+                self.max_target_shares_limit = self.max_shares
+                if self.initial_shares is None:
+                    self.initial_shares = self.max_target_shares_limit
+                    # TODO: consider using half of self.max_shares (if initial shares is at max shares)
+                    
+                # self.log(f"100% of target shares ({self.max_shares}) reached at entry",level=logging.INFO)
+                self.log(f"100% of target shares ({self.max_shares}) reached {(current_timestamp - self.entry_time).total_seconds()/60 :.2f} min after entry",level=logging.INFO)
             else:
+                # Check for close price crossing buy price
+                current_limit = self.max_target_shares_limit or 0 # default 0 for comparisons of limits
                 
-                # Close hasn't crossed but high/low has - start with 1 share
-                if self.max_target_shares_limit is None:
-                    # self.max_target_shares_limit = 1
-                    self.max_target_shares_limit = 0
-                    if self.initial_shares is None:
-                        self.initial_shares = self.max_target_shares_limit
-                    self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
-                elif new_limit > current_limit:
-                    # Maintain current limit until close crosses buy price
-                    self.max_target_shares_limit = current_limit
-                # elif new_limit < current_limit and self.max_shares_ratio_threshold():
-                #     self.max_target_shares_limit = new_limit
-        # else:
-        #     # self.max_target_shares_limit = min(self.max_target_shares_limit, self.max_shares)
-        #     # self.max_target_shares_limit = self.max_shares
-        #     self.max_target_shares_limit = self.max_shares
+                # NOTE: if doing gradual entry
+                new_limit = self.calculate_target_shares_from_price(bar.close)
+                
+                
+                # or, need to call calculate_target_shares_from_price BEFORE max_shares was reduced due to volume changes
+                
+                
+                # # NOTE: if doing immediate entry after close price meets buy price
+                # new_limit = self.max_shares
+                # self.has_crossed_full_entry = True
+                # self.full_entry_time = current_timestamp
+                
+                # Scale up based on close price (when full entry not reached but close has crossed entry price)
+                # NOTE: commenting this out seems to improve performance
+                if (self.is_long and bar.close >= self.area.get_buy_price) or \
+                (not self.is_long and bar.close <= self.area.get_buy_price):
+                    # Close has crossed buy price - calculate size based on movement
+                    if new_limit > current_limit:
+                        self.max_target_shares_limit = new_limit
+                        if self.initial_shares is None:
+                            self.initial_shares = self.max_target_shares_limit
+                        self.log(f"Close price crossed {(current_timestamp - self.entry_time).total_seconds()/60 :.0f} min after entry: {new_limit} shares ({(new_limit/self.max_shares)*100:.1f}%)",level=logging.INFO)
+                    # elif new_limit < current_limit and self.max_shares_ratio_threshold():
+                    #     self.max_target_shares_limit = new_limit
+                else:
+                    
+                    # Close hasn't crossed but high/low has - start with 1 share
+                    if self.max_target_shares_limit is None:
+                        # self.max_target_shares_limit = 1
+                        self.max_target_shares_limit = 0
+                        if self.initial_shares is None:
+                            self.initial_shares = self.max_target_shares_limit
+                        self.log(f"High/Low price crossed at entry but not Close. Starting with {self.initial_shares} share(s)",level=logging.INFO)
+                    elif new_limit > current_limit:
+                        # Maintain current limit until close crosses buy price
+                        self.max_target_shares_limit = current_limit
+                    # elif new_limit < current_limit and self.max_shares_ratio_threshold():
+                    #     self.max_target_shares_limit = new_limit
+        else:
+            # self.max_target_shares_limit = min(self.max_target_shares_limit, self.max_shares)
+            # self.max_target_shares_limit = self.max_shares
+            self.max_target_shares_limit = self.max_shares
             
 
     def reached_exit_ema(self, bar: TypedBarData, exit_quote_price: float = None, slippage_factor: float = None, atr_sensitivity: float = None) -> bool:
@@ -797,7 +913,8 @@ class TradePosition:
             if prev_snapshot.bar.exit_ema_dist < 0 and bar.exit_ema_dist >= 0:
                 return True
             
-            
+        # if prev_snapshot.vwap_std_close <= self.take_profit_config.std_threshold_early_exit:
+        #     return True
             
         
         # if prev_snapshot.central_value_dist != bar.central_value_dist:
@@ -1145,6 +1262,9 @@ class TradePosition:
         
         if append:
             self.position_metrics.add_snapshot(snapshot, best_wick_pl, worst_wick_pl, best_wick_plpc, worst_wick_plpc)
+            
+        if snapshot.is_exit_snapshot:
+            self.position_metrics.finalize_metrics()
     
 
 def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
@@ -1185,8 +1305,14 @@ def export_trades_to_csv(trades: List[TradePosition], filename: str = None):
             'Commit Time': trade.entry_time.time().strftime('%H:%M:%S'),
             'Entry Time': trade.actual_entry_time.time().strftime('%H:%M:%S'),
             'Exit Time': trade.exit_time.time().strftime('%H:%M:%S') if trade.exit_time else None,
-            'exited_from_stop_order': trade.exited_from_stop_order,
-            'failed_full_exit_count': trade.failed_full_exit_count,
+            
+            'total_tp_exits': trade.total_tp_exits,
+            'last_tp_exit_time': trade.last_tp_exit_time.time().strftime('%H:%M:%S') if trade.last_tp_exit_time else None,
+            
+            
+            # 'exited_from_stop_order': trade.exited_from_stop_order,
+            # 'failed_full_exit_count': trade.failed_full_exit_count,
+            
             # 'Holding Time (min)': trade.holding_time_minutes,
             # 'Entry Price': trade.entry_price,
             'Entry Price': trade.actual_entry_price,

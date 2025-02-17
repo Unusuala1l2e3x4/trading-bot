@@ -41,9 +41,9 @@ class PreMarketBar:
 class AnchoredVWAPMetrics:
     """Container for VWAP metrics calculated from a sequence of bars"""
     vwap: float = np.nan  # Anchored VWAP value
-    vwap_dist: float = np.nan  # Distance from close to VWAP
+    vwap_dist: float = np.nan  # Distance from close to VWAP (sign switched for shorts)
     vwap_std: float = np.nan  # Standard deviation of prices from VWAP
-    vwap_std_close: float = np.nan  # Close price in standard deviations from VWAP
+    vwap_std_close: float = np.nan  # Close price in standard deviations from VWAP (sign switched for shorts)
     
     
 @dataclass
@@ -709,10 +709,7 @@ class TypedBarData:
         last_close = bars[-1].close
         
         # Calculate VWAP distance based on position direction
-        if is_long:
-            vwap_dist = last_close - vwap
-        else:
-            vwap_dist = vwap - last_close
+        vwap_dist = last_close - vwap if is_long else vwap - last_close
             
         # Calculate volume-weighted standard deviation
         squared_devs = sum(
@@ -722,7 +719,7 @@ class TypedBarData:
         vwap_std = np.sqrt(squared_devs / cumulative_volume)
         
         # Calculate close price in standard deviations from VWAP
-        vwap_std_close = ((last_close - vwap) / vwap_std 
+        vwap_std_close = (vwap_dist / vwap_std 
                          if vwap_std > 0 else 0.0)
         
         return AnchoredVWAPMetrics(

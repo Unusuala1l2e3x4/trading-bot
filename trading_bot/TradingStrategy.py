@@ -1127,9 +1127,9 @@ class TradingStrategy:
                 # should_exit_early = False # original functionality
                 # should_exit = should_exit_early or should_exit # bad
                 # should_exit = should_exit_early # can exit early and dont hold. best?
-                if not position.has_exited:
-                # if position.has_entered and not position.has_exited:
-                    should_exit = should_exit_early # can exit early and dont hold. best?
+                # if not position.has_exited:
+                # # if position.has_entered and not position.has_exited:
+                #     should_exit = should_exit_early # can exit early and dont hold. best?
                     
                 # if should_exit_early:
                 #     should_exit = True # can exit early and dont hold
@@ -1192,7 +1192,26 @@ class TradingStrategy:
             if price_at_action:
                 assert target_shares == 0, target_shares
             
+            tp_reason = ''
+            # Check take-profit conditions if no regular exit
             if not price_at_action:
+                # Calculate take-profit exit size
+                exit_quote_price = self.get_price_at_action(position.is_long, False)
+                shares_to_exit, tp_reason = position.calculate_take_profit_exit(
+                    exit_quote_price, self.now_bar, self.params.slippage.slippage_factor, self.params.slippage.atr_sensitivity
+                )
+                
+                if shares_to_exit and shares_to_exit > 0:
+                    target_shares = position.shares - shares_to_exit
+                    price_at_action = exit_quote_price
+                    self.log(f"Take-profit exit triggered: {tp_reason}", level=logging.INFO)
+                elif tp_reason == "final_stage_start":
+                    # Just entered final stage - will exit via regular logic
+                    pass
+            
+            
+            if not price_at_action:
+                assert target_shares == position.max_target_shares_limit or target_shares == 0, target_shares
                 price_at_action = get_price_at_action_from_shares_diff(position.shares, target_shares, position.is_long)
             
             
@@ -1259,6 +1278,26 @@ class TradingStrategy:
                         if not position.is_simulated:
                             self.day_accrued_fees += fees_expected
                         
+                        
+                        if tp_reason.startswith('vwap_std_'):
+                            # position.max_shares = position.shares
+                            # position.has_crossed_full_entry = True
+                            # position.max_target_shares_limit = position.max_shares
+                            # position.in_final_exit_stage = True
+                            
+                            prev_min_remaining = position.max_shares * position.take_profit_config.min_remaining
+                            
+                            position.max_shares -= shares_change
+                            position.max_target_shares_limit = max(position.max_target_shares_limit - shares_change, position.max_shares)
+                            if position.max_target_shares_limit == position.max_shares:
+                                position.has_crossed_full_entry = True
+                            
+                            position.take_profit_config.min_remaining = prev_min_remaining / position.max_shares # keep min_remaining consistent  
+                            
+                            # Update take-profit tracking
+                            position.total_tp_exits += 1
+                            position.last_tp_exit_time = current_timestamp
+                    
                         
                         # if target_shares == 0:
                         #     assert position.shares == 0, (temp, shares_to_adjust, shares_change, position.shares)

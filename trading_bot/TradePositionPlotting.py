@@ -312,12 +312,7 @@ def create_plot(df_intraday: pd.DataFrame, volume_data: pd.DataFrame, unique_dat
     ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP'], color='purple', label='VWAP', zorder=0)
     ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP']+df_intraday['VWAP_std'], color='purple', label='VWAP std +',alpha=0.3, zorder=0)
     ax1.plot(df_intraday['continuous_index'], df_intraday['VWAP']-df_intraday['VWAP_std'], color='purple', label='VWAP std -',alpha=0.3, zorder=0)
-    
-    # print(list(df_intraday.columns))
-    # ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap', 'MACD', 'MACD_signal', 'MACD_hist', 'MACD_hist_roc', 'RSI', 'RSI_roc', 'MFI', 'MFI_roc', 'VWAP', 
-    # 'central_value', 'exit_ema', 'is_res', 'H_L', 'ATR', 'MTR', 'avg_volume', 'avg_trade_count', 'log_return', 'volatility', 'rolling_range_min_4', 'rolling_range_min_7', 
-    # 'rolling_ATR', 'central_value_dist', 'exit_ema_dist', 'ADX', 'trend_strength', 'time', 'date', 'half_hour', 'continuous_index']
-    
+
     # Add points for when above max investment if provided
     if when_above_max_investment and len(when_above_max_investment) > 0:
         above_max_continuous_index = []
@@ -496,7 +491,7 @@ def plot_cumulative_pl_and_price(trades: List['TradePosition'], df: pd.DataFrame
             filename = filename.replace('pl','plpc')
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         plt.savefig(filename, dpi=300)
-        print(f"Graph has been saved as {filename}")
+        # print(f"Graph has been saved as {filename}")
     else:
         plt.show()
         
@@ -545,7 +540,7 @@ def plot_cumulative_pl_and_price_from_snapshots(trades: List['TradePosition'], d
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         # plt.savefig(filename, dpi=300)
         plt.savefig(os.path.join(os.path.dirname(filename), fn), dpi=300)
-        print(f"Graph has been saved as {filename}")
+        # print(f"Graph has been saved as {filename}")
     else:
         plt.show()
         
