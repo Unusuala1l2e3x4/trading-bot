@@ -23,3 +23,7 @@ reject
 trading_bot/trading_bot.egg-info/PKG-INFO
 trading_bot.egg-info/PKG-INFO
 setup.py
+
+!trading_bot/example backtesting results output/**
+trading_bot/restart_run_notebooks.py
+/trading_bot/.vscode
