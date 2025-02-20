@@ -11,7 +11,7 @@ This project implements an automated trading system that attempts to identify an
 - Clean code organization and separation of concerns
 - Detailed handling of market data processing
 
-The system was inspired by [this article on support/resistance trading](MEDIUM_POST_LINK) but attempts to fully automate the strategy. Through development, it became apparent that technical analysis patterns often require human discretion and may not translate well to fully automated systems.
+The system was inspired by [this article on support/resistance trading](https://medium.com/@paullenosky/i-have-created-an-indicator-that-actually-makes-money-unlike-any-other-indicator-i-have-ever-seen-fd7b36aba975) but attempts to fully automate the strategy. Through development, it became apparent that technical analysis patterns often require human discretion and may not translate well to fully automated systems.
 
 ## Project Structure
 
