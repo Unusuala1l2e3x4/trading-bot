@@ -102,7 +102,7 @@ ACCOUNTNAME=paper
 
 ## Usage
 
-Refer to Jupyter Notebooks (*.ipynb) in trading_bot folder for examples and usage.
+Refer to Jupyter Notebooks (*.ipynb) in `trading_bot` folder for examples and usage.
 
 ## Contributing
 
